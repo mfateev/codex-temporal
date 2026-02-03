@@ -5,34 +5,39 @@
 //!
 //! # Architecture
 //!
-//! The POC demonstrates running model calls as Temporal activities:
+//! The agent workflow runs a model-as-activity pattern:
 //!
 //! ```text
-//! ┌────────────────────────────────────────────────────────────────┐
-//! │                     Temporal Workflow                           │
-//! │                                                                 │
-//! │  1. Receive prompt from workflow input                          │
-//! │  2. Call model_stream activity                                  │
-//! │  3. (Future) Process tool calls via tool_execute activity       │
-//! │  4. Return response                                             │
-//! │                                                                 │
-//! └────────────────────────────────────────────────────────────────┘
-//!                              │
-//!                              ▼
-//! ┌────────────────────────────────────────────────────────────────┐
-//! │                        Activities                               │
-//! │                                                                 │
-//! │  - model_stream: Makes HTTP calls to OpenAI, buffers response   │
-//! │  - tool_execute: Executes tool calls (stub for POC)             │
-//! │                                                                 │
-//! └────────────────────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────────────────────┐
+//! │                         Temporal Workflow                                 │
+//! │                                                                           │
+//! │  agent_workflow(input: AgentInput)                                        │
+//! │    ├─ Initialize conversation history                                     │
+//! │    └─ Agent Loop (deterministic):                                         │
+//! │        ├─ invoke_model_activity(history, tools) → ModelOutput             │
+//! │        │   └─ Returns: text + tool_calls[]                                │
+//! │        ├─ If tool_calls:                                                  │
+//! │        │   └─ http_fetch_activity(url) → response body                    │
+//! │        │   └─ Add result to history, continue loop                        │
+//! │        └─ If no tool_calls: return final response                         │
+//! └──────────────────────────────────────────────────────────────────────────┘
+//!
+//! Activities:
+//! ├─ invoke_model_activity: OpenAI Responses API call
+//! └─ http_fetch_activity: Simple HTTP GET (tool demo)
 //! ```
 
 pub mod activities;
 pub mod adapters;
+pub mod types;
 pub mod workflow;
 
-// Re-export key types
-pub use activities::{ModelActivityInput, ModelActivityOutput, model_stream_activity};
+// Re-export key types for convenient access
+pub use activities::{
+    http_fetch_activity, http_fetch_tool_def, invoke_model_activity, model_stream_activity,
+    HttpFetchInput, HttpFetchOutput, ModelActivityInput, ModelActivityOutput, ModelInput,
+    ModelOutput,
+};
 pub use adapters::entropy::{WorkflowClock, WorkflowRandomSource};
-pub use workflow::{CodexWorkflowInput, CodexWorkflowOutput};
+pub use types::{AgentInput, AgentOutput, FunctionCall, FunctionDef, InputItem, ToolCallMessage, ToolDef};
+pub use workflow::{agent_workflow, codex_workflow, CodexWorkflowInput, CodexWorkflowOutput};
