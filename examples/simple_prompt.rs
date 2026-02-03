@@ -14,8 +14,9 @@
 //! ```
 
 use std::sync::Arc;
-use temporalio_sdk::{Worker, sdk_client_options};
+use temporalio_sdk::Worker;
 use temporalio_sdk_core::{init_worker, CoreRuntime, RuntimeOptions, Url};
+use temporalio_client::ClientOptions;
 use temporalio_common::{
     telemetry::TelemetryOptions,
     worker::{WorkerConfig, WorkerTaskTypes, WorkerVersioningStrategy},
@@ -36,7 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Codex-Temporal worker example...");
 
     // Connect to Temporal server
-    let server_options = sdk_client_options(Url::parse("http://localhost:7233")?).build();
+    let server_options = ClientOptions::builder()
+        .target_url(Url::parse("http://localhost:7233")?)
+        .client_name("codex-temporal")
+        .client_version(env!("CARGO_PKG_VERSION"))
+        .identity("codex-temporal-worker")
+        .build();
 
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime_options = RuntimeOptions::builder()
