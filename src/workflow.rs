@@ -3,6 +3,7 @@
 //! This workflow calls [`try_run_sampling_request`] in a loop, dispatching
 //! model calls and tool executions as Temporal activities.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -11,8 +12,8 @@ use codex_core::config::Config;
 use codex_core::entropy::{EntropyProviders, ENTROPY};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
-    EventSink, Prompt, Session, StorageBackend, TurnContext, TurnDiffTracker,
-    try_run_sampling_request,
+    EventSink, JsonSchema, Prompt, ResponsesApiTool, Session, StorageBackend, ToolSpec,
+    TurnContext, TurnDiffTracker, try_run_sampling_request,
 };
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
 use codex_protocol::ThreadId;
@@ -107,9 +108,29 @@ impl CodexWorkflow {
             end_turn: None,
             phase: None,
         };
+        // Shell tool definition so the model can execute commands.
+        let shell_tool = ToolSpec::Function(ResponsesApiTool {
+            name: "shell".to_string(),
+            description: "Runs a shell command and returns its output. \
+                The arguments to `shell` will be passed to execvp()."
+                .to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties: BTreeMap::from([(
+                    "command".to_string(),
+                    JsonSchema::Array {
+                        items: Box::new(JsonSchema::String { description: None }),
+                        description: Some("The command to execute".to_string()),
+                    },
+                )]),
+                required: Some(vec!["command".to_string()]),
+                additional_properties: Some(false.into()),
+            },
+        });
+
         let prompt = Prompt {
             input: vec![user_item],
-            tools: vec![],
+            tools: vec![shell_tool],
             parallel_tool_calls: false,
             base_instructions: BaseInstructions {
                 text: input.instructions.clone(),

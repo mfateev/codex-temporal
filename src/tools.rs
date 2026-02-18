@@ -32,13 +32,15 @@ impl<W: 'static> ToolCallHandler for TemporalToolHandler<W> {
     fn handle_tool_call(&self, call: ToolCall, _cancellation_token: CancellationToken) -> Self::Future {
         let ctx = self.ctx.clone();
 
+        let arguments = match &call.payload {
+            codex_core::ToolPayload::Function { arguments } => arguments.clone(),
+            other => format!("{other:?}"),
+        };
+
         let input = ToolExecInput {
             tool_name: call.tool_name.clone(),
             call_id: call.call_id.clone(),
-            arguments: serde_json::to_string(&serde_json::json!({
-                "command": [format!("{:?}", call.payload)]
-            }))
-            .unwrap_or_default(),
+            arguments,
         };
 
         Box::pin(async move {
