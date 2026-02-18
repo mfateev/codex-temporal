@@ -8,6 +8,7 @@ repository = "https://github.com/mfateev/codex-temporal"
 
 [dependencies]
 anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
 futures = "0.3"
 futures-util = "0.3"
