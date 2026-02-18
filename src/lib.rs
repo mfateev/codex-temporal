@@ -1,8 +1,16 @@
 //! Temporal durable execution harness for the OpenAI Codex CLI agent.
 //!
-//! This crate provides a Temporal-backed implementation of the `codex_core`
-//! extension traits (`AgentSession`, `ToolCallHandler`, etc.) so that
-//! Codex agent workflows can survive process failures and be replayed
-//! deterministically using Temporal's workflow engine.
+//! This crate provides Temporal-backed implementations of the `codex_core`
+//! extension traits (`ModelStreamer`, `ToolCallHandler`, `EventSink`,
+//! `StorageBackend`, `RandomSource`, `Clock`) so that the Codex agentic
+//! loop can survive process failures and be replayed deterministically
+//! using Temporal's workflow engine.
 
-pub mod session;
+pub mod activities;
+pub mod entropy;
+pub mod sink;
+pub mod storage;
+pub mod streamer;
+pub mod tools;
+pub mod types;
+pub mod workflow;
