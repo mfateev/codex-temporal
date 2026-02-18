@@ -3,10 +3,11 @@
 //! This workflow calls [`try_run_sampling_request`] in a loop, dispatching
 //! model calls and tool executions as Temporal activities.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use codex_core::config::ConfigBuilder;
+use codex_core::config::Config;
 use codex_core::entropy::{EntropyProviders, ENTROPY};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
@@ -60,14 +61,10 @@ impl CodexWorkflow {
         };
 
         // --- config ---
-        let codex_home = std::env::temp_dir().join("codex-temporal");
-        let _ = std::fs::create_dir_all(&codex_home);
-        let config = ConfigBuilder::default()
-            .codex_home(codex_home)
-            .build()
-            .await
+        // Use for_harness() — zero I/O, safe inside the deterministic workflow sandbox.
+        let codex_home = PathBuf::from("/tmp/codex-temporal");
+        let mut config = Config::for_harness(codex_home)
             .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
-        let mut config = config;
         config.model = Some(input.model.clone());
         let config = Arc::new(config);
 

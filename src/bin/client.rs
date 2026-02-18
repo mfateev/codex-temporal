@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection_options = ConnectionOptions::new(
         Url::from_str(&server_url)?,
     )
+    .identity("codex-temporal-client")
     .build();
     let telemetry_options = TelemetryOptions::builder().build();
     let runtime_options = RuntimeOptions::builder()
