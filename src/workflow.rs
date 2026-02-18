@@ -98,17 +98,7 @@ impl CodexWorkflow {
         let mut streamer = TemporalModelStreamer::new(ctx.clone());
         let handler = TemporalToolHandler::new(ctx.clone());
 
-        // --- prompt ---
-        let user_item = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: input.user_message.clone(),
-            }],
-            end_turn: None,
-            phase: None,
-        };
-        // Shell tool definition so the model can execute commands.
+        // --- tools ---
         let shell_tool = ToolSpec::Function(ResponsesApiTool {
             name: "shell".to_string(),
             description: "Runs a shell command and returns its output. \
@@ -127,17 +117,22 @@ impl CodexWorkflow {
                 additional_properties: Some(false.into()),
             },
         });
-
-        let prompt = Prompt {
-            input: vec![user_item],
-            tools: vec![shell_tool],
-            parallel_tool_calls: false,
-            base_instructions: BaseInstructions {
-                text: input.instructions.clone(),
-            },
-            personality: None,
-            output_schema: None,
+        let tools = vec![shell_tool];
+        let base_instructions = BaseInstructions {
+            text: input.instructions.clone(),
         };
+
+        // --- seed user message into session history ---
+        let user_item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: input.user_message.clone(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        sess.record_items(&turn_context, &[user_item]).await;
 
         // --- run the agentic loop ---
         let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
@@ -152,6 +147,17 @@ impl CodexWorkflow {
                         tracing::warn!("max iterations reached ({MAX_ITERATIONS}), stopping");
                         break;
                     }
+
+                    // Rebuild prompt from accumulated session history each iteration.
+                    let history = sess.history_items().await;
+                    let prompt = Prompt {
+                        input: history,
+                        tools: tools.clone(),
+                        parallel_tool_calls: false,
+                        base_instructions: base_instructions.clone(),
+                        personality: None,
+                        output_schema: None,
+                    };
 
                     let result = try_run_sampling_request(
                         Arc::clone(&sess),
