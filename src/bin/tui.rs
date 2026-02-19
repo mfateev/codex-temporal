@@ -180,8 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Create ChatWidget ---
     let mut chat_widget = ChatWidget::new_with_op_sender(init, op_tx);
 
-    // --- Initial draw so the widget knows its area ---
-    // clear() resets the previous buffer so the first diff produces output.
+    // --- Initial draw ---
+    // The custom terminal starts with a zero-sized viewport. Set it to the
+    // full screen size so the widget renders and knows its dimensions.
+    let screen_size = terminal.size()?;
+    terminal.set_viewport_area(ratatui::layout::Rect::new(
+        0,
+        0,
+        screen_size.width,
+        screen_size.height,
+    ));
     terminal.clear()?;
     terminal.draw(|f| {
         let area = f.area();
