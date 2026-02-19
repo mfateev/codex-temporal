@@ -180,6 +180,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Create ChatWidget ---
     let mut chat_widget = ChatWidget::new_with_op_sender(init, op_tx);
 
+    // --- Initial draw so the widget knows its area ---
+    terminal.draw(|f| {
+        let area = f.area();
+        chat_widget.render(area, f.buffer_mut());
+    })?;
+
     // --- Event loop ---
     let mut crossterm_events = EventStream::new();
 
