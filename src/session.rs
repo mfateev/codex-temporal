@@ -265,9 +265,22 @@ impl codex_core::AgentSession for TemporalAgentSession {
                 Ok("interrupt-noop".to_string())
             }
 
-            // The TUI sends these on startup to discover custom prompts and
-            // skills. In the Temporal context there are none, so ignore silently.
-            Op::ListCustomPrompts | Op::ListSkills { .. } => Ok("noop".to_string()),
+            // The TUI sends these during normal operation. In the Temporal
+            // context they are no-ops — the worker handles execution, there
+            // are no local MCP servers, custom prompts, skills, or history.
+            Op::ListCustomPrompts
+            | Op::ListSkills { .. }
+            | Op::ListMcpTools
+            | Op::AddToHistory { .. }
+            | Op::CleanBackgroundTerminals
+            | Op::DropMemories
+            | Op::UpdateMemories
+            | Op::ReloadUserConfig
+            | Op::Review { .. }
+            | Op::RunUserShellCommand { .. }
+            | Op::Compact
+            | Op::SetThreadName { .. }
+            | Op::Undo => Ok("noop".to_string()),
 
             other => {
                 tracing::warn!(?other, "unhandled Op variant in TemporalAgentSession");
