@@ -2,7 +2,6 @@
 //!
 //! Exposes a single fixed model without contacting any remote service.
 
-use codex_core::config::Config;
 use codex_core::models_manager::manager::ModelsProvider;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
@@ -37,7 +36,7 @@ impl FixedModelsProvider {
 }
 
 impl ModelsProvider for FixedModelsProvider {
-    fn try_list_models(&self, _config: &Config) -> Result<Vec<ModelPreset>, TryLockError> {
+    fn try_list_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
         Ok(vec![self.preset.clone()])
     }
 

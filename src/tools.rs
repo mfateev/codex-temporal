@@ -95,6 +95,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 id: turn_id.clone(),
                 msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                     call_id: call_id.clone(),
+                    approval_id: Some(call_id.clone()),
                     turn_id,
                     command,
                     cwd: PathBuf::from("/tmp"),
