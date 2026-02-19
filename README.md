@@ -58,7 +58,24 @@ For tool-use prompts:
 cargo run --bin codex-temporal-client -- "Use shell to run 'echo hello world' and tell me the output."
 ```
 
-### 4. Environment variables
+### 4. Run the TUI
+
+The TUI binary reuses the Codex `ChatWidget` but connects to a Temporal workflow instead of an in-process agent. The worker holds the API key and makes LLM calls — the TUI process does not need auth credentials or config files.
+
+```bash
+# Make sure the worker is running (step 2 above), then:
+cargo run --bin codex-temporal-tui -- "Explain what Temporal is in two sentences."
+```
+
+You can also launch without an initial prompt and type interactively:
+
+```bash
+cargo run --bin codex-temporal-tui
+```
+
+The TUI renders the same chat interface as the standard Codex CLI. Events flow from the Temporal workflow back through the TUI in real time (session configured, agent messages, tool approval requests, turn completion).
+
+### 5. Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -88,12 +105,32 @@ OPENAI_API_KEY="sk-..." cargo test --test e2e_test -- --nocapture
 
 Tests are skipped gracefully when `OPENAI_API_KEY` is not set.
 
-Two test cases run sequentially:
+Two test cases:
 
 | Test | What it does |
 |------|-------------|
 | `model_only_turn` | Submits a simple prompt, asserts `TurnStarted` and `TurnComplete` with a non-empty agent message |
 | `tool_approval_flow` | Submits a prompt that triggers a shell tool call, waits for `ExecApprovalRequest`, sends approval, asserts `TurnComplete` after tool execution |
+
+### TUI E2E tests
+
+TUI E2E tests verify the full ChatWidget → `wire_session` → `TemporalAgentSession` → Temporal workflow round-trip. They require a running Temporal server.
+
+```bash
+# Start a dev server if one isn't running:
+temporal server start-dev --port 7234
+
+# Run the tests:
+TEMPORAL_ADDRESS=http://localhost:7234 OPENAI_API_KEY="sk-..." \
+  cargo test --test tui_e2e_test -- --nocapture
+```
+
+Two test cases:
+
+| Test | What it does |
+|------|-------------|
+| `tui_model_turn` | Wires a ChatWidget to a TemporalAgentSession, submits "Say hello in one word" via `initial_user_message`, asserts `TurnStarted`, agent messages, and `TurnComplete` all flow through the TUI event channel |
+| `tui_tool_approval_request` | Submits a prompt requesting shell execution, asserts `ExecApprovalRequest` flows through the TUI pipeline from the Temporal workflow |
 
 ## Architecture
 
@@ -109,9 +146,12 @@ codex-temporal/src/
   activities.rs       Activity definitions (model_call, tool_exec)
   workflow.rs         CodexWorkflow (multi-turn interactive workflow)
   session.rs          TemporalAgentSession (AgentSession impl for client-side use)
+  auth_stub.rs        NoopAuthProvider (stub AuthProvider for TUI — no credentials needed)
+  models_stub.rs      FixedModelsProvider (stub ModelsProvider — single fixed model preset)
   bin/
     worker.rs         Temporal worker binary
     client.rs         CLI to start a one-shot workflow
+    tui.rs            TUI binary (ChatWidget wired to TemporalAgentSession)
 ```
 
 ### Protocol
