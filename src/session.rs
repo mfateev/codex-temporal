@@ -265,6 +265,10 @@ impl codex_core::AgentSession for TemporalAgentSession {
                 Ok("interrupt-noop".to_string())
             }
 
+            // The TUI sends these on startup to discover custom prompts and
+            // skills. In the Temporal context there are none, so ignore silently.
+            Op::ListCustomPrompts | Op::ListSkills { .. } => Ok("noop".to_string()),
+
             other => {
                 tracing::warn!(?other, "unhandled Op variant in TemporalAgentSession");
                 Ok("noop".to_string())
