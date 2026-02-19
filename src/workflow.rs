@@ -279,6 +279,7 @@ impl CodexWorkflow {
                             output_schema: None,
                         };
 
+                        let mut server_model_warning_emitted = false;
                         let result = try_run_sampling_request(
                             Arc::clone(&sess),
                             Arc::clone(&turn_context),
@@ -286,6 +287,7 @@ impl CodexWorkflow {
                             &handler,
                             None,
                             Arc::clone(&diff_tracker),
+                            &mut server_model_warning_emitted,
                             &prompt,
                             cancellation_token.child_token(),
                         )
