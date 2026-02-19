@@ -8,6 +8,7 @@
 
 pub mod activities;
 pub mod entropy;
+pub mod session;
 pub mod sink;
 pub mod storage;
 pub mod streamer;
