@@ -7,7 +7,9 @@
 //! using Temporal's workflow engine.
 
 pub mod activities;
+pub mod auth_stub;
 pub mod entropy;
+pub mod models_stub;
 pub mod session;
 pub mod sink;
 pub mod storage;
