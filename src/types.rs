@@ -86,6 +86,37 @@ impl ToolExecOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Signal payloads
+// ---------------------------------------------------------------------------
+
+/// Signal payload for submitting a new user turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTurnInput {
+    /// Unique identifier for this turn (used to correlate events).
+    pub turn_id: String,
+    /// The user's message text.
+    pub message: String,
+}
+
+/// Signal payload for approving or denying a tool execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalInput {
+    /// The call_id from the ExecApprovalRequest event.
+    pub call_id: String,
+    /// Whether the tool execution is approved.
+    pub approved: bool,
+}
+
+/// Pending approval state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    /// The call_id awaiting approval.
+    pub call_id: String,
+    /// Set to `Some(true)` or `Some(false)` when the client responds.
+    pub decision: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
 // Workflow I/O
 // ---------------------------------------------------------------------------
 

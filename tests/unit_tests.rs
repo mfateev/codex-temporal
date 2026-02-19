@@ -5,7 +5,10 @@ use std::sync::Arc;
 use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
-use codex_temporal::types::{CodexWorkflowInput, CodexWorkflowOutput, ToolExecOutput};
+use codex_temporal::types::{
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, PendingApproval, ToolExecOutput,
+    UserTurnInput,
+};
 
 use codex_core::entropy::{Clock, RandomSource};
 use codex_core::{EventSink, StorageBackend};
@@ -240,4 +243,119 @@ async fn turn_context_new_minimal_creates_usable_context() {
     );
     // TurnContext constructed successfully — fields are pub(crate) but
     // the important thing is that new_minimal() doesn't panic.
+}
+
+// ---------------------------------------------------------------------------
+// New signal payload types tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_turn_input_roundtrips_through_json() {
+    let input = UserTurnInput {
+        turn_id: "turn-42".to_string(),
+        message: "What is 2+2?".to_string(),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: UserTurnInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.turn_id, "turn-42");
+    assert_eq!(back.message, "What is 2+2?");
+}
+
+#[test]
+fn approval_input_roundtrips_through_json() {
+    let input = ApprovalInput {
+        call_id: "call-123".to_string(),
+        approved: true,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: ApprovalInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.call_id, "call-123");
+    assert!(back.approved);
+}
+
+#[test]
+fn pending_approval_decision_lifecycle() {
+    let mut pa = PendingApproval {
+        call_id: "call-abc".to_string(),
+        decision: None,
+    };
+
+    assert!(pa.decision.is_none(), "initially no decision");
+
+    pa.decision = Some(true);
+    assert_eq!(pa.decision, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// BufferEventSink::events_since tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn buffer_event_sink_events_since_returns_subset() {
+    let sink = BufferEventSink::new();
+
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    // Push 3 events.
+    for i in 0..3 {
+        let event = Event {
+            id: format!("ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink.emit_event(event).await;
+    }
+
+    // events_since(0) should return all 3.
+    let (events, watermark) = sink.events_since(0);
+    assert_eq!(events.len(), 3);
+    assert_eq!(watermark, 3);
+
+    // events_since(2) should return only the last one.
+    let (events, watermark) = sink.events_since(2);
+    assert_eq!(events.len(), 1);
+    assert_eq!(watermark, 3);
+
+    // events_since(3) should return empty.
+    let (events, watermark) = sink.events_since(3);
+    assert!(events.is_empty());
+    assert_eq!(watermark, 3);
+
+    // events_since(100) should return empty.
+    let (events, watermark) = sink.events_since(100);
+    assert!(events.is_empty());
+    assert_eq!(watermark, 3);
+
+    // Verify events are valid JSON and can be deserialized back.
+    let (events, _) = sink.events_since(0);
+    for json_str in &events {
+        let event: Event = serde_json::from_str(json_str)
+            .expect("events_since should return valid JSON");
+        assert!(event.id.starts_with("ev-"));
+    }
+}
+
+#[tokio::test]
+async fn buffer_event_sink_emit_event_sync_works() {
+    let sink = BufferEventSink::new();
+
+    use codex_protocol::protocol::{Event, EventMsg};
+
+    sink.emit_event_sync(Event {
+        id: "sync-1".to_string(),
+        msg: EventMsg::ShutdownComplete,
+    });
+
+    assert_eq!(sink.len(), 1);
+
+    let (events, watermark) = sink.events_since(0);
+    assert_eq!(events.len(), 1);
+    assert_eq!(watermark, 1);
 }

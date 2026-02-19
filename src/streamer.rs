@@ -12,19 +12,20 @@ use tokio::sync::mpsc;
 
 use crate::activities::CodexActivities;
 use crate::types::ModelCallInput;
+use crate::workflow::CodexWorkflow;
 
 /// A [`ModelStreamer`] that dispatches model calls as Temporal activities.
-pub struct TemporalModelStreamer<W> {
-    ctx: WorkflowContext<W>,
+pub struct TemporalModelStreamer {
+    ctx: WorkflowContext<CodexWorkflow>,
 }
 
-impl<W> TemporalModelStreamer<W> {
-    pub fn new(ctx: WorkflowContext<W>) -> Self {
+impl TemporalModelStreamer {
+    pub fn new(ctx: WorkflowContext<CodexWorkflow>) -> Self {
         Self { ctx }
     }
 }
 
-impl<W: 'static> ModelStreamer for TemporalModelStreamer<W> {
+impl ModelStreamer for TemporalModelStreamer {
     async fn stream(
         &mut self,
         prompt: &Prompt,
