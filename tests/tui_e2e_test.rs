@@ -42,6 +42,9 @@ use codex_tui::chatwidget::wire_session;
 use codex_tui::render::renderable::Renderable;
 use codex_tui::tui::FrameRequester;
 
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
 use ratatui::layout::Rect;
 
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
@@ -111,6 +114,7 @@ fn build_tui_for_session(
     let mut config = Config::for_harness(codex_home).expect("Config::for_harness");
     config.model = Some(model.to_string());
     config.cwd = cwd;
+    config.disable_paste_burst = true;
 
     let (draw_tx, _draw_rx) = broadcast::channel::<()>(16);
     let frame_requester = FrameRequester::new(draw_tx);
@@ -377,6 +381,65 @@ async fn tui_tool_approval_request(client: &Client) {
     }
 }
 
+/// Simulate a real user interaction: type characters, press Enter, wait for
+/// the response. This exercises the full input → render → submit → workflow →
+/// events → render path, matching what happens in the actual TUI binary.
+async fn tui_interactive_turn(client: &Client) {
+    // Build a session with NO initial prompt — we'll type it.
+    let session = Arc::new(new_session(client, "gpt-4o"));
+    let (mut chat_widget, mut rx) = build_tui_for_session(session, "gpt-4o", None);
+
+    render_widget(&chat_widget);
+
+    // 1. Process SessionConfigured so the widget is ready to accept input.
+    let event = next_codex_event(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("timed out waiting for SessionConfigured");
+    assert!(matches!(&event.msg, EventMsg::SessionConfigured(_)));
+    chat_widget.handle_codex_event(event);
+    render_widget(&chat_widget);
+
+    // 2. Type "Hi" character by character, then press Enter.
+    for ch in "Hi".chars() {
+        chat_widget.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        render_widget(&chat_widget);
+    }
+    chat_widget.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    render_widget(&chat_widget);
+
+    // 3. Wait for events from the workflow (the Enter should have submitted Op::UserTurn).
+    let mut saw_turn_started = false;
+    let mut saw_turn_complete = false;
+
+    loop {
+        let event = next_codex_event(&mut rx, Duration::from_secs(120))
+            .await
+            .expect("timed out waiting for TurnComplete in interactive turn");
+        match &event.msg {
+            EventMsg::TurnStarted(_) => {
+                eprintln!("  [tui_interactive] TurnStarted");
+                saw_turn_started = true;
+            }
+            EventMsg::TurnComplete(tc) => {
+                eprintln!(
+                    "  [tui_interactive] TurnComplete: {:?}",
+                    tc.last_agent_message
+                );
+                saw_turn_complete = true;
+                chat_widget.handle_codex_event(event);
+                render_widget(&chat_widget);
+                break;
+            }
+            _ => {}
+        }
+        chat_widget.handle_codex_event(event);
+        render_widget(&chat_widget);
+    }
+
+    assert!(saw_turn_started, "expected TurnStarted from typed input");
+    assert!(saw_turn_complete, "expected TurnComplete from typed input");
+}
+
 // ---------------------------------------------------------------------------
 // Test entry-point
 // ---------------------------------------------------------------------------
@@ -401,6 +464,9 @@ async fn tui_e2e_tests() {
 
     eprintln!("--- test: tui_tool_approval_request ---");
     tui_tool_approval_request(&client).await;
+
+    eprintln!("--- test: tui_interactive_turn ---");
+    tui_interactive_turn(&client).await;
 
     eprintln!("--- all TUI E2E tests passed ---");
 }
