@@ -33,11 +33,8 @@ codex-feedback = { path = "../codex/codex-rs/feedback" }
 codex-protocol = { path = "../codex/codex-rs/protocol" }
 codex-otel = { path = "../codex/codex-rs/otel" }
 codex-tui = { path = "../codex/codex-rs/tui" }
+codex-shell-command = { path = "../codex/codex-rs/shell-command" }
 
-# TUI dependencies (patched versions come via [patch.crates-io])
-crossterm = { version = "0.28", features = ["event-stream"] }
-ratatui = { version = "0.29", features = ["unstable-widget-ref"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Patches required by codex-core/codex-tui transitive dependencies
 [patch.crates-io]
@@ -51,6 +48,8 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 
 [dev-dependencies]
 temporalio-sdk-core = { git = "https://github.com/mfateev/sdk-core.git", branch = "fix/wait-condition-wakers", features = ["ephemeral-server"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { version = "0.29", features = ["unstable-widget-ref"] }
 
 [[bin]]
 name = "codex-temporal-worker"

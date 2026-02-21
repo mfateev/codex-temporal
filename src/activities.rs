@@ -4,100 +4,137 @@
 //! perform real I/O (HTTP calls, shell commands, etc.).  Results are
 //! recorded in the workflow history for deterministic replay.
 
-use codex_protocol::models::ResponseItem;
+use codex_core::{ModelClient, ModelProviderInfo, Prompt, ResponseEvent, built_in_model_providers};
+use codex_otel::OtelManager;
+use codex_protocol::models::{BaseInstructions, ResponseItem};
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::ThreadId;
+use futures::StreamExt;
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use crate::types::{ModelCallInput, ModelCallOutput, ToolExecInput, ToolExecOutput};
 
-/// The OpenAI Responses API endpoint path.
-const RESPONSES_PATH: &str = "responses";
+/// Resolve the model provider to use for the activity.
+///
+/// Starts from the built-in OpenAI provider but overrides it to use API-key
+/// auth (`OPENAI_API_KEY` env var) instead of ChatGPT OAuth — activities run
+/// headless so there is no interactive login flow.
+fn resolve_provider() -> ModelProviderInfo {
+    let mut provider = built_in_model_providers()
+        .remove("openai")
+        .expect("built-in openai provider must exist");
+
+    // Switch from ChatGPT OAuth to API-key auth.
+    provider.requires_openai_auth = false;
+    provider.env_key = Some("OPENAI_API_KEY".to_string());
+
+    // Honour explicit base-URL override.
+    if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+        provider.base_url = Some(base);
+    }
+
+    // If a bearer token is supplied directly, prefer it over the env_key
+    // mechanism (useful for programmatic / test scenarios).
+    if let Ok(token) = std::env::var("OPENAI_BEARER_TOKEN") {
+        provider.experimental_bearer_token = Some(token);
+    }
+
+    provider
+}
 
 /// Activity implementations for the codex workflow.
 pub struct CodexActivities;
 
-/// Non-streaming response body from the OpenAI Responses API.
-#[derive(Debug, serde::Deserialize)]
-struct ResponsesApiResponse {
-    #[allow(dead_code)]
-    id: String,
-    output: Vec<ResponseItem>,
-}
-
 #[activities]
 impl CodexActivities {
-    /// Call the OpenAI Responses API (non-streaming) and return collected
-    /// output items.
-    ///
-    /// Requires the `OPENAI_API_KEY` env var on the activity worker.
-    /// Optionally reads `OPENAI_BASE_URL` (defaults to
-    /// `https://api.openai.com/v1`).
+    /// Call the model API using the full codex client stack (provider
+    /// resolution, retries, auth refresh, etc.) and return collected output
+    /// items.
     #[activity]
     pub async fn model_call(
         _ctx: ActivityContext,
         input: ModelCallInput,
     ) -> Result<ModelCallOutput, ActivityError> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY not set"))?;
+        let provider = resolve_provider();
+        let conversation_id = ThreadId::new();
 
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let base_url = base_url.trim_end_matches('/');
-        let url = format!("{base_url}/{RESPONSES_PATH}");
-
-        tracing::info!(
-            model = %input.model,
-            input_items = input.input.len(),
-            tools = input.tools_json.len(),
-            %url,
-            "calling OpenAI Responses API"
+        let model_client = ModelClient::new(
+            None, // no AuthManager — uses env_key / bearer token
+            conversation_id.clone(),
+            provider,
+            SessionSource::Exec,
+            None,  // model_verbosity
+            false, // websockets
+            false, // websockets v2
+            false, // request compression
+            false, // timing metrics
+            None,  // beta features header
         );
 
-        let body = serde_json::json!({
-            "model": input.model,
-            "instructions": input.instructions,
-            "input": input.input,
-            "tools": input.tools_json,
-            "tool_choice": "auto",
-            "parallel_tool_calls": input.parallel_tool_calls,
-            "store": false,
-            "stream": false,
-        });
+        let mut session = model_client.new_session();
 
-        let client = reqwest::Client::new();
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+        let prompt = Prompt {
+            input: input.input,
+            tools: input.tools,
+            parallel_tool_calls: input.parallel_tool_calls,
+            base_instructions: BaseInstructions {
+                text: input.instructions,
+            },
+            personality: input.personality,
+            output_schema: None,
+        };
+
+        let otel_manager = OtelManager::new(
+            conversation_id,
+            &input.model_info.slug,
+            &input.model_info.slug,
+            None,
+            None,
+            None,
+            "temporal-activity".to_string(),
+            false,
+            "activity".to_string(),
+            SessionSource::Exec,
+        );
+
+        tracing::info!(
+            model = %input.model_info.slug,
+            input_items = prompt.input.len(),
+            tools = prompt.tools.len(),
+            effort = ?input.effort,
+            "calling model via codex client"
+        );
+
+        let mut stream = session
+            .stream(
+                &prompt,
+                &input.model_info,
+                &otel_manager,
+                input.effort,
+                input.summary,
+                None,
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("HTTP request failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("model stream failed: {e}"))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
-            return Err(anyhow::anyhow!(
-                "OpenAI API returned {status}: {error_body}"
-            ).into());
+        let mut items: Vec<ResponseItem> = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(ResponseEvent::OutputItemDone(item)) => {
+                    items.push(item);
+                }
+                Ok(ResponseEvent::Completed { .. }) => break,
+                Ok(_) => {} // Created, Delta, etc.
+                Err(e) => {
+                    return Err(anyhow::anyhow!("model stream error: {e}").into());
+                }
+            }
         }
 
-        let api_response: ResponsesApiResponse = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
+        tracing::info!(output_items = items.len(), "model_call completed");
 
-        tracing::info!(
-            output_items = api_response.output.len(),
-            "model_call completed"
-        );
-
-        Ok(ModelCallOutput {
-            items: api_response.output,
-        })
+        Ok(ModelCallOutput { items })
     }
 
     /// Execute a shell command and return stdout/stderr/exit_code.

@@ -1,11 +1,12 @@
 //! Serializable I/O types for Temporal activities.
 //!
 //! These types are sent across the Temporal activity boundary, so they must
-//! implement `Serialize` + `Deserialize`.  They mirror the codex-core types
-//! that are not themselves serializable (e.g. `Prompt`, `ResponseStream`).
+//! implement `Serialize` + `Deserialize`.
 
-use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ResponseItem;
+use codex_core::ToolSpec;
+use codex_protocol::config_types::{Personality, ReasoningSummary};
+use codex_protocol::models::{ResponseInputItem, ResponseItem};
+use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -17,14 +18,23 @@ use serde::{Deserialize, Serialize};
 pub struct ModelCallInput {
     /// Conversation context items sent to the model.
     pub input: Vec<ResponseItem>,
-    /// JSON-serialized tool definitions.
-    pub tools_json: Vec<serde_json::Value>,
+    /// Tool definitions (carried as typed specs, not pre-serialized JSON).
+    pub tools: Vec<ToolSpec>,
     /// Whether parallel tool calls are permitted.
     pub parallel_tool_calls: bool,
     /// Base instructions for the model.
     pub instructions: String,
-    /// Model slug (e.g. "gpt-4o").
-    pub model: String,
+    /// Full model metadata (slug, capabilities, etc.).
+    pub model_info: ModelInfo,
+    /// Optional reasoning effort level.
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
+    /// Reasoning summary mode.
+    #[serde(default)]
+    pub summary: ReasoningSummary,
+    /// Optional personality for the model.
+    #[serde(default)]
+    pub personality: Option<Personality>,
 }
 
 /// Output from the `model_call` activity.
@@ -129,6 +139,10 @@ pub struct CodexWorkflowInput {
     pub model: String,
     /// Base instructions / system prompt.
     pub instructions: String,
+    /// Tool approval policy — controls when tool executions require user
+    /// approval before running.
+    #[serde(default)]
+    pub approval_policy: codex_protocol::protocol::AskForApproval,
 }
 
 /// Output from the codex workflow.

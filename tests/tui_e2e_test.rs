@@ -4,6 +4,10 @@
 //! TemporalAgentSession → Temporal workflow → worker (LLM activity) →
 //! events flow back through the channel → ChatWidget processes them.
 //!
+//! Every event is also rendered into a ratatui `Buffer` to catch rendering
+//! bugs (e.g. uninitialized width tracking) that only surface when the
+//! widget is actually drawn.
+//!
 //! **Requires:**
 //! - `OPENAI_API_KEY` env var
 //! - A running Temporal server (`TEMPORAL_ADDRESS`, default `http://localhost:7233`)
@@ -35,7 +39,13 @@ use codex_tui::bottom_pane::FeedbackAudience;
 use codex_tui::chatwidget::ChatWidget;
 use codex_tui::chatwidget::ChatWidgetInit;
 use codex_tui::chatwidget::wire_session;
+use codex_tui::render::renderable::Renderable;
 use codex_tui::tui::FrameRequester;
+
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use ratatui::layout::Rect;
 
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 use temporalio_common::telemetry::TelemetryOptions;
@@ -47,13 +57,19 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::unbounded_channel;
 
 const TASK_QUEUE: &str = "codex-temporal";
+const TERM_WIDTH: u16 = 120;
+const TERM_HEIGHT: u16 = 40;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn server_url() -> String {
-    std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "http://localhost:7233".to_string())
+/// Render the widget into an off-screen buffer, exercising the same code
+/// path as a real terminal draw. Panics on rendering bugs.
+fn render_widget(chat_widget: &ChatWidget) {
+    let area = Rect::new(0, 0, TERM_WIDTH, TERM_HEIGHT);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    chat_widget.render(area, &mut buf);
 }
 
 /// Build a `ChatWidget` wired to a `TemporalAgentSession`, returning the
@@ -98,6 +114,7 @@ fn build_tui_for_session(
     let mut config = Config::for_harness(codex_home).expect("Config::for_harness");
     config.model = Some(model.to_string());
     config.cwd = cwd;
+    config.disable_paste_burst = true;
 
     let (draw_tx, _draw_rx) = broadcast::channel::<()>(16);
     let frame_requester = FrameRequester::new(draw_tx);
@@ -142,6 +159,7 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         user_message: String::new(),
         model: model.to_string(),
         instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -171,7 +189,7 @@ async fn next_codex_event(
 // Infrastructure: connect + start worker
 // ---------------------------------------------------------------------------
 
-async fn connect_client(url: &str) -> Client {
+async fn connect_client(url: &str) -> Option<Client> {
     let conn_opts = ConnectionOptions::new(Url::from_str(url).expect("bad URL"))
         .identity("tui-e2e-test-client")
         .build();
@@ -182,17 +200,27 @@ async fn connect_client(url: &str) -> Client {
         .expect("runtime options");
     let _runtime = CoreRuntime::new_assume_tokio(runtime_options).expect("runtime");
 
-    let connection = Connection::connect(conn_opts)
-        .await
-        .expect("failed to connect to Temporal server — is it running?");
-    Client::new(connection, ClientOptions::new("default").build())
-        .expect("failed to create client")
+    match tokio::time::timeout(Duration::from_secs(10), Connection::connect(conn_opts)).await {
+        Ok(Ok(connection)) => {
+            let client = Client::new(connection, ClientOptions::new("default").build())
+                .expect("failed to create client");
+            Some(client)
+        }
+        Ok(Err(e)) => {
+            eprintln!("failed to connect to Temporal server at {url}: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("connection to Temporal server at {url} timed out (10s)");
+            None
+        }
+    }
 }
 
 /// Start a worker on a dedicated OS thread (Worker future is !Send).
 /// Returns when the worker is ready to poll.
 fn start_worker(url: String) {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -212,9 +240,24 @@ fn start_worker(url: String) {
             let conn = ConnectionOptions::new(Url::from_str(&url).expect("bad URL"))
                 .identity("tui-e2e-test-worker")
                 .build();
-            let connection = Connection::connect(conn)
-                .await
-                .expect("worker: failed to connect");
+
+            let connection = match tokio::time::timeout(
+                Duration::from_secs(10),
+                Connection::connect(conn),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    let _ = ready_tx.send(Err(format!("worker connect failed: {e}")));
+                    return;
+                }
+                Err(_) => {
+                    let _ = ready_tx.send(Err("worker connect timed out (10s)".into()));
+                    return;
+                }
+            };
+
             let worker_client =
                 Client::new(connection, ClientOptions::new("default").build())
                     .expect("worker: failed to create client");
@@ -227,7 +270,7 @@ fn start_worker(url: String) {
             let mut worker = Worker::new(&worker_runtime, worker_client, opts)
                 .expect("failed to create worker");
 
-            let _ = ready_tx.send(());
+            let _ = ready_tx.send(Ok(()));
 
             if let Err(e) = worker.run().await {
                 eprintln!("worker error: {e}");
@@ -235,9 +278,11 @@ fn start_worker(url: String) {
         });
     });
 
-    ready_rx
-        .recv()
-        .expect("worker thread died before becoming ready");
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("worker failed to start: {e}"),
+        Err(_) => panic!("worker thread died before becoming ready"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,10 +290,14 @@ fn start_worker(url: String) {
 // ---------------------------------------------------------------------------
 
 /// Full TUI round-trip: prompt → Temporal workflow → LLM → events back.
+/// Renders the widget after every event to catch rendering bugs.
 async fn tui_model_turn(client: &Client) {
     let session = Arc::new(new_session(client, "gpt-4o"));
     let (mut chat_widget, mut rx) =
         build_tui_for_session(session, "gpt-4o", Some("Say hello in one word."));
+
+    // Render initial state (before any events).
+    render_widget(&chat_widget);
 
     // 1. Wait for SessionConfigured and process it (triggers initial_user_message submission).
     let event = next_codex_event(&mut rx, Duration::from_secs(10))
@@ -260,6 +309,7 @@ async fn tui_model_turn(client: &Client) {
         std::mem::discriminant(&event.msg)
     );
     chat_widget.handle_codex_event(event);
+    render_widget(&chat_widget);
 
     // 2. Drain events until TurnComplete (up to 120s for LLM response).
     let mut saw_turn_started = false;
@@ -284,6 +334,7 @@ async fn tui_model_turn(client: &Client) {
                     tc.last_agent_message
                 );
                 chat_widget.handle_codex_event(event);
+                render_widget(&chat_widget);
                 break;
             }
             other => {
@@ -294,6 +345,7 @@ async fn tui_model_turn(client: &Client) {
             }
         }
         chat_widget.handle_codex_event(event);
+        render_widget(&chat_widget);
     }
 
     assert!(saw_turn_started, "expected TurnStarted event via TUI");
@@ -301,6 +353,7 @@ async fn tui_model_turn(client: &Client) {
 }
 
 /// Verify that an ExecApprovalRequest flows through the TUI pipeline.
+/// Renders after every event.
 async fn tui_tool_approval_request(client: &Client) {
     let session = Arc::new(new_session(client, "gpt-4o"));
     let (mut chat_widget, mut rx) = build_tui_for_session(
@@ -309,14 +362,17 @@ async fn tui_tool_approval_request(client: &Client) {
         Some("Use shell to run 'echo temporal-tui-test' and tell me the output."),
     );
 
+    render_widget(&chat_widget);
+
     // 1. Process SessionConfigured.
     let event = next_codex_event(&mut rx, Duration::from_secs(10))
         .await
         .expect("timed out waiting for SessionConfigured");
     assert!(matches!(&event.msg, EventMsg::SessionConfigured(_)));
     chat_widget.handle_codex_event(event);
+    render_widget(&chat_widget);
 
-    // 2. Wait for ExecApprovalRequest (the model should try to run a shell command).
+    // 2. Wait for ExecApprovalRequest or TurnComplete.
     let mut saw_approval_request = false;
 
     loop {
@@ -332,26 +388,84 @@ async fn tui_tool_approval_request(client: &Client) {
                 );
                 saw_approval_request = true;
                 chat_widget.handle_codex_event(event);
+                render_widget(&chat_widget);
                 break;
             }
             EventMsg::TurnComplete(_) => {
-                // Model decided not to use a tool — that's acceptable too.
                 eprintln!("  [tui_tool_approval] TurnComplete (no tool call)");
                 chat_widget.handle_codex_event(event);
+                render_widget(&chat_widget);
                 break;
             }
             _ => {
                 chat_widget.handle_codex_event(event);
+                render_widget(&chat_widget);
             }
         }
     }
 
-    // The key assertion: events from the Temporal workflow flowed through
-    // wire_session → app_event channel → we could process them in the TUI.
-    // If the model used a tool, we saw the approval request.
     if !saw_approval_request {
         eprintln!("  [tui_tool_approval] note: model did not issue a tool call this run");
     }
+}
+
+/// Simulate a real user interaction: type characters, press Enter, wait for
+/// the response. This exercises the full input → render → submit → workflow →
+/// events → render path, matching what happens in the actual TUI binary.
+async fn tui_interactive_turn(client: &Client) {
+    // Build a session with NO initial prompt — we'll type it.
+    let session = Arc::new(new_session(client, "gpt-4o"));
+    let (mut chat_widget, mut rx) = build_tui_for_session(session, "gpt-4o", None);
+
+    render_widget(&chat_widget);
+
+    // 1. Process SessionConfigured so the widget is ready to accept input.
+    let event = next_codex_event(&mut rx, Duration::from_secs(10))
+        .await
+        .expect("timed out waiting for SessionConfigured");
+    assert!(matches!(&event.msg, EventMsg::SessionConfigured(_)));
+    chat_widget.handle_codex_event(event);
+    render_widget(&chat_widget);
+
+    // 2. Type "Hi" character by character, then press Enter.
+    for ch in "Hi".chars() {
+        chat_widget.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        render_widget(&chat_widget);
+    }
+    chat_widget.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    render_widget(&chat_widget);
+
+    // 3. Wait for events from the workflow (the Enter should have submitted Op::UserTurn).
+    let mut saw_turn_started = false;
+    let mut saw_turn_complete = false;
+
+    loop {
+        let event = next_codex_event(&mut rx, Duration::from_secs(120))
+            .await
+            .expect("timed out waiting for TurnComplete in interactive turn");
+        match &event.msg {
+            EventMsg::TurnStarted(_) => {
+                eprintln!("  [tui_interactive] TurnStarted");
+                saw_turn_started = true;
+            }
+            EventMsg::TurnComplete(tc) => {
+                eprintln!(
+                    "  [tui_interactive] TurnComplete: {:?}",
+                    tc.last_agent_message
+                );
+                saw_turn_complete = true;
+                chat_widget.handle_codex_event(event);
+                render_widget(&chat_widget);
+                break;
+            }
+            _ => {}
+        }
+        chat_widget.handle_codex_event(event);
+        render_widget(&chat_widget);
+    }
+
+    assert!(saw_turn_started, "expected TurnStarted from typed input");
+    assert!(saw_turn_complete, "expected TurnComplete from typed input");
 }
 
 // ---------------------------------------------------------------------------
@@ -360,14 +474,33 @@ async fn tui_tool_approval_request(client: &Client) {
 
 #[tokio::test]
 async fn tui_e2e_tests() {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set for TUI E2E tests");
-    assert!(!api_key.is_empty(), "OPENAI_API_KEY must not be empty");
+    match tokio::time::timeout(Duration::from_secs(180), tui_e2e_tests_inner()).await {
+        Ok(()) => {}
+        Err(_) => panic!("tui_e2e_tests timed out after 180s"),
+    }
+}
 
-    let url = server_url();
+async fn tui_e2e_tests_inner() {
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            eprintln!("OPENAI_API_KEY not set — skipping TUI E2E tests");
+            return;
+        }
+    };
+    let _ = api_key; // validated above
+
+    let url = std::env::var("TEMPORAL_ADDRESS")
+        .unwrap_or_else(|_| "http://localhost:7233".to_string());
     eprintln!("Connecting to Temporal at {url}");
 
-    let client = connect_client(&url).await;
+    let client = match connect_client(&url).await {
+        Some(c) => c,
+        None => {
+            eprintln!("Temporal server not available — skipping TUI E2E tests");
+            return;
+        }
+    };
 
     eprintln!("Starting worker…");
     start_worker(url);
@@ -377,6 +510,9 @@ async fn tui_e2e_tests() {
 
     eprintln!("--- test: tui_tool_approval_request ---");
     tui_tool_approval_request(&client).await;
+
+    eprintln!("--- test: tui_interactive_turn ---");
+    tui_interactive_turn(&client).await;
 
     eprintln!("--- all TUI E2E tests passed ---");
 }

@@ -93,6 +93,7 @@ impl TemporalAgentSession {
             user_message: message,
             model: self.base_input.model.clone(),
             instructions: self.base_input.instructions.clone(),
+            approval_policy: self.base_input.approval_policy,
         };
 
         let options = WorkflowStartOptions::new(TASK_QUEUE, &self.workflow_id).build();

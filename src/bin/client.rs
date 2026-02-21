@@ -9,6 +9,7 @@ use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Wo
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use codex_protocol::protocol::AskForApproval;
 use codex_temporal::types::CodexWorkflowInput;
 use codex_temporal::workflow::CodexWorkflow;
 
@@ -50,10 +51,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ClientOptions::new("default").build(),
     )?;
 
+    let approval_policy = match std::env::var("CODEX_APPROVAL_POLICY")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "never" => AskForApproval::Never,
+        "untrusted" => AskForApproval::UnlessTrusted,
+        "on-failure" => AskForApproval::OnFailure,
+        _ => AskForApproval::OnRequest,
+    };
+
     let input = CodexWorkflowInput {
         user_message: user_message.clone(),
         model: std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
         instructions: "You are a helpful coding assistant.".to_string(),
+        approval_policy,
     };
 
     let workflow_id = format!("codex-{}", uuid::Uuid::new_v4());

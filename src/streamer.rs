@@ -31,22 +31,19 @@ impl ModelStreamer for TemporalModelStreamer {
         prompt: &Prompt,
         model_info: &ModelInfo,
         _otel_manager: &OtelManager,
-        _effort: Option<ReasoningEffort>,
-        _summary: ReasoningSummary,
+        effort: Option<ReasoningEffort>,
+        summary: ReasoningSummary,
         _turn_metadata_header: Option<&str>,
     ) -> codex_core::error::Result<ResponseStream> {
-        let tools_json: Vec<serde_json::Value> = prompt
-            .tools
-            .iter()
-            .filter_map(|t| serde_json::to_value(t).ok())
-            .collect();
-
         let input = ModelCallInput {
             input: prompt.input.clone(),
-            tools_json,
+            tools: prompt.tools.clone(),
             parallel_tool_calls: prompt.parallel_tool_calls,
             instructions: prompt.base_instructions.text.clone(),
-            model: model_info.slug.clone(),
+            model_info: model_info.clone(),
+            effort,
+            summary,
+            personality: prompt.personality,
         };
 
         let opts = ActivityOptions {
