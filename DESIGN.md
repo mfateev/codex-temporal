@@ -168,6 +168,103 @@ Full codex passes `Arc::clone(&session.core)` (or relies on `Deref`) to `try_run
 - `tool_exec` — add handlers for `apply_patch`, `read_file`, `list_dir`, `grep_files`
 - Each tool handler is straightforward I/O (~10-150 lines each)
 
+## Worker-Level State for Persistent Processes
+
+Some codex features require **long-lived processes** that outlive individual activity calls: PTY sessions, JS REPL kernels, MCP server connections. Activities are stateless one-shot functions — they can't hold a subprocess or connection open between invocations.
+
+The solution is **worker-level state**: the worker process owns persistent resources, and activities access them by reference.
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Worker Process (long-lived)                          │
+│                                                      │
+│  WorkerResources (shared across all activities)      │
+│  ├── mcp_connections: HashMap<String, McpConnection> │
+│  ├── pty_sessions: HashMap<String, PtySession>       │
+│  ├── js_repl: Option<JsReplKernel>                   │
+│  └── sandbox_config: SandboxConfig                   │
+│                                                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
+│  │ Activity    │  │ Activity    │  │ Activity    │  │
+│  │ tool_exec   │  │ model_call  │  │ tool_exec   │  │
+│  │  accesses   │  │             │  │  accesses   │  │
+│  │  PTY #3     │  │  ModelClient│  │  MCP "git"  │  │
+│  └─────────────┘  └─────────────┘  └─────────────┘  │
+└──────────────────────────────────────────────────────┘
+```
+
+### How it works
+
+1. **Worker startup**: The worker process creates `WorkerResources` — starts MCP servers, initializes sandbox config, prepares PTY/REPL infrastructure.
+
+2. **Activity access**: Activities receive a reference to `WorkerResources` via the activity context. They look up or create persistent resources by key (e.g., workflow ID → PTY session).
+
+3. **Lifecycle**: Resources are tied to the worker process lifetime. When the worker restarts, resources are re-created. The workflow is unaffected — it replays and activities re-establish connections.
+
+### What this enables
+
+| Feature | Worker resource | Activity usage |
+|---|---|---|
+| **MCP tools** | `McpConnection` per server | Activity sends request, gets response |
+| **JS REPL** | `JsReplKernel` per workflow | Activity evaluates code, returns result |
+| **PTY / unified exec** | `PtySession` per terminal | Activity writes command, reads output |
+| **Background terminals** | Multiple `PtySession`s | `/ps` queries workflow state, execution via activities |
+| **Sandbox (bubblewrap)** | `SandboxConfig` | Activity wraps subprocess in bubblewrap |
+| **Network proxy** | `ManagedProxy` | Activity routes requests through proxy |
+
+### Trade-off: Sticky task routing
+
+Worker-level state means a workflow's activities must run on the **same worker** that holds its resources. This requires sticky task routing — assigning each workflow to a specific worker via a workflow-specific task queue or session-based routing.
+
+This breaks the "any worker can handle any task" assumption, but is the correct trade-off for a coding agent:
+- The worker runs on the **machine with the code** (filesystem access required)
+- Coding agents are inherently single-machine (you edit files on one machine)
+- The worker IS the machine — sticky routing is the natural model
+
+For multi-machine deployments, each machine runs its own worker with its own task queue. The TUI connects to the workflow, which routes activities to the right worker.
+
+### Implementation
+
+```rust
+/// Shared state held by the worker process.
+pub struct WorkerResources {
+    mcp: Mutex<HashMap<String, McpConnection>>,
+    pty: Mutex<HashMap<String, PtySession>>,
+    js_repl: Mutex<Option<JsReplKernel>>,
+    sandbox: SandboxConfig,
+}
+
+/// Activities access worker resources via the activity struct.
+pub struct CodexActivities {
+    resources: Arc<WorkerResources>,
+}
+
+#[activities]
+impl CodexActivities {
+    #[activity]
+    pub async fn tool_exec(&self, ctx: ActivityContext, input: ToolExecInput)
+        -> Result<ToolExecOutput, ActivityError>
+    {
+        match input.tool_name.as_str() {
+            "shell" => self.run_shell(&input).await,
+            "apply_patch" => self.apply_patch(&input).await,
+            "js_repl" => {
+                // Access persistent kernel from worker resources
+                let mut repl = self.resources.js_repl.lock().await;
+                let kernel = repl.get_or_insert_with(|| JsReplKernel::new());
+                kernel.eval(&input.arguments).await
+            }
+            name if self.resources.is_mcp_tool(name) => {
+                // Route to persistent MCP connection
+                let conn = self.resources.mcp_connection(name).await?;
+                conn.call_tool(&input.arguments).await
+            }
+            _ => Err(anyhow::anyhow!("unknown tool: {}", input.tool_name).into()),
+        }
+    }
+}
+```
+
 ## Benefits
 
 1. **No dead fields** — workflow constructs exactly what it needs
@@ -176,3 +273,5 @@ Full codex passes `Arc::clone(&session.core)` (or relies on `Deref`) to `try_run
 4. **Codex stays clean** — `Session` wraps `SessionCore` via `Deref`, existing code unchanged
 5. **Feature parity path** — as codex adds state to `SessionCore`, Temporal gets it automatically
 6. **No duplication** — approval logic, history management, prompt building shared between codex and Temporal
+7. **Persistent processes** — worker-level state enables MCP, PTY, JS REPL, sandbox without architectural mismatch
+8. **Natural deployment** — sticky routing matches the reality that coding agents work on a single machine
