@@ -6,9 +6,9 @@ Single/multi-turn conversation, shell tool execution as durable activities, tool
 
 ---
 
-## Phase 1: Model & Streaming
+## Phase 1: Model Improvements
 
-1. **Streaming responses** — chunked delivery via activity heartbeats so TUI shows tokens incrementally
+1. ~~**Streaming responses**~~ — *out of scope*
 2. **Reasoning effort** — pass low/medium/high through to Responses API; wire `/model` command
 3. **Multi-provider** — route `model_call` to OpenAI/Ollama/LM Studio/custom based on workflow input
 4. **Prompt caching** — cache control headers for long conversations
@@ -89,7 +89,7 @@ Single/multi-turn conversation, shell tool execution as durable activities, tool
 |-------|-------|-----------|
 | 1 | 3 — Approval policies | Biggest usability win; `never` mode removes friction |
 | 2 | 2 — Tool ecosystem | Apply-patch alone unlocks most coding workflows |
-| 3 | 1 — Streaming | Makes TUI feel responsive |
+| 3 | 1 — Model improvements | Reasoning effort, multi-provider, prompt caching |
 | 4 | 5 — Session persistence | Resume is critical for real usage |
 | 5 | 4 — Config/auth | Needed for multi-user deployment |
 | 6 | 8 — Git/project context | Important for coding tasks |

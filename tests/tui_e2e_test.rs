@@ -188,7 +188,7 @@ async fn next_codex_event(
 // Infrastructure: connect + start worker
 // ---------------------------------------------------------------------------
 
-async fn connect_client(url: &str) -> Client {
+async fn connect_client(url: &str) -> Option<Client> {
     let conn_opts = ConnectionOptions::new(Url::from_str(url).expect("bad URL"))
         .identity("tui-e2e-test-client")
         .build();
@@ -199,17 +199,27 @@ async fn connect_client(url: &str) -> Client {
         .expect("runtime options");
     let _runtime = CoreRuntime::new_assume_tokio(runtime_options).expect("runtime");
 
-    let connection = Connection::connect(conn_opts)
-        .await
-        .expect("failed to connect to Temporal server — is it running?");
-    Client::new(connection, ClientOptions::new("default").build())
-        .expect("failed to create client")
+    match tokio::time::timeout(Duration::from_secs(10), Connection::connect(conn_opts)).await {
+        Ok(Ok(connection)) => {
+            let client = Client::new(connection, ClientOptions::new("default").build())
+                .expect("failed to create client");
+            Some(client)
+        }
+        Ok(Err(e)) => {
+            eprintln!("failed to connect to Temporal server at {url}: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("connection to Temporal server at {url} timed out (10s)");
+            None
+        }
+    }
 }
 
 /// Start a worker on a dedicated OS thread (Worker future is !Send).
 /// Returns when the worker is ready to poll.
 fn start_worker(url: String) {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -229,9 +239,24 @@ fn start_worker(url: String) {
             let conn = ConnectionOptions::new(Url::from_str(&url).expect("bad URL"))
                 .identity("tui-e2e-test-worker")
                 .build();
-            let connection = Connection::connect(conn)
-                .await
-                .expect("worker: failed to connect");
+
+            let connection = match tokio::time::timeout(
+                Duration::from_secs(10),
+                Connection::connect(conn),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    let _ = ready_tx.send(Err(format!("worker connect failed: {e}")));
+                    return;
+                }
+                Err(_) => {
+                    let _ = ready_tx.send(Err("worker connect timed out (10s)".into()));
+                    return;
+                }
+            };
+
             let worker_client =
                 Client::new(connection, ClientOptions::new("default").build())
                     .expect("worker: failed to create client");
@@ -244,7 +269,7 @@ fn start_worker(url: String) {
             let mut worker = Worker::new(&worker_runtime, worker_client, opts)
                 .expect("failed to create worker");
 
-            let _ = ready_tx.send(());
+            let _ = ready_tx.send(Ok(()));
 
             if let Err(e) = worker.run().await {
                 eprintln!("worker error: {e}");
@@ -252,9 +277,11 @@ fn start_worker(url: String) {
         });
     });
 
-    ready_rx
-        .recv()
-        .expect("worker thread died before becoming ready");
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("worker failed to start: {e}"),
+        Err(_) => panic!("worker thread died before becoming ready"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,15 +473,33 @@ async fn tui_interactive_turn(client: &Client) {
 
 #[tokio::test]
 async fn tui_e2e_tests() {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set for TUI E2E tests");
-    assert!(!api_key.is_empty(), "OPENAI_API_KEY must not be empty");
+    match tokio::time::timeout(Duration::from_secs(180), tui_e2e_tests_inner()).await {
+        Ok(()) => {}
+        Err(_) => panic!("tui_e2e_tests timed out after 180s"),
+    }
+}
+
+async fn tui_e2e_tests_inner() {
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            eprintln!("OPENAI_API_KEY not set — skipping TUI E2E tests");
+            return;
+        }
+    };
+    let _ = api_key; // validated above
 
     let url = std::env::var("TEMPORAL_ADDRESS")
         .unwrap_or_else(|_| "http://localhost:7233".to_string());
     eprintln!("Connecting to Temporal at {url}");
 
-    let client = connect_client(&url).await;
+    let client = match connect_client(&url).await {
+        Some(c) => c,
+        None => {
+            eprintln!("Temporal server not available — skipping TUI E2E tests");
+            return;
+        }
+    };
 
     eprintln!("Starting worker…");
     start_worker(url);

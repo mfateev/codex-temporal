@@ -198,19 +198,38 @@ async fn tool_approval_flow(client: &Client) {
 
 #[tokio::test]
 async fn e2e_tests() {
+    match tokio::time::timeout(Duration::from_secs(180), e2e_tests_inner()).await {
+        Ok(()) => {}
+        Err(_) => panic!("e2e_tests timed out after 180s"),
+    }
+}
+
+async fn e2e_tests_inner() {
     if std::env::var("OPENAI_API_KEY").is_err() {
         eprintln!("OPENAI_API_KEY not set — skipping E2E tests");
         return;
     }
 
-    // --- start ephemeral server ---
-    let config = TemporalDevServerConfig::builder()
-        .exe(default_cached_download())
-        .build();
-    let mut server = config
-        .start_server()
-        .await
-        .expect("failed to start ephemeral server");
+    // --- start ephemeral server (fail fast if download/start hangs) ---
+    let server_result = tokio::time::timeout(Duration::from_secs(60), async {
+        let config = TemporalDevServerConfig::builder()
+            .exe(default_cached_download())
+            .build();
+        config.start_server().await
+    })
+    .await;
+
+    let mut server = match server_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            eprintln!("failed to start ephemeral server: {e} — skipping E2E tests");
+            return;
+        }
+        Err(_) => {
+            eprintln!("ephemeral server startup timed out (60s) — skipping E2E tests");
+            return;
+        }
+    };
 
     let server_target = server.target.clone();
 
@@ -227,9 +246,24 @@ async fn e2e_tests() {
         .expect("runtime options");
     let runtime = CoreRuntime::new_assume_tokio(runtime_options).expect("runtime");
 
-    let connection = Connection::connect(conn_opts)
-        .await
-        .expect("failed to connect");
+    let connection = match tokio::time::timeout(
+        Duration::from_secs(10),
+        Connection::connect(conn_opts),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("failed to connect to ephemeral server: {e} — skipping");
+            let _ = server.shutdown().await;
+            return;
+        }
+        Err(_) => {
+            eprintln!("connection to ephemeral server timed out (10s) — skipping");
+            let _ = server.shutdown().await;
+            return;
+        }
+    };
     let client = Client::new(connection, ClientOptions::new("default").build())
         .expect("failed to create client");
 
@@ -258,9 +292,25 @@ async fn e2e_tests() {
             .identity("e2e-test-worker")
             .build();
 
-            let connection = Connection::connect(conn)
-                .await
-                .expect("worker: failed to connect");
+            let connection = match tokio::time::timeout(
+                Duration::from_secs(10),
+                Connection::connect(conn),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    eprintln!("worker connect failed: {e}");
+                    let _ = ready_tx.send(());
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("worker connect timed out (10s)");
+                    let _ = ready_tx.send(());
+                    return;
+                }
+            };
+
             let worker_client =
                 Client::new(connection, ClientOptions::new("default").build())
                     .expect("worker: failed to create client");
