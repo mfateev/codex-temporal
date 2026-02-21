@@ -1,103 +1,76 @@
-# Codex-Temporal Design: SessionCore Refactoring
+# Codex-Temporal Design: Session Integration
 
 ## Problem
 
 Codex's `Session` is a monolithic "god object" that owns everything needed to run the agent in a single process: conversation state, model client, tool execution, MCP connections, auth, analytics, sandbox, file watching, network proxy, agent lifecycle, and more.
 
-The Temporal harness only needs the **state management** portion. Currently `Session::new_minimal()` constructs a full `Session` with most fields stubbed — this works but is conceptually wrong (a Session that isn't really a Session) and carries 24 dead fields in the workflow.
+The Temporal harness only needs the **state management** portion. `Session::new_minimal()` constructs a full `Session` with most service fields stubbed to defaults/no-ops. This works and is the chosen approach — it avoids splitting `Session` into separate types, which would require moving ~20 methods, updating all callers, and touching 16+ files for marginal benefit.
 
-## Solution: Composition via SessionCore
+## Approach: Single Session with Stubs
 
-Split `Session` into a base (`SessionCore`) and a full variant (`Session`) using Rust composition:
+Rather than extracting a `SessionCore` base type, we keep a single `Session` struct and use `Session::new_minimal()` to construct it for the Temporal workflow. The stub fields carry no meaningful runtime cost and the constructor is straightforward.
 
 ```
-SessionCore                          Session
-├── conversation_id                  ├── core: SessionCore
-├── config                           └── services: SessionServices
-├── history                              ├── model_client
-├── event_sink (dyn EventSink)           ├── mcp_connection_manager
-├── storage (dyn StorageBackend)         ├── auth_manager
-└── approval_store                       ├── unified_exec_manager
-                                         ├── zsh_exec_bridge
-                                         ├── user_shell
-                                         ├── exec_policy
-                                         ├── analytics
-                                         ├── hooks
-                                         ├── rollout
-                                         ├── file_watcher
-                                         ├── agent_control
-                                         ├── network_proxy
-                                         ├── skills_manager
-                                         ├── models_manager
-                                         ├── otel_manager
-                                         └── ... (24 fields total)
+Session (used by both codex CLI and Temporal workflow)
+├── conversation_id
+├── state (Mutex<SessionState>)        ← conversation history, token info
+├── features
+├── active_turn
+├── event_sink (dyn EventSink)         ← ChannelEventSink (codex) / BufferEventSink (Temporal)
+├── storage (dyn StorageBackend)       ← RolloutFileStorage (codex) / InMemoryStorage (Temporal)
+├── next_internal_sub_id
+├── tx_event
+├── agent_status
+├── pending_mcp_server_refresh_config
+├── js_repl
+└── services: SessionServices
+    ├── model_client                   ← stubbed in Temporal (unused — activities do model calls)
+    ├── mcp_connection_manager         ← stubbed (default empty)
+    ├── auth_manager                   ← stubbed (API key "harness")
+    ├── otel_manager                   ← no-op (no telemetry in workflow)
+    ├── ... (24 fields total)          ← all stubbed to defaults/no-ops
+    └── show_raw_agent_reasoning       ← false
 ```
 
-### SessionCore — the "base class"
+### Why this works
 
-Contains only what the agentic loop (`try_run_sampling_request`) needs:
+1. **`event_sink` and `storage`** are injected via traits — Temporal provides its own implementations.
+2. **`EntropyProviders`** are scoped per-turn via task-local `ENTROPY` — Temporal injects deterministic implementations.
+3. **`ModelStreamer` and `ToolCallHandler`** are generic parameters on `try_run_sampling_request` — Temporal provides its own activity-backed implementations.
+4. **The 24 stubbed service fields** are never accessed in the Temporal workflow path. They're dead weight (~few KB) but cause no correctness issues.
 
-```rust
-pub struct SessionCore {
-    pub conversation_id: ThreadId,
-    pub config: Arc<Config>,
-    history: Mutex<Vec<ResponseItem>>,
-    event_sink: Arc<dyn EventSink>,
-    storage: Arc<dyn StorageBackend>,
-    approval_store: Mutex<ApprovalStore>,
-}
+### Why not SessionCore
 
-impl SessionCore {
-    // Conversation state
-    pub async fn record_items(&self, ctx: &TurnContext, items: &[ResponseItem]);
-    pub async fn history_items(&self) -> Vec<ResponseItem>;
+We explored extracting a `SessionCore` struct (containing only the fields `try_run_sampling_request` needs) and having `Session` wrap it via `Deref`. This required:
+- Moving ~20 methods from `impl Session` to `impl SessionCore`
+- Updating every call site that accesses `services.otel_manager` (16+ files, 40+ references)
+- Changing `try_run_sampling_request` signature from `Arc<Session>` to `Arc<SessionCore>`
+- Updating all plan-mode helpers, `HandleOutputCtx`, `drain_in_flight`, etc.
 
-    // Approval logic (deterministic, no I/O)
-    pub fn check_tool_approval(&self, command: &[String], policy: AskForApproval) -> ExecApprovalRequirement;
-    pub fn record_tool_approval(&self, key: &str, decision: ReviewDecision);
-}
-```
-
-### Session — the "subclass"
-
-Wraps `SessionCore` and adds heavy services for the full codex CLI:
-
-```rust
-pub struct Session {
-    pub core: SessionCore,
-    pub(crate) services: SessionServices,
-}
-
-impl Deref for Session {
-    type Target = SessionCore;
-    fn deref(&self) -> &SessionCore { &self.core }
-}
-```
-
-Full codex constructs `Session` (which contains `SessionCore`). Temporal workflow constructs `SessionCore` directly — no stubs, no defaults, no dead fields.
+The refactoring touched too many files for too little benefit. The single-Session approach with stubs is simpler, works today, and can be revisited if the stub overhead ever becomes a real problem.
 
 ## How It Maps to Temporal
 
-Temporal decomposes `Session`'s responsibilities across its own primitives. `SessionCore` runs in the workflow; `SessionServices` functionality is replaced by activities:
+Temporal decomposes `Session`'s responsibilities across its own primitives. `Session::new_minimal()` runs in the workflow; `SessionServices` functionality is replaced by activities:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Temporal Workflow (deterministic)                       │
 │                                                         │
-│  SessionCore                                            │
-│  ├── conversation history    (workflow state)            │
-│  ├── approval store          (workflow state)            │
-│  ├── event sink              (BufferEventSink)           │
-│  ├── config                  (workflow input)            │
-│  └── approval logic          (deterministic checks)     │
+│  Session (via new_minimal)                              │
+│  ├── conversation history    (workflow state)           │
+│  ├── event sink              (BufferEventSink)          │
+│  ├── storage                 (InMemoryStorage)          │
+│  ├── config                  (Config::for_harness)      │
+│  └── services                (all stubbed)              │
 │                                                         │
-│  try_run_sampling_request(sess_core, streamer, handler)  │
-│       │                          │            │          │
-│       │                   ┌──────┘     ┌──────┘          │
-│       ▼                   ▼            ▼                 │
-│  SessionCore        ModelStreamer  ToolCallHandler        │
-│  (state only)       (trait)       (trait)                │
-└───────────────────────┬───────────────┬──────────────────┘
+│  try_run_sampling_request(sess, streamer, handler)      │
+│       │                          │            │         │
+│       │                   ┌──────┘     ┌──────┘         │
+│       ▼                   ▼            ▼                │
+│  Session             ModelStreamer  ToolCallHandler      │
+│  (state + stubs)     (trait)       (trait)               │
+└───────────────────────┬───────────────┬─────────────────┘
                         │               │
                   ┌─────▼─────┐   ┌─────▼─────┐
                   │ Activity  │   │ Activity  │
@@ -112,59 +85,39 @@ Temporal decomposes `Session`'s responsibilities across its own primitives. `Ses
 
 | Responsibility | Codex (single process) | Temporal |
 |---|---|---|
-| Conversation history | `Session.history` | `SessionCore` in workflow state |
-| Prompt building | `Session` methods | `SessionCore` in workflow |
-| Approval decisions | `Session.services.tool_approvals` | `SessionCore.approval_store` in workflow |
-| Command safety | `Session.services.exec_policy` | `is_known_safe_command()` in workflow |
+| Conversation history | `Session.state` | `Session::new_minimal()` in workflow |
+| Prompt building | `Session` methods | Same `Session` methods in workflow |
 | Model calls | `Session.services.model_client` | `model_call` activity (uses `ModelClient`) |
 | Tool execution | `Session.services` (shell, sandbox) | `tool_exec` activity (subprocess/file I/O) |
-| Event delivery | `Session.event_sink` channel | `BufferEventSink` + query polling |
-| Persistence | `Session.services.rollout` files | Temporal workflow history (built-in) |
+| Event delivery | `Session.event_sink` (channel) | `BufferEventSink` + query polling |
+| Persistence | `Session.services.rollout` (files) | Temporal workflow history (built-in) |
 | Fault tolerance | None (process dies = state lost) | Workflow replay (automatic) |
 | Auth | `Session.services.auth_manager` | Worker env var (`OPENAI_API_KEY`) |
+| Entropy | System random + clock | Deterministic `TemporalRandomSource` / `TemporalClock` |
 
-## Codex-Core Changes Required
+## Codex-Core Extension Points (already done)
 
-### 1. Extract SessionCore (~100 lines moved)
+No `SessionCore` extraction needed. The following traits/abstractions are already in place:
 
-Move from `Session` to `SessionCore`:
-- `conversation_id`, `config`, history state, `event_sink`, `storage`
-- `record_items()`, `history_items()` methods
-- Add `approval_store` + approval check methods
+1. **`EventSink` trait** — pluggable event delivery (`ChannelEventSink` / `BufferEventSink`)
+2. **`StorageBackend` trait** — pluggable rollout persistence (`RolloutFileStorage` / `InMemoryStorage`)
+3. **`ModelStreamer` trait** — pluggable model calls (generic on `try_run_sampling_request`)
+4. **`ToolCallHandler` trait** — pluggable tool execution (generic on `try_run_sampling_request`)
+5. **`EntropyProviders`** — pluggable random/clock via task-local `ENTROPY`
+6. **`AgentSession` trait** — pluggable agent backend for TUI
+7. **`Session::new_minimal()`** — zero-service constructor for external harnesses
+8. **`Config::for_harness()`** — zero-I/O config constructor
 
-### 2. Update try_run_sampling_request signature
-
-```rust
-// Before:
-pub async fn try_run_sampling_request<M, T>(sess: Arc<Session>, ...)
-// After:
-pub async fn try_run_sampling_request<M, T>(sess: Arc<SessionCore>, ...)
-```
-
-### 3. Export approval types (4 items)
-
-```rust
-// In lib.rs:
-pub use tools::sandboxing::{ApprovalStore, ExecApprovalRequirement, default_exec_approval_requirement};
-pub use exec_policy::render_decision_for_unmatched_command;
-```
-
-### 4. Update codex callers
-
-Full codex passes `Arc::clone(&session.core)` (or relies on `Deref`) to `try_run_sampling_request`. No behavior change — just passing the inner type.
-
-## Codex-Temporal Changes
+## Codex-Temporal Changes (next steps)
 
 ### Workflow
 
-- Construct `SessionCore` directly (no `Session::new_minimal()`)
-- Use `sess_core.check_tool_approval()` before dispatching tool activities
-- Only emit `ExecApprovalRequest` signal when policy requires user input
-- Cache approval decisions in `sess_core.approval_store`
+- Uses `Session::new_minimal()` (already done)
+- Approval decisions via `ExecApprovalRequest` signal + `wait_condition`
 
 ### Activities
 
-- `model_call` — already uses `ModelClient` (done)
+- `model_call` — uses codex `ModelClient` / `ModelClientSession` (done)
 - `tool_exec` — add handlers for `apply_patch`, `read_file`, `list_dir`, `grep_files`
 - Each tool handler is straightforward I/O (~10-150 lines each)
 
@@ -222,56 +175,3 @@ This breaks the "any worker can handle any task" assumption, but is the correct 
 - The worker IS the machine — sticky routing is the natural model
 
 For multi-machine deployments, each machine runs its own worker with its own task queue. The TUI connects to the workflow, which routes activities to the right worker.
-
-### Implementation
-
-```rust
-/// Shared state held by the worker process.
-pub struct WorkerResources {
-    mcp: Mutex<HashMap<String, McpConnection>>,
-    pty: Mutex<HashMap<String, PtySession>>,
-    js_repl: Mutex<Option<JsReplKernel>>,
-    sandbox: SandboxConfig,
-}
-
-/// Activities access worker resources via the activity struct.
-pub struct CodexActivities {
-    resources: Arc<WorkerResources>,
-}
-
-#[activities]
-impl CodexActivities {
-    #[activity]
-    pub async fn tool_exec(&self, ctx: ActivityContext, input: ToolExecInput)
-        -> Result<ToolExecOutput, ActivityError>
-    {
-        match input.tool_name.as_str() {
-            "shell" => self.run_shell(&input).await,
-            "apply_patch" => self.apply_patch(&input).await,
-            "js_repl" => {
-                // Access persistent kernel from worker resources
-                let mut repl = self.resources.js_repl.lock().await;
-                let kernel = repl.get_or_insert_with(|| JsReplKernel::new());
-                kernel.eval(&input.arguments).await
-            }
-            name if self.resources.is_mcp_tool(name) => {
-                // Route to persistent MCP connection
-                let conn = self.resources.mcp_connection(name).await?;
-                conn.call_tool(&input.arguments).await
-            }
-            _ => Err(anyhow::anyhow!("unknown tool: {}", input.tool_name).into()),
-        }
-    }
-}
-```
-
-## Benefits
-
-1. **No dead fields** — workflow constructs exactly what it needs
-2. **Type-safe separation** — compiler enforces that workflow code can't access services
-3. **Testable** — `SessionCore` can be unit tested without Temporal or heavy services
-4. **Codex stays clean** — `Session` wraps `SessionCore` via `Deref`, existing code unchanged
-5. **Feature parity path** — as codex adds state to `SessionCore`, Temporal gets it automatically
-6. **No duplication** — approval logic, history management, prompt building shared between codex and Temporal
-7. **Persistent processes** — worker-level state enables MCP, PTY, JS REPL, sandbox without architectural mismatch
-8. **Natural deployment** — sticky routing matches the reality that coding agents work on a single machine
