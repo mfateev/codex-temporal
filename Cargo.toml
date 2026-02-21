@@ -33,6 +33,7 @@ codex-feedback = { path = "../codex/codex-rs/feedback" }
 codex-protocol = { path = "../codex/codex-rs/protocol" }
 codex-otel = { path = "../codex/codex-rs/otel" }
 codex-tui = { path = "../codex/codex-rs/tui" }
+codex-shell-command = { path = "../codex/codex-rs/shell-command" }
 
 
 # Patches required by codex-core/codex-tui transitive dependencies

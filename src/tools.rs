@@ -18,7 +18,8 @@ use codex_core::error::CodexErr;
 use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
 use codex_protocol::models::ResponseInputItem;
-use codex_protocol::protocol::{Event, EventMsg, ExecApprovalRequestEvent};
+use codex_protocol::protocol::{AskForApproval, Event, EventMsg, ExecApprovalRequestEvent};
+use codex_shell_command::is_safe_command::is_known_safe_command;
 use temporalio_sdk::{ActivityOptions, WorkflowContext};
 use tokio_util::sync::CancellationToken;
 
@@ -29,10 +30,18 @@ use crate::workflow::CodexWorkflow;
 
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
 /// dispatches approved calls as Temporal activities.
+///
+/// The approval behavior depends on the configured [`AskForApproval`] policy:
+///
+/// - **`Never`** — execute immediately, no approval prompt.
+/// - **`OnRequest`** / **`OnFailure`** — always prompt for approval.
+/// - **`UnlessTrusted`** — auto-approve commands that pass
+///   `is_known_safe_command()`; prompt for everything else.
 pub struct TemporalToolHandler {
     ctx: WorkflowContext<CodexWorkflow>,
     events: Arc<BufferEventSink>,
     turn_id: String,
+    approval_policy: AskForApproval,
 }
 
 impl TemporalToolHandler {
@@ -40,11 +49,13 @@ impl TemporalToolHandler {
         ctx: WorkflowContext<CodexWorkflow>,
         events: Arc<BufferEventSink>,
         turn_id: String,
+        approval_policy: AskForApproval,
     ) -> Self {
         Self {
             ctx,
             events,
             turn_id,
+            approval_policy,
         }
     }
 }
@@ -60,6 +71,7 @@ impl ToolCallHandler for TemporalToolHandler {
         let ctx = self.ctx.clone();
         let events = self.events.clone();
         let turn_id = self.turn_id.clone();
+        let approval_policy = self.approval_policy;
 
         let arguments = match &call.payload {
             codex_core::ToolPayload::Function { arguments } => arguments.clone(),
@@ -82,52 +94,62 @@ impl ToolCallHandler for TemporalToolHandler {
             .unwrap_or_else(|| vec![arguments.clone()]);
 
         Box::pin(async move {
-            // 1. Set pending approval in workflow state
-            ctx.state_mut(|s| {
-                s.pending_approval = Some(PendingApproval {
-                    call_id: call_id.clone(),
-                    decision: None,
-                });
-            });
-
-            // 2. Emit ExecApprovalRequest event
-            let approval_event = Event {
-                id: turn_id.clone(),
-                msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
-                    call_id: call_id.clone(),
-                    approval_id: Some(call_id.clone()),
-                    turn_id,
-                    command,
-                    cwd: PathBuf::from("/tmp"),
-                    reason: None,
-                    network_approval_context: None,
-                    proposed_execpolicy_amendment: None,
-                    parsed_cmd: Vec::new(),
-                }),
+            // Determine whether this call needs user approval based on policy.
+            let needs_approval = match approval_policy {
+                AskForApproval::Never => false,
+                AskForApproval::UnlessTrusted => !is_known_safe_command(&command),
+                // OnRequest and OnFailure both require explicit approval.
+                AskForApproval::OnRequest | AskForApproval::OnFailure => true,
             };
-            events.emit_event_sync(approval_event);
 
-            // 3. Wait for approval decision
-            ctx.wait_condition(|s| {
-                s.pending_approval
-                    .as_ref()
-                    .map_or(true, |p| p.decision.is_some())
-            })
-            .await;
+            if needs_approval {
+                // 1. Set pending approval in workflow state
+                ctx.state_mut(|s| {
+                    s.pending_approval = Some(PendingApproval {
+                        call_id: call_id.clone(),
+                        decision: None,
+                    });
+                });
 
-            // 4. Check decision
-            let approved = ctx.state_mut(|s| {
-                let decision = s
-                    .pending_approval
-                    .as_ref()
-                    .and_then(|p| p.decision)
-                    .unwrap_or(false);
-                s.pending_approval = None;
-                decision
-            });
+                // 2. Emit ExecApprovalRequest event
+                let approval_event = Event {
+                    id: turn_id.clone(),
+                    msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                        call_id: call_id.clone(),
+                        approval_id: Some(call_id.clone()),
+                        turn_id,
+                        command,
+                        cwd: PathBuf::from("/tmp"),
+                        reason: None,
+                        network_approval_context: None,
+                        proposed_execpolicy_amendment: None,
+                        parsed_cmd: Vec::new(),
+                    }),
+                };
+                events.emit_event_sync(approval_event);
 
-            if !approved {
-                return Ok(denied_response(call_id));
+                // 3. Wait for approval decision
+                ctx.wait_condition(|s| {
+                    s.pending_approval
+                        .as_ref()
+                        .map_or(true, |p| p.decision.is_some())
+                })
+                .await;
+
+                // 4. Check decision
+                let approved = ctx.state_mut(|s| {
+                    let decision = s
+                        .pending_approval
+                        .as_ref()
+                        .and_then(|p| p.decision)
+                        .unwrap_or(false);
+                    s.pending_approval = None;
+                    decision
+                });
+
+                if !approved {
+                    return Ok(denied_response(call_id));
+                }
             }
 
             // 5. Execute tool as activity

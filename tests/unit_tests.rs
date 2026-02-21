@@ -167,6 +167,7 @@ fn workflow_input_roundtrips_through_json() {
         user_message: "Write a hello world program".to_string(),
         model: "gpt-4o".to_string(),
         instructions: "You are a coding assistant.".to_string(),
+        approval_policy: Default::default(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -358,4 +359,65 @@ async fn buffer_event_sink_emit_event_sync_works() {
     let (events, watermark) = sink.events_since(0);
     assert_eq!(events.len(), 1);
     assert_eq!(watermark, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Approval policy tests
+// ---------------------------------------------------------------------------
+
+use codex_protocol::protocol::AskForApproval;
+
+#[test]
+fn workflow_input_approval_policy_defaults_to_on_request() {
+    // Deserializing JSON without an approval_policy field should default to
+    // OnRequest (the codex default).
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(
+        matches!(input.approval_policy, AskForApproval::OnRequest),
+        "expected OnRequest, got {:?}",
+        input.approval_policy,
+    );
+}
+
+#[test]
+fn workflow_input_approval_policy_never_roundtrips() {
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: AskForApproval::Never,
+    };
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back.approval_policy, AskForApproval::Never));
+}
+
+#[test]
+fn workflow_input_approval_policy_untrusted_roundtrips() {
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: AskForApproval::UnlessTrusted,
+    };
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back.approval_policy, AskForApproval::UnlessTrusted));
+}
+
+#[test]
+fn is_known_safe_command_classifies_read_only_commands() {
+    use codex_shell_command::is_safe_command::is_known_safe_command;
+
+    // Safe commands should be auto-approved under UnlessTrusted.
+    assert!(is_known_safe_command(&["ls".to_string()]));
+    assert!(is_known_safe_command(&["cat".to_string(), "foo.txt".to_string()]));
+    assert!(is_known_safe_command(&["pwd".to_string()]));
+    assert!(is_known_safe_command(&["whoami".to_string()]));
+
+    // Unsafe commands should require approval under UnlessTrusted.
+    assert!(!is_known_safe_command(&["rm".to_string(), "-rf".to_string(), "/".to_string()]));
+    assert!(!is_known_safe_command(&["curl".to_string(), "https://example.com".to_string()]));
+    assert!(!is_known_safe_command(&["python".to_string(), "script.py".to_string()]));
 }

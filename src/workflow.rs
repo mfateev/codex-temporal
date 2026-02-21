@@ -256,6 +256,7 @@ impl CodexWorkflow {
                         ctx.clone(),
                         events.clone(),
                         turn_id.clone(),
+                        input.approval_policy,
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));

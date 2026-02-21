@@ -45,6 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_url = std::env::var("TEMPORAL_ADDRESS")
         .unwrap_or_else(|_| "http://localhost:7233".to_string());
     let model = std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+    let approval_policy = match std::env::var("CODEX_APPROVAL_POLICY")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "never" => AskForApproval::Never,
+        "untrusted" => AskForApproval::UnlessTrusted,
+        "on-failure" => AskForApproval::OnFailure,
+        _ => AskForApproval::OnRequest,
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // --- Connect to Temporal ---
@@ -65,6 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_message: String::new(),
         model: model.clone(),
         instructions: "You are a helpful coding assistant.".to_string(),
+        approval_policy,
     };
     let session = Arc::new(TemporalAgentSession::new(
         client,
@@ -79,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread_name: None,
         model: model.clone(),
         model_provider_id: "openai".to_string(),
-        approval_policy: AskForApproval::OnFailure,
+        approval_policy,
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         cwd: cwd.clone(),
         reasoning_effort: None,

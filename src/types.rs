@@ -139,6 +139,10 @@ pub struct CodexWorkflowInput {
     pub model: String,
     /// Base instructions / system prompt.
     pub instructions: String,
+    /// Tool approval policy — controls when tool executions require user
+    /// approval before running.
+    #[serde(default)]
+    pub approval_policy: codex_protocol::protocol::AskForApproval,
 }
 
 /// Output from the codex workflow.
