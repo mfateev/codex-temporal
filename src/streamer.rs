@@ -74,7 +74,7 @@ impl ModelStreamer for TemporalModelStreamer {
         }
         tx.send(Ok(ResponseEvent::Completed {
             response_id: String::new(),
-            token_usage: None,
+            token_usage: output.token_usage,
             can_append: false,
         }))
         .await

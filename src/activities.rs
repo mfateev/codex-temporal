@@ -143,12 +143,16 @@ impl CodexActivities {
             .map_err(|e| anyhow::anyhow!("model stream failed: {e}"))?;
 
         let mut items: Vec<ResponseItem> = Vec::new();
+        let mut token_usage = None;
         while let Some(event) = stream.next().await {
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items.push(item);
                 }
-                Ok(ResponseEvent::Completed { .. }) => break,
+                Ok(ResponseEvent::Completed { token_usage: usage, .. }) => {
+                    token_usage = usage;
+                    break;
+                }
                 Ok(_) => {} // Created, Delta, etc.
                 Err(e) => {
                     return Err(anyhow::anyhow!("model stream error: {e}").into());
@@ -156,9 +160,13 @@ impl CodexActivities {
             }
         }
 
-        tracing::info!(output_items = items.len(), "model_call completed");
+        tracing::info!(
+            output_items = items.len(),
+            ?token_usage,
+            "model_call completed"
+        );
 
-        Ok(ModelCallOutput { items })
+        Ok(ModelCallOutput { items, token_usage })
     }
 
     /// Execute a tool using codex-core's full ToolRegistry dispatch.

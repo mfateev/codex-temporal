@@ -16,6 +16,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use codex_core::config::Config;
+use codex_protocol::config_types::{Personality, ReasoningSummary};
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -79,12 +81,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    let reasoning_effort = match std::env::var("CODEX_EFFORT")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
+    };
+
+    let reasoning_summary = match std::env::var("CODEX_REASONING_SUMMARY")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "concise" => ReasoningSummary::Concise,
+        "detailed" => ReasoningSummary::Detailed,
+        _ => ReasoningSummary::Auto,
+    };
+
+    let personality = match std::env::var("CODEX_PERSONALITY")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "friendly" => Some(Personality::Friendly),
+        "pragmatic" => Some(Personality::Pragmatic),
+        _ => None,
+    };
+
     let base_input = CodexWorkflowInput {
         user_message: String::new(),
         model: model.clone(),
         instructions: "You are a helpful coding assistant.".to_string(),
         approval_policy,
         web_search_mode,
+        reasoning_effort,
+        reasoning_summary,
+        personality,
     };
     let session = Arc::new(TemporalAgentSession::new(
         client,
@@ -102,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         approval_policy,
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         cwd: cwd.clone(),
-        reasoning_effort: None,
+        reasoning_effort,
         history_log_id: 0,
         history_entry_count: 0,
         initial_messages: None,

@@ -9,7 +9,8 @@ use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Wo
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
-use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_temporal::types::CodexWorkflowInput;
 use codex_temporal::workflow::CodexWorkflow;
@@ -72,12 +73,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    let reasoning_effort = match std::env::var("CODEX_EFFORT")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
+    };
+
+    let reasoning_summary = match std::env::var("CODEX_REASONING_SUMMARY")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "concise" => ReasoningSummary::Concise,
+        "detailed" => ReasoningSummary::Detailed,
+        _ => ReasoningSummary::Auto,
+    };
+
+    let personality = match std::env::var("CODEX_PERSONALITY")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "friendly" => Some(Personality::Friendly),
+        "pragmatic" => Some(Personality::Pragmatic),
+        _ => None,
+    };
+
     let input = CodexWorkflowInput {
         user_message: user_message.clone(),
         model: std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
         instructions: "You are a helpful coding assistant.".to_string(),
         approval_policy,
         web_search_mode,
+        reasoning_effort,
+        reasoning_summary,
+        personality,
     };
 
     let workflow_id = format!("codex-{}", uuid::Uuid::new_v4());

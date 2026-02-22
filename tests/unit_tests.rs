@@ -6,8 +6,8 @@ use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, PendingApproval, ToolExecOutput,
-    UserTurnInput,
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ModelCallOutput, PendingApproval,
+    ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::{Clock, RandomSource};
@@ -169,6 +169,9 @@ fn workflow_input_roundtrips_through_json() {
         instructions: "You are a coding assistant.".to_string(),
         approval_policy: Default::default(),
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -184,6 +187,7 @@ fn workflow_output_roundtrips_through_json() {
     let output = CodexWorkflowOutput {
         last_agent_message: Some("Hello!".to_string()),
         iterations: 3,
+        token_usage: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -191,6 +195,7 @@ fn workflow_output_roundtrips_through_json() {
 
     assert_eq!(back.last_agent_message, output.last_agent_message);
     assert_eq!(back.iterations, output.iterations);
+    assert!(back.token_usage.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -253,9 +258,15 @@ async fn turn_context_new_minimal_creates_usable_context() {
 
 #[test]
 fn user_turn_input_roundtrips_through_json() {
+    use codex_protocol::config_types::{Personality, ReasoningSummary};
+    use codex_protocol::openai_models::ReasoningEffort;
+
     let input = UserTurnInput {
         turn_id: "turn-42".to_string(),
         message: "What is 2+2?".to_string(),
+        effort: Some(ReasoningEffort::High),
+        summary: ReasoningSummary::Detailed,
+        personality: Some(Personality::Friendly),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -263,6 +274,9 @@ fn user_turn_input_roundtrips_through_json() {
 
     assert_eq!(back.turn_id, "turn-42");
     assert_eq!(back.message, "What is 2+2?");
+    assert_eq!(back.effort, Some(ReasoningEffort::High));
+    assert_eq!(back.summary, ReasoningSummary::Detailed);
+    assert_eq!(back.personality, Some(Personality::Friendly));
 }
 
 #[test]
@@ -389,6 +403,9 @@ fn workflow_input_approval_policy_never_roundtrips() {
         instructions: "test".to_string(),
         approval_policy: AskForApproval::Never,
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -403,6 +420,9 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         instructions: "test".to_string(),
         approval_policy: AskForApproval::UnlessTrusted,
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -430,6 +450,9 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         instructions: "test".to_string(),
         approval_policy: AskForApproval::Never,
         web_search_mode: Some(WebSearchMode::Live),
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -438,6 +461,42 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         "expected Some(Live), got {:?}",
         back.web_search_mode,
     );
+}
+
+#[test]
+fn workflow_input_reasoning_effort_roundtrips() {
+    use codex_protocol::config_types::{Personality, ReasoningSummary};
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: None,
+        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_summary: ReasoningSummary::Concise,
+        personality: Some(Personality::Pragmatic),
+    };
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(back.reasoning_summary, ReasoningSummary::Concise);
+    assert_eq!(back.personality, Some(Personality::Pragmatic));
+}
+
+#[test]
+fn workflow_input_reasoning_fields_default_when_missing() {
+    // JSON without the new fields should deserialize with defaults.
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(input.reasoning_effort.is_none());
+    assert_eq!(
+        input.reasoning_summary,
+        codex_protocol::config_types::ReasoningSummary::Auto
+    );
+    assert!(input.personality.is_none());
 }
 
 #[test]
@@ -454,6 +513,86 @@ fn is_known_safe_command_classifies_read_only_commands() {
     assert!(!is_known_safe_command(&["rm".to_string(), "-rf".to_string(), "/".to_string()]));
     assert!(!is_known_safe_command(&["curl".to_string(), "https://example.com".to_string()]));
     assert!(!is_known_safe_command(&["python".to_string(), "script.py".to_string()]));
+}
+
+// ---------------------------------------------------------------------------
+// Token usage serialization tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_call_output_with_token_usage_roundtrips() {
+    use codex_protocol::protocol::TokenUsage;
+
+    let output = ModelCallOutput {
+        items: vec![],
+        token_usage: Some(TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 50,
+            output_tokens: 30,
+            reasoning_output_tokens: 0,
+            total_tokens: 130,
+        }),
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: ModelCallOutput = serde_json::from_str(&json).unwrap();
+
+    let usage = back.token_usage.expect("token_usage should be Some");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.cached_input_tokens, 50);
+    assert_eq!(usage.output_tokens, 30);
+    assert_eq!(usage.total_tokens, 130);
+}
+
+#[test]
+fn model_call_output_token_usage_defaults_to_none() {
+    // JSON without token_usage should deserialize to None (backward compat).
+    let json = r#"{"items":[]}"#;
+    let output: ModelCallOutput = serde_json::from_str(json).unwrap();
+    assert!(
+        output.token_usage.is_none(),
+        "expected None, got {:?}",
+        output.token_usage
+    );
+}
+
+#[test]
+fn workflow_output_with_token_usage_roundtrips() {
+    use codex_protocol::protocol::TokenUsage;
+
+    let output = CodexWorkflowOutput {
+        last_agent_message: Some("Done".to_string()),
+        iterations: 2,
+        token_usage: Some(TokenUsage {
+            input_tokens: 200,
+            cached_input_tokens: 150,
+            output_tokens: 60,
+            reasoning_output_tokens: 10,
+            total_tokens: 270,
+        }),
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: CodexWorkflowOutput = serde_json::from_str(&json).unwrap();
+
+    let usage = back.token_usage.expect("token_usage should be Some");
+    assert_eq!(usage.input_tokens, 200);
+    assert_eq!(usage.cached_input_tokens, 150);
+    assert_eq!(usage.output_tokens, 60);
+    assert_eq!(usage.reasoning_output_tokens, 10);
+    assert_eq!(usage.total_tokens, 270);
+}
+
+#[test]
+fn workflow_output_token_usage_defaults_to_none() {
+    // JSON without token_usage should deserialize to None (backward compat).
+    let json = r#"{"last_agent_message":"hi","iterations":1}"#;
+    let output: CodexWorkflowOutput = serde_json::from_str(json).unwrap();
+    assert!(
+        output.token_usage.is_none(),
+        "expected None, got {:?}",
+        output.token_usage
+    );
 }
 
 // ---------------------------------------------------------------------------

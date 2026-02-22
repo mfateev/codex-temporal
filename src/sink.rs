@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use codex_protocol::protocol::Event;
+use codex_protocol::protocol::{Event, EventMsg, TokenUsage};
 
 /// An [`EventSink`] that buffers events in memory.
 pub struct BufferEventSink {
@@ -46,6 +46,22 @@ impl BufferEventSink {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Return the latest cumulative `TokenUsage` from buffered `TokenCount`
+    /// events, if any.
+    pub fn latest_token_usage(&self) -> Option<TokenUsage> {
+        let guard = self.events.lock().expect("lock poisoned");
+        guard
+            .iter()
+            .rev()
+            .find_map(|e| {
+                if let EventMsg::TokenCount(tc) = &e.msg {
+                    tc.info.as_ref().map(|info| info.total_token_usage.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Synchronous event push — usable from non-async contexts (e.g. tool

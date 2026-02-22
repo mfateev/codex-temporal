@@ -45,6 +45,9 @@ pub struct ModelCallOutput {
     /// The collected response events from the model, represented as
     /// response items (OutputItemDone payloads).
     pub items: Vec<ResponseItem>,
+    /// Token usage from the model response (includes cached_input_tokens).
+    #[serde(default)]
+    pub token_usage: Option<codex_protocol::protocol::TokenUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +115,15 @@ pub struct UserTurnInput {
     pub turn_id: String,
     /// The user's message text.
     pub message: String,
+    /// Optional per-turn reasoning effort override.
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
+    /// Per-turn reasoning summary mode.
+    #[serde(default)]
+    pub summary: ReasoningSummary,
+    /// Optional per-turn personality override.
+    #[serde(default)]
+    pub personality: Option<Personality>,
 }
 
 /// Signal payload for approving or denying a tool execution.
@@ -153,6 +165,15 @@ pub struct CodexWorkflowInput {
     /// Defaults to `None` (disabled). Set to `Cached` or `Live` to enable.
     #[serde(default)]
     pub web_search_mode: Option<codex_protocol::config_types::WebSearchMode>,
+    /// Optional reasoning effort level for the model.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Reasoning summary mode.
+    #[serde(default)]
+    pub reasoning_summary: ReasoningSummary,
+    /// Optional personality for the model.
+    #[serde(default)]
+    pub personality: Option<Personality>,
 }
 
 /// Output from the codex workflow.
@@ -162,4 +183,7 @@ pub struct CodexWorkflowOutput {
     pub last_agent_message: Option<String>,
     /// Number of model→tool loop iterations executed.
     pub iterations: u32,
+    /// Cumulative token usage across all model calls.
+    #[serde(default)]
+    pub token_usage: Option<codex_protocol::protocol::TokenUsage>,
 }
