@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 /// Input to the `model_call` activity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCallInput {
+    /// Stable conversation ID (workflow-scoped) for prompt caching.
+    pub conversation_id: String,
     /// Conversation context items sent to the model.
     pub input: Vec<ResponseItem>,
     /// Tool definitions (carried as typed specs, not pre-serialized JSON).

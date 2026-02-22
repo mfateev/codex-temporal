@@ -55,7 +55,18 @@ fn resolve_provider() -> ModelProviderInfo {
 }
 
 /// Activity implementations for the codex workflow.
-pub struct CodexActivities;
+pub struct CodexActivities {
+    provider: ModelProviderInfo,
+}
+
+impl CodexActivities {
+    /// Create a new `CodexActivities` with the provider resolved once.
+    pub fn new() -> Self {
+        Self {
+            provider: resolve_provider(),
+        }
+    }
+}
 
 #[activities]
 impl CodexActivities {
@@ -64,11 +75,13 @@ impl CodexActivities {
     /// items.
     #[activity]
     pub async fn model_call(
+        self: Arc<Self>,
         _ctx: ActivityContext,
         input: ModelCallInput,
     ) -> Result<ModelCallOutput, ActivityError> {
-        let provider = resolve_provider();
-        let conversation_id = ThreadId::new();
+        let provider = self.provider.clone();
+        let conversation_id = ThreadId::from_string(&input.conversation_id)
+            .map_err(|e| anyhow::anyhow!("invalid conversation_id: {e}"))?;
 
         let model_client = ModelClient::new(
             None, // no AuthManager — uses env_key / bearer token

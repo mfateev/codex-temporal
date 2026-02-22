@@ -358,7 +358,7 @@ async fn e2e_tests_inner() {
             let opts = WorkerOptions::new(TASK_QUEUE)
                 .task_types(WorkerTaskTypes::all())
                 .register_workflow::<CodexWorkflow>()
-                .register_activities(CodexActivities)
+                .register_activities(CodexActivities::new())
                 .build();
             let mut worker =
                 Worker::new(&worker_runtime, worker_client, opts).expect("failed to create worker");

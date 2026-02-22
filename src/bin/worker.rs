@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker_options = WorkerOptions::new(TASK_QUEUE)
         .task_types(WorkerTaskTypes::all())
         .register_workflow::<CodexWorkflow>()
-        .register_activities(CodexActivities)
+        .register_activities(CodexActivities::new())
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;

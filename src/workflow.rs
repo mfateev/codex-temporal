@@ -242,7 +242,7 @@ impl CodexWorkflow {
                     sess.record_items(&turn_context, &[user_item]).await;
 
                     // --- run the agentic loop for this turn ---
-                    let mut streamer = TemporalModelStreamer::new(ctx.clone());
+                    let mut streamer = TemporalModelStreamer::new(ctx.clone(), conversation_id.to_string());
                     let handler = TemporalToolHandler::new(
                         ctx.clone(),
                         events.clone(),

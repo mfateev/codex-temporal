@@ -17,11 +17,12 @@ use crate::workflow::CodexWorkflow;
 /// A [`ModelStreamer`] that dispatches model calls as Temporal activities.
 pub struct TemporalModelStreamer {
     ctx: WorkflowContext<CodexWorkflow>,
+    conversation_id: String,
 }
 
 impl TemporalModelStreamer {
-    pub fn new(ctx: WorkflowContext<CodexWorkflow>) -> Self {
-        Self { ctx }
+    pub fn new(ctx: WorkflowContext<CodexWorkflow>, conversation_id: String) -> Self {
+        Self { ctx, conversation_id }
     }
 }
 
@@ -36,6 +37,7 @@ impl ModelStreamer for TemporalModelStreamer {
         _turn_metadata_header: Option<&str>,
     ) -> codex_core::error::Result<ResponseStream> {
         let input = ModelCallInput {
+            conversation_id: self.conversation_id.clone(),
             input: prompt.input.clone(),
             tools: prompt.tools.clone(),
             parallel_tool_calls: prompt.parallel_tool_calls,
