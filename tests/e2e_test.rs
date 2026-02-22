@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use codex_core::AgentSession;
 use codex_protocol::config_types::{ReasoningSummary, WebSearchMode};
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
     AskForApproval, EventMsg, Op, ReviewDecision, SandboxPolicy,
 };
@@ -62,6 +63,9 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         instructions: "You are a helpful coding assistant. Be concise.".to_string(),
         approval_policy: Default::default(),
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -322,6 +326,29 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         instructions: "You are a helpful assistant. Be concise.".to_string(),
         approval_policy: AskForApproval::Never,
         web_search_mode: Some(WebSearchMode::Live),
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+    };
+    TemporalAgentSession::new(client.clone(), workflow_id, base_input)
+}
+
+/// Create a session with a specific reasoning effort.
+fn new_session_with_effort(
+    client: &Client,
+    model: &str,
+    effort: ReasoningEffort,
+) -> TemporalAgentSession {
+    let workflow_id = format!("e2e-effort-{}", uuid::Uuid::new_v4());
+    let base_input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: model.to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: None,
+        reasoning_effort: Some(effort),
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -367,6 +394,23 @@ async fn web_search_turn(client: &Client) {
     assert!(
         turn_complete_msg.is_some(),
         "expected non-empty last_agent_message in web search TurnComplete"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+async fn reasoning_effort_turn(client: &Client) {
+    let session = new_session_with_effort(client, "gpt-4o", ReasoningEffort::Low);
+
+    session
+        .submit(user_turn_op("What is 2+2? Reply with just the number."))
+        .await
+        .expect("submit failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    assert!(
+        msg.is_some(),
+        "expected agent message with reasoning effort Low"
     );
 
     drain_shutdown(&session).await;
@@ -514,6 +558,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: model_selection_with_tool_use ---");
     model_selection_with_tool_use(&client).await;
+
+    eprintln!("--- test: reasoning_effort_turn ---");
+    reasoning_effort_turn(&client).await;
 
     // --- teardown ---
     drop(client);

@@ -169,6 +169,9 @@ fn workflow_input_roundtrips_through_json() {
         instructions: "You are a coding assistant.".to_string(),
         approval_policy: Default::default(),
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -253,9 +256,15 @@ async fn turn_context_new_minimal_creates_usable_context() {
 
 #[test]
 fn user_turn_input_roundtrips_through_json() {
+    use codex_protocol::config_types::{Personality, ReasoningSummary};
+    use codex_protocol::openai_models::ReasoningEffort;
+
     let input = UserTurnInput {
         turn_id: "turn-42".to_string(),
         message: "What is 2+2?".to_string(),
+        effort: Some(ReasoningEffort::High),
+        summary: ReasoningSummary::Detailed,
+        personality: Some(Personality::Friendly),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -263,6 +272,9 @@ fn user_turn_input_roundtrips_through_json() {
 
     assert_eq!(back.turn_id, "turn-42");
     assert_eq!(back.message, "What is 2+2?");
+    assert_eq!(back.effort, Some(ReasoningEffort::High));
+    assert_eq!(back.summary, ReasoningSummary::Detailed);
+    assert_eq!(back.personality, Some(Personality::Friendly));
 }
 
 #[test]
@@ -389,6 +401,9 @@ fn workflow_input_approval_policy_never_roundtrips() {
         instructions: "test".to_string(),
         approval_policy: AskForApproval::Never,
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -403,6 +418,9 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         instructions: "test".to_string(),
         approval_policy: AskForApproval::UnlessTrusted,
         web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -430,6 +448,9 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         instructions: "test".to_string(),
         approval_policy: AskForApproval::Never,
         web_search_mode: Some(WebSearchMode::Live),
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -438,6 +459,42 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         "expected Some(Live), got {:?}",
         back.web_search_mode,
     );
+}
+
+#[test]
+fn workflow_input_reasoning_effort_roundtrips() {
+    use codex_protocol::config_types::{Personality, ReasoningSummary};
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: None,
+        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_summary: ReasoningSummary::Concise,
+        personality: Some(Personality::Pragmatic),
+    };
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(back.reasoning_summary, ReasoningSummary::Concise);
+    assert_eq!(back.personality, Some(Personality::Pragmatic));
+}
+
+#[test]
+fn workflow_input_reasoning_fields_default_when_missing() {
+    // JSON without the new fields should deserialize with defaults.
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(input.reasoning_effort.is_none());
+    assert_eq!(
+        input.reasoning_summary,
+        codex_protocol::config_types::ReasoningSummary::Auto
+    );
+    assert!(input.personality.is_none());
 }
 
 #[test]

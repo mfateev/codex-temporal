@@ -17,6 +17,8 @@
 use std::sync::Mutex;
 
 use codex_core::error::{CodexErr, Result as CodexResult};
+use codex_protocol::config_types::{Personality, ReasoningSummary};
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{Event, EventMsg, Op, ReviewDecision};
 use temporalio_client::{
     Client, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
@@ -82,7 +84,13 @@ impl TemporalAgentSession {
     }
 
     /// Start the workflow with the first user message.
-    async fn start_workflow(&self, message: String) -> CodexResult<String> {
+    async fn start_workflow(
+        &self,
+        message: String,
+        effort: Option<ReasoningEffort>,
+        summary: ReasoningSummary,
+        personality: Option<Personality>,
+    ) -> CodexResult<String> {
         let turn_id = {
             let mut counter = self.turn_counter.lock().expect("lock poisoned");
             *counter += 1;
@@ -95,6 +103,13 @@ impl TemporalAgentSession {
             instructions: self.base_input.instructions.clone(),
             approval_policy: self.base_input.approval_policy,
             web_search_mode: self.base_input.web_search_mode,
+            reasoning_effort: effort.or(self.base_input.reasoning_effort),
+            reasoning_summary: if summary != ReasoningSummary::default() {
+                summary
+            } else {
+                self.base_input.reasoning_summary
+            },
+            personality: personality.or(self.base_input.personality),
         };
 
         let options = WorkflowStartOptions::new(TASK_QUEUE, &self.workflow_id).build();
@@ -116,7 +131,13 @@ impl TemporalAgentSession {
     }
 
     /// Signal a new user turn to an already-running workflow.
-    async fn signal_user_turn(&self, message: String) -> CodexResult<String> {
+    async fn signal_user_turn(
+        &self,
+        message: String,
+        effort: Option<ReasoningEffort>,
+        summary: ReasoningSummary,
+        personality: Option<Personality>,
+    ) -> CodexResult<String> {
         let turn_id = self.next_turn_id();
 
         let handle = self
@@ -126,6 +147,9 @@ impl TemporalAgentSession {
         let input = UserTurnInput {
             turn_id: turn_id.clone(),
             message,
+            effort,
+            summary,
+            personality,
         };
 
         handle
@@ -240,13 +264,21 @@ impl TemporalAgentSession {
 impl codex_core::AgentSession for TemporalAgentSession {
     async fn submit(&self, op: Op) -> CodexResult<String> {
         match op {
-            Op::UserTurn { items, .. } => {
+            Op::UserTurn {
+                items,
+                effort,
+                summary,
+                personality,
+                ..
+            } => {
                 let message = Self::extract_message(&items);
                 let started = *self.started.lock().expect("lock poisoned");
                 if started {
-                    self.signal_user_turn(message).await
+                    self.signal_user_turn(message, effort, summary, personality)
+                        .await
                 } else {
-                    self.start_workflow(message).await
+                    self.start_workflow(message, effort, summary, personality)
+                        .await
                 }
             }
 

@@ -27,6 +27,7 @@ use codex_core::{
     TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams, build_specs,
     try_run_sampling_request,
 };
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
 use codex_protocol::protocol::{Event, EventMsg, TurnCompleteEvent, TurnStartedEvent};
 use codex_protocol::ThreadId;
@@ -71,6 +72,9 @@ impl CodexWorkflow {
             vec![UserTurnInput {
                 turn_id: "turn-0".to_string(),
                 message: input.user_message.clone(),
+                effort: input.reasoning_effort,
+                summary: input.reasoning_summary,
+                personality: input.personality,
             }]
         };
 
@@ -150,6 +154,9 @@ impl CodexWorkflow {
         let mut config = Config::for_harness(codex_home)
             .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
         config.model = Some(input.model.clone());
+        config.model_reasoning_effort = input.reasoning_effort;
+        config.model_reasoning_summary = input.reasoning_summary;
+        config.personality = input.personality;
         let config = Arc::new(config);
 
         // --- model info ---
@@ -233,10 +240,26 @@ impl CodexWorkflow {
                         phase: None,
                     };
 
+                    // Per-turn config: apply overrides from UserTurnInput if
+                    // they differ from workflow-level defaults.
+                    let turn_config = {
+                        let mut c = (*config).clone();
+                        if turn.effort.is_some() {
+                            c.model_reasoning_effort = turn.effort;
+                        }
+                        if turn.summary != ReasoningSummary::default() {
+                            c.model_reasoning_summary = turn.summary;
+                        }
+                        if turn.personality.is_some() {
+                            c.personality = turn.personality;
+                        }
+                        Arc::new(c)
+                    };
+
                     let turn_context = Arc::new(TurnContext::new_minimal(
                         turn_id.clone(),
                         model_info.clone(),
-                        Arc::clone(&config),
+                        Arc::clone(&turn_config),
                     ));
 
                     sess.record_items(&turn_context, &[user_item]).await;
@@ -269,7 +292,7 @@ impl CodexWorkflow {
                             tools: tools.clone(),
                             parallel_tool_calls: false,
                             base_instructions: base_instructions.clone(),
-                            personality: None,
+                            personality: turn_config.personality,
                             output_schema: None,
                         };
 
