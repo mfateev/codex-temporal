@@ -160,6 +160,7 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         model: model.to_string(),
         instructions: "You are a helpful coding assistant. Be concise.".to_string(),
         approval_policy: Default::default(),
+        web_search_mode: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -189,7 +190,7 @@ async fn next_codex_event(
 // Infrastructure: connect + start worker
 // ---------------------------------------------------------------------------
 
-async fn connect_client(url: &str) -> Option<Client> {
+async fn connect_client(url: &str) -> Client {
     let conn_opts = ConnectionOptions::new(Url::from_str(url).expect("bad URL"))
         .identity("tui-e2e-test-client")
         .build();
@@ -200,21 +201,12 @@ async fn connect_client(url: &str) -> Option<Client> {
         .expect("runtime options");
     let _runtime = CoreRuntime::new_assume_tokio(runtime_options).expect("runtime");
 
-    match tokio::time::timeout(Duration::from_secs(10), Connection::connect(conn_opts)).await {
-        Ok(Ok(connection)) => {
-            let client = Client::new(connection, ClientOptions::new("default").build())
-                .expect("failed to create client");
-            Some(client)
-        }
-        Ok(Err(e)) => {
-            eprintln!("failed to connect to Temporal server at {url}: {e}");
-            None
-        }
-        Err(_) => {
-            eprintln!("connection to Temporal server at {url} timed out (10s)");
-            None
-        }
-    }
+    let connection = tokio::time::timeout(Duration::from_secs(10), Connection::connect(conn_opts))
+        .await
+        .expect(&format!("connection to Temporal server at {url} timed out (10s)"))
+        .expect(&format!("failed to connect to Temporal server at {url}"));
+    Client::new(connection, ClientOptions::new("default").build())
+        .expect("failed to create client")
 }
 
 /// Start a worker on a dedicated OS thread (Worker future is !Send).
@@ -265,7 +257,7 @@ fn start_worker(url: String) {
             let opts = WorkerOptions::new(TASK_QUEUE)
                 .task_types(WorkerTaskTypes::all())
                 .register_workflow::<CodexWorkflow>()
-                .register_activities(CodexActivities)
+                .register_activities(CodexActivities::new())
                 .build();
             let mut worker = Worker::new(&worker_runtime, worker_client, opts)
                 .expect("failed to create worker");
@@ -437,7 +429,6 @@ async fn tui_interactive_turn(client: &Client) {
 
     // 3. Wait for events from the workflow (the Enter should have submitted Op::UserTurn).
     let mut saw_turn_started = false;
-    let mut saw_turn_complete = false;
 
     loop {
         let event = next_codex_event(&mut rx, Duration::from_secs(120))
@@ -453,7 +444,6 @@ async fn tui_interactive_turn(client: &Client) {
                     "  [tui_interactive] TurnComplete: {:?}",
                     tc.last_agent_message
                 );
-                saw_turn_complete = true;
                 chat_widget.handle_codex_event(event);
                 render_widget(&chat_widget);
                 break;
@@ -465,7 +455,6 @@ async fn tui_interactive_turn(client: &Client) {
     }
 
     assert!(saw_turn_started, "expected TurnStarted from typed input");
-    assert!(saw_turn_complete, "expected TurnComplete from typed input");
 }
 
 // ---------------------------------------------------------------------------
@@ -481,26 +470,15 @@ async fn tui_e2e_tests() {
 }
 
 async fn tui_e2e_tests_inner() {
-    let api_key = match std::env::var("OPENAI_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("OPENAI_API_KEY not set — skipping TUI E2E tests");
-            return;
-        }
-    };
-    let _ = api_key; // validated above
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY must be set to run TUI E2E tests");
+    assert!(!api_key.is_empty(), "OPENAI_API_KEY must not be empty");
 
     let url = std::env::var("TEMPORAL_ADDRESS")
         .unwrap_or_else(|_| "http://localhost:7233".to_string());
     eprintln!("Connecting to Temporal at {url}");
 
-    let client = match connect_client(&url).await {
-        Some(c) => c,
-        None => {
-            eprintln!("Temporal server not available — skipping TUI E2E tests");
-            return;
-        }
-    };
+    let client = connect_client(&url).await;
 
     eprintln!("Starting worker…");
     start_worker(url);

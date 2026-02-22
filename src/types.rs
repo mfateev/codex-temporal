@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 /// Input to the `model_call` activity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCallInput {
+    /// Stable conversation ID (workflow-scoped) for prompt caching.
+    pub conversation_id: String,
     /// Conversation context items sent to the model.
     pub input: Vec<ResponseItem>,
     /// Tool definitions (carried as typed specs, not pre-serialized JSON).
@@ -58,6 +60,10 @@ pub struct ToolExecInput {
     pub call_id: String,
     /// The tool arguments as a JSON string.
     pub arguments: String,
+    /// Model slug (needed to build ToolsConfig for the registry).
+    pub model: String,
+    /// Working directory for tool execution.
+    pub cwd: String,
 }
 
 /// Output from the `tool_exec` activity.
@@ -143,6 +149,10 @@ pub struct CodexWorkflowInput {
     /// approval before running.
     #[serde(default)]
     pub approval_policy: codex_protocol::protocol::AskForApproval,
+    /// Web search mode — controls whether the model can perform web searches.
+    /// Defaults to `None` (disabled). Set to `Cached` or `Live` to enable.
+    #[serde(default)]
+    pub web_search_mode: Option<codex_protocol::config_types::WebSearchMode>,
 }
 
 /// Output from the codex workflow.

@@ -1,8 +1,8 @@
 # Codex-Temporal Feature Roadmap
 
-## Current State (POC)
+## Current State
 
-Single/multi-turn conversation, shell tool execution as durable activities, tool approval gating, full TUI reuse, deterministic entropy, non-streaming OpenAI Responses API calls, event polling with watermarks.
+Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistry dispatch (shell, apply_patch, read_file, list_dir, grep_files, view_image, web search), tool approval gating with policy modes, full TUI reuse, deterministic entropy, non-streaming OpenAI Responses API calls via codex ModelClient, event polling with watermarks.
 
 ---
 
@@ -15,16 +15,16 @@ Single/multi-turn conversation, shell tool execution as durable activities, tool
 
 ## Phase 2: Tool Ecosystem
 
-5. **Apply-patch** — register tool spec, activity applies diffs on worker
-6. **File read/write** — activities for file ops within sandbox boundary
-7. **Search (BM25)** — activity wrapping file search with ranking
-8. **View image** — activity returns base64 for model
+5. ~~**Apply-patch**~~ — ✅ dispatched via codex-core ToolRegistry; worker handles `--codex-run-as-apply-patch` subprocess
+6. ~~**File read/write**~~ — ✅ `read_file`, `list_dir`, `grep_files` via ToolRegistry dispatch (enabled by `experimental_supported_tools`)
+7. ~~**Search (BM25)**~~ — ✅ available via ToolRegistry when `Feature::Apps` is enabled
+8. ~~**View image**~~ — ✅ registered by `build_specs` unconditionally
 9. **JS REPL** — persistent Node kernel on worker
-10. **Web search** — cached/live modes via activity
+10. ~~**Web search**~~ — ✅ server-side via Responses API; `CODEX_WEB_SEARCH=live|cached` env var
 
 ## Phase 3: Approval Policies & Sandbox
 
-11. **Policy modes** — `untrusted`/`on-request`/`never` in workflow
+11. ~~**Policy modes**~~ — ✅ `Never`/`OnRequest`/`OnFailure`/`UnlessTrusted` in workflow
 12. **Policy amendment signals** — update policies mid-workflow
 13. **Worker sandbox** — bubblewrap/container isolation for tool activities
 14. **Command safety analysis** — reuse `command_safety` to classify before approval
@@ -87,13 +87,14 @@ Single/multi-turn conversation, shell tool execution as durable activities, tool
 
 | Order | Phase | Rationale |
 |-------|-------|-----------|
-| 1 | 3 — Approval policies | Biggest usability win; `never` mode removes friction |
-| 2 | 2 — Tool ecosystem | Apply-patch alone unlocks most coding workflows |
-| 3 | 1 — Model improvements | Reasoning effort, multi-provider, prompt caching |
+| ~~1~~ | ~~3 — Approval policies~~ | ✅ Done (policy modes) |
+| ~~2~~ | ~~2 — Tool ecosystem~~ | ✅ Done (ToolRegistry dispatch, web search); JS REPL remaining |
+| 3 | 1 — Model improvements | Reasoning effort wiring, multi-provider, prompt caching |
 | 4 | 5 — Session persistence | Resume is critical for real usage |
-| 5 | 4 — Config/auth | Needed for multi-user deployment |
-| 6 | 8 — Git/project context | Important for coding tasks |
-| 7 | 6 — Multi-agent | Power feature |
-| 8 | 7 — MCP/skills | Extensibility |
-| 9 | 9 — Advanced | Nice-to-haves |
-| 10 | 10 — Hardening | Before any real deployment |
+| 5 | 8 — Git/project context | Important for coding tasks |
+| 6 | 4 — Config/auth | Needed for multi-user deployment |
+| 7 | 3 remaining — Sandbox | Worker sandbox, policy amendments, command safety |
+| 8 | 6 — Multi-agent | Power feature |
+| 9 | 7 — MCP/skills | Extensibility |
+| 10 | 9 — Advanced | Nice-to-haves |
+| 11 | 10 — Hardening | Before any real deployment |

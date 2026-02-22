@@ -42,6 +42,8 @@ pub struct TemporalToolHandler {
     events: Arc<BufferEventSink>,
     turn_id: String,
     approval_policy: AskForApproval,
+    model: String,
+    cwd: String,
 }
 
 impl TemporalToolHandler {
@@ -50,12 +52,16 @@ impl TemporalToolHandler {
         events: Arc<BufferEventSink>,
         turn_id: String,
         approval_policy: AskForApproval,
+        model: String,
+        cwd: String,
     ) -> Self {
         Self {
             ctx,
             events,
             turn_id,
             approval_policy,
+            model,
+            cwd,
         }
     }
 }
@@ -80,6 +86,8 @@ impl ToolCallHandler for TemporalToolHandler {
 
         let call_id = call.call_id.clone();
         let tool_name = call.tool_name.clone();
+        let model = self.model.clone();
+        let cwd = self.cwd.clone();
 
         // Parse command from arguments for the approval request event.
         let command: Vec<String> = serde_json::from_str(&arguments)
@@ -157,6 +165,8 @@ impl ToolCallHandler for TemporalToolHandler {
                 tool_name,
                 call_id: call_id.clone(),
                 arguments,
+                model,
+                cwd,
             };
 
             let opts = ActivityOptions {

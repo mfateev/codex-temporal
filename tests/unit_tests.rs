@@ -168,6 +168,7 @@ fn workflow_input_roundtrips_through_json() {
         model: "gpt-4o".to_string(),
         instructions: "You are a coding assistant.".to_string(),
         approval_policy: Default::default(),
+        web_search_mode: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -387,6 +388,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         model: "gpt-4o".to_string(),
         instructions: "test".to_string(),
         approval_policy: AskForApproval::Never,
+        web_search_mode: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -400,10 +402,42 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         model: "gpt-4o".to_string(),
         instructions: "test".to_string(),
         approval_policy: AskForApproval::UnlessTrusted,
+        web_search_mode: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
     assert!(matches!(back.approval_policy, AskForApproval::UnlessTrusted));
+}
+
+#[test]
+fn workflow_input_web_search_mode_defaults_to_none() {
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(
+        input.web_search_mode.is_none(),
+        "expected None, got {:?}",
+        input.web_search_mode,
+    );
+}
+
+#[test]
+fn workflow_input_web_search_mode_live_roundtrips() {
+    use codex_protocol::config_types::WebSearchMode;
+
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: Some(WebSearchMode::Live),
+    };
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+    assert!(
+        matches!(back.web_search_mode, Some(WebSearchMode::Live)),
+        "expected Some(Live), got {:?}",
+        back.web_search_mode,
+    );
 }
 
 #[test]
@@ -420,4 +454,232 @@ fn is_known_safe_command_classifies_read_only_commands() {
     assert!(!is_known_safe_command(&["rm".to_string(), "-rf".to_string(), "/".to_string()]));
     assert!(!is_known_safe_command(&["curl".to_string(), "https://example.com".to_string()]));
     assert!(!is_known_safe_command(&["python".to_string(), "script.py".to_string()]));
+}
+
+// ---------------------------------------------------------------------------
+// Tool dispatch integration tests
+// ---------------------------------------------------------------------------
+// These exercise the full build_specs → ToolRegistry::dispatch pipeline
+// without a Temporal worker or model API call.
+
+use codex_temporal::activities::dispatch_tool;
+use codex_temporal::types::ToolExecInput;
+
+/// Helper to build a ToolExecInput for a given tool.
+fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
+    ToolExecInput {
+        tool_name: tool_name.to_string(),
+        call_id: format!("test-call-{}", uuid::Uuid::new_v4()),
+        arguments: arguments.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_shell_echo() {
+    let input = tool_input(
+        "shell",
+        r#"{"command":["echo","hello from dispatch"]}"#,
+    );
+
+    let output = dispatch_tool(input).await.expect("dispatch_tool failed");
+
+    assert_eq!(output.exit_code, 0, "echo should succeed: {}", output.output);
+    assert!(
+        output.output.contains("hello from dispatch"),
+        "output should contain the echoed text, got: {}",
+        output.output,
+    );
+}
+
+#[tokio::test]
+async fn dispatch_shell_failing_command() {
+    let input = tool_input(
+        "shell",
+        r#"{"command":["false"]}"#,
+    );
+
+    let output = dispatch_tool(input).await.expect("dispatch_tool failed");
+
+    assert_ne!(output.exit_code, 0, "`false` should return non-zero exit code");
+}
+
+#[tokio::test]
+async fn dispatch_unknown_tool_returns_error() {
+    let input = tool_input(
+        "nonexistent_tool",
+        r#"{"foo":"bar"}"#,
+    );
+
+    let output = dispatch_tool(input).await.expect("dispatch_tool failed");
+
+    // The registry returns a dispatch error for unknown tools.
+    assert_eq!(output.exit_code, 1);
+    assert!(
+        output.output.contains("unsupported") || output.output.contains("error"),
+        "expected error message for unknown tool, got: {}",
+        output.output,
+    );
+}
+
+#[tokio::test]
+async fn dispatch_shell_with_cwd() {
+    let input = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "test-cwd".to_string(),
+        arguments: r#"{"command":["pwd"]}"#.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+    };
+
+    let output = dispatch_tool(input).await.expect("dispatch_tool failed");
+
+    assert_eq!(output.exit_code, 0, "pwd should succeed: {}", output.output);
+    // The shell handler should respect the configured cwd.
+    assert!(
+        output.output.contains("/tmp"),
+        "pwd output should contain /tmp, got: {}",
+        output.output,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Registry-level tests for tools that need experimental_supported_tools
+// ---------------------------------------------------------------------------
+
+use codex_core::{
+    Session, TurnContext, TurnDiffTracker,
+    ToolInvocation, ToolPayload, ToolsConfig, ToolsConfigParams, build_specs,
+};
+use codex_core::models_manager::manager::ModelsManager;
+use codex_protocol::ThreadId;
+use tokio::sync::Mutex;
+
+/// Build a ToolsConfig that enables read_file, list_dir, grep_files via
+/// `experimental_supported_tools`, then dispatch a tool invocation through
+/// the resulting registry.
+async fn dispatch_with_experimental_tools(
+    tool_name: &str,
+    arguments: &str,
+    extra_tools: &[&str],
+) -> (String, i32) {
+    let codex_home = std::path::PathBuf::from("/tmp/codex-temporal");
+    let mut config = codex_core::config::Config::for_harness(codex_home).unwrap();
+    config.model = Some("gpt-4o".to_string());
+    config.cwd = std::path::PathBuf::from("/tmp");
+    let config = Arc::new(config);
+
+    let model_slug = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
+    let mut model_info =
+        ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
+
+    // Inject experimental tools into model_info so ToolsConfig picks them up.
+    model_info.experimental_supported_tools = extra_tools.iter().map(|s| s.to_string()).collect();
+
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        features: &config.features,
+        web_search_mode: None,
+    });
+    let builder = build_specs(&tools_config, None, None, &[]);
+    let (_specs, registry) = builder.build();
+
+    let conversation_id = ThreadId::new();
+    let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new());
+    let storage: Arc<dyn codex_core::StorageBackend> = Arc::new(InMemoryStorage::new());
+
+    let session = Session::new_minimal(
+        conversation_id,
+        Arc::clone(&config),
+        event_sink,
+        storage,
+    )
+    .await;
+
+    let turn_context = Arc::new(TurnContext::new_minimal(
+        "test".to_string(),
+        model_info,
+        Arc::clone(&config),
+    ));
+
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+    let invocation = ToolInvocation {
+        session,
+        turn: turn_context,
+        tracker,
+        call_id: "test-call".to_string(),
+        tool_name: tool_name.to_string(),
+        payload: ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+    };
+
+    match registry.dispatch(invocation).await {
+        Ok(item) => {
+            // Extract text from the response item.
+            match &item {
+                codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } => {
+                    let text = output.body.to_text().unwrap_or_default();
+                    let success = output.success.unwrap_or(true);
+                    (text, if success { 0 } else { 1 })
+                }
+                codex_protocol::models::ResponseInputItem::CustomToolCallOutput {
+                    output, ..
+                } => (output.clone(), 0),
+                other => (format!("{other:?}"), 0),
+            }
+        }
+        Err(e) => (format!("dispatch error: {e}"), 1),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_read_file_reads_etc_hostname() {
+    let (output, exit_code) = dispatch_with_experimental_tools(
+        "read_file",
+        r#"{"file_path":"/etc/hostname"}"#,
+        &["read_file"],
+    )
+    .await;
+
+    assert_eq!(exit_code, 0, "read_file should succeed: {output}");
+    // /etc/hostname should contain some text (the container hostname).
+    assert!(
+        !output.is_empty(),
+        "read_file output should not be empty",
+    );
+}
+
+#[tokio::test]
+async fn dispatch_list_dir_lists_tmp() {
+    let (output, exit_code) = dispatch_with_experimental_tools(
+        "list_dir",
+        r#"{"dir_path":"/tmp"}"#,
+        &["list_dir"],
+    )
+    .await;
+
+    assert_eq!(exit_code, 0, "list_dir should succeed: {output}");
+    assert!(
+        !output.is_empty(),
+        "list_dir output should not be empty",
+    );
+}
+
+#[tokio::test]
+async fn dispatch_read_file_nonexistent_returns_error() {
+    let (output, exit_code) = dispatch_with_experimental_tools(
+        "read_file",
+        r#"{"file_path":"/tmp/this-file-does-not-exist-xyz-123"}"#,
+        &["read_file"],
+    )
+    .await;
+
+    // Should report an error (either exit_code=1 or error text in output).
+    assert!(
+        exit_code != 0 || output.to_lowercase().contains("error") || output.to_lowercase().contains("no such file"),
+        "expected error for nonexistent file, got exit_code={exit_code}, output: {output}",
+    );
 }

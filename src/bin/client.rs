@@ -9,6 +9,7 @@ use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Wo
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
+use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_temporal::types::CodexWorkflowInput;
 use codex_temporal::workflow::CodexWorkflow;
@@ -61,11 +62,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => AskForApproval::OnRequest,
     };
 
+    let web_search_mode = match std::env::var("CODEX_WEB_SEARCH")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "live" => Some(WebSearchMode::Live),
+        "cached" => Some(WebSearchMode::Cached),
+        "disabled" => None,
+        _ => None,
+    };
+
     let input = CodexWorkflowInput {
         user_message: user_message.clone(),
         model: std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
         instructions: "You are a helpful coding assistant.".to_string(),
         approval_policy,
+        web_search_mode,
     };
 
     let workflow_id = format!("codex-{}", uuid::Uuid::new_v4());
