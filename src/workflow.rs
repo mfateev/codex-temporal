@@ -15,7 +15,6 @@
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -24,8 +23,9 @@ use codex_core::config::Config;
 use codex_core::entropy::{EntropyProviders, ENTROPY};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
-    EventSink, JsonSchema, Prompt, ResponsesApiTool, Session, StorageBackend, ToolSpec,
-    TurnContext, TurnDiffTracker, try_run_sampling_request,
+    EventSink, Prompt, Session, StorageBackend, ToolSpec,
+    TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams, build_specs,
+    try_run_sampling_request,
 };
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
 use codex_protocol::protocol::{Event, EventMsg, TurnCompleteEvent, TurnStartedEvent};
@@ -171,25 +171,16 @@ impl CodexWorkflow {
         .await;
 
         // --- tools ---
-        let shell_tool = ToolSpec::Function(ResponsesApiTool {
-            name: "shell".to_string(),
-            description: "Runs a shell command and returns its output. \
-                The arguments to `shell` will be passed to execvp()."
-                .to_string(),
-            strict: false,
-            parameters: JsonSchema::Object {
-                properties: BTreeMap::from([(
-                    "command".to_string(),
-                    JsonSchema::Array {
-                        items: Box::new(JsonSchema::String { description: None }),
-                        description: Some("The command to execute".to_string()),
-                    },
-                )]),
-                required: Some(vec!["command".to_string()]),
-                additional_properties: Some(false.into()),
-            },
+        // Use codex-core's build_specs to get the full set of tool specs
+        // (shell, apply_patch, read_file, list_dir, grep_files, etc.).
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &config.features,
+            web_search_mode: None,
         });
-        let tools = vec![shell_tool];
+        let builder = build_specs(&tools_config, None, None, &[]);
+        let (configured_specs, _registry) = builder.build();
+        let tools: Vec<ToolSpec> = configured_specs.into_iter().map(|cs| cs.spec).collect();
         let base_instructions = BaseInstructions {
             text: input.instructions.clone(),
         };
@@ -257,6 +248,8 @@ impl CodexWorkflow {
                         events.clone(),
                         turn_id.clone(),
                         input.approval_policy,
+                        input.model.clone(),
+                        config.cwd.to_string_lossy().to_string(),
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));

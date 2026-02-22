@@ -58,6 +58,10 @@ pub struct ToolExecInput {
     pub call_id: String,
     /// The tool arguments as a JSON string.
     pub arguments: String,
+    /// Model slug (needed to build ToolsConfig for the registry).
+    pub model: String,
+    /// Working directory for tool execution.
+    pub cwd: String,
 }
 
 /// Output from the `tool_exec` activity.

@@ -19,6 +19,15 @@ const TASK_QUEUE: &str = "codex-temporal";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The apply_patch tool handler spawns a subprocess using the current
+    // binary with `--codex-run-as-apply-patch` as the first argument.
+    // Detect that and delegate immediately.
+    // TODO: consider creating a slimmed-down binary for just the patch tool.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|a| a.as_str()) == Some(codex_core::CODEX_APPLY_PATCH_ARG1) {
+        codex_apply_patch::main(); // diverges (-> !)
+    }
+
     // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
