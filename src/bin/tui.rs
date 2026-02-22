@@ -70,11 +70,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Create TemporalAgentSession ---
     let workflow_id = format!("codex-tui-{}", uuid::Uuid::new_v4());
+    let web_search_mode = match std::env::var("CODEX_WEB_SEARCH")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "live" => Some(codex_protocol::config_types::WebSearchMode::Live),
+        "cached" => Some(codex_protocol::config_types::WebSearchMode::Cached),
+        _ => None,
+    };
+
     let base_input = CodexWorkflowInput {
         user_message: String::new(),
         model: model.clone(),
         instructions: "You are a helpful coding assistant.".to_string(),
         approval_policy,
+        web_search_mode,
     };
     let session = Arc::new(TemporalAgentSession::new(
         client,

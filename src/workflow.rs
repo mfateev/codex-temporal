@@ -176,7 +176,7 @@ impl CodexWorkflow {
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &config.features,
-            web_search_mode: None,
+            web_search_mode: input.web_search_mode,
         });
         let builder = build_specs(&tools_config, None, None, &[]);
         let (configured_specs, _registry) = builder.build();

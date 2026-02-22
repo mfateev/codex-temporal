@@ -61,6 +61,7 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         model: model.to_string(),
         instructions: "You are a helpful coding assistant. Be concise.".to_string(),
         approval_policy: Default::default(),
+        web_search_mode: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }

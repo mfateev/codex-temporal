@@ -147,6 +147,10 @@ pub struct CodexWorkflowInput {
     /// approval before running.
     #[serde(default)]
     pub approval_policy: codex_protocol::protocol::AskForApproval,
+    /// Web search mode — controls whether the model can perform web searches.
+    /// Defaults to `None` (disabled). Set to `Cached` or `Live` to enable.
+    #[serde(default)]
+    pub web_search_mode: Option<codex_protocol::config_types::WebSearchMode>,
 }
 
 /// Output from the codex workflow.

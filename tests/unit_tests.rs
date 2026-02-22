@@ -168,6 +168,7 @@ fn workflow_input_roundtrips_through_json() {
         model: "gpt-4o".to_string(),
         instructions: "You are a coding assistant.".to_string(),
         approval_policy: Default::default(),
+        web_search_mode: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -387,6 +388,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         model: "gpt-4o".to_string(),
         instructions: "test".to_string(),
         approval_policy: AskForApproval::Never,
+        web_search_mode: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -400,10 +402,42 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         model: "gpt-4o".to_string(),
         instructions: "test".to_string(),
         approval_policy: AskForApproval::UnlessTrusted,
+        web_search_mode: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
     assert!(matches!(back.approval_policy, AskForApproval::UnlessTrusted));
+}
+
+#[test]
+fn workflow_input_web_search_mode_defaults_to_none() {
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(
+        input.web_search_mode.is_none(),
+        "expected None, got {:?}",
+        input.web_search_mode,
+    );
+}
+
+#[test]
+fn workflow_input_web_search_mode_live_roundtrips() {
+    use codex_protocol::config_types::WebSearchMode;
+
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: Some(WebSearchMode::Live),
+    };
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+    assert!(
+        matches!(back.web_search_mode, Some(WebSearchMode::Live)),
+        "expected Some(Live), got {:?}",
+        back.web_search_mode,
+    );
 }
 
 #[test]
