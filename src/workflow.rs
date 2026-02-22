@@ -360,6 +360,7 @@ impl CodexWorkflow {
         Ok(CodexWorkflowOutput {
             last_agent_message,
             iterations: total_iterations,
+            token_usage: events.latest_token_usage(),
         })
     }
 

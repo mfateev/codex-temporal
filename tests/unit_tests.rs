@@ -6,8 +6,8 @@ use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, PendingApproval, ToolExecOutput,
-    UserTurnInput,
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ModelCallOutput, PendingApproval,
+    ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::{Clock, RandomSource};
@@ -187,6 +187,7 @@ fn workflow_output_roundtrips_through_json() {
     let output = CodexWorkflowOutput {
         last_agent_message: Some("Hello!".to_string()),
         iterations: 3,
+        token_usage: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -194,6 +195,7 @@ fn workflow_output_roundtrips_through_json() {
 
     assert_eq!(back.last_agent_message, output.last_agent_message);
     assert_eq!(back.iterations, output.iterations);
+    assert!(back.token_usage.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +513,86 @@ fn is_known_safe_command_classifies_read_only_commands() {
     assert!(!is_known_safe_command(&["rm".to_string(), "-rf".to_string(), "/".to_string()]));
     assert!(!is_known_safe_command(&["curl".to_string(), "https://example.com".to_string()]));
     assert!(!is_known_safe_command(&["python".to_string(), "script.py".to_string()]));
+}
+
+// ---------------------------------------------------------------------------
+// Token usage serialization tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn model_call_output_with_token_usage_roundtrips() {
+    use codex_protocol::protocol::TokenUsage;
+
+    let output = ModelCallOutput {
+        items: vec![],
+        token_usage: Some(TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 50,
+            output_tokens: 30,
+            reasoning_output_tokens: 0,
+            total_tokens: 130,
+        }),
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: ModelCallOutput = serde_json::from_str(&json).unwrap();
+
+    let usage = back.token_usage.expect("token_usage should be Some");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.cached_input_tokens, 50);
+    assert_eq!(usage.output_tokens, 30);
+    assert_eq!(usage.total_tokens, 130);
+}
+
+#[test]
+fn model_call_output_token_usage_defaults_to_none() {
+    // JSON without token_usage should deserialize to None (backward compat).
+    let json = r#"{"items":[]}"#;
+    let output: ModelCallOutput = serde_json::from_str(json).unwrap();
+    assert!(
+        output.token_usage.is_none(),
+        "expected None, got {:?}",
+        output.token_usage
+    );
+}
+
+#[test]
+fn workflow_output_with_token_usage_roundtrips() {
+    use codex_protocol::protocol::TokenUsage;
+
+    let output = CodexWorkflowOutput {
+        last_agent_message: Some("Done".to_string()),
+        iterations: 2,
+        token_usage: Some(TokenUsage {
+            input_tokens: 200,
+            cached_input_tokens: 150,
+            output_tokens: 60,
+            reasoning_output_tokens: 10,
+            total_tokens: 270,
+        }),
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: CodexWorkflowOutput = serde_json::from_str(&json).unwrap();
+
+    let usage = back.token_usage.expect("token_usage should be Some");
+    assert_eq!(usage.input_tokens, 200);
+    assert_eq!(usage.cached_input_tokens, 150);
+    assert_eq!(usage.output_tokens, 60);
+    assert_eq!(usage.reasoning_output_tokens, 10);
+    assert_eq!(usage.total_tokens, 270);
+}
+
+#[test]
+fn workflow_output_token_usage_defaults_to_none() {
+    // JSON without token_usage should deserialize to None (backward compat).
+    let json = r#"{"last_agent_message":"hi","iterations":1}"#;
+    let output: CodexWorkflowOutput = serde_json::from_str(json).unwrap();
+    assert!(
+        output.token_usage.is_none(),
+        "expected None, got {:?}",
+        output.token_usage
+    );
 }
 
 // ---------------------------------------------------------------------------

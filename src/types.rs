@@ -45,6 +45,9 @@ pub struct ModelCallOutput {
     /// The collected response events from the model, represented as
     /// response items (OutputItemDone payloads).
     pub items: Vec<ResponseItem>,
+    /// Token usage from the model response (includes cached_input_tokens).
+    #[serde(default)]
+    pub token_usage: Option<codex_protocol::protocol::TokenUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,4 +183,7 @@ pub struct CodexWorkflowOutput {
     pub last_agent_message: Option<String>,
     /// Number of model→tool loop iterations executed.
     pub iterations: u32,
+    /// Cumulative token usage across all model calls.
+    #[serde(default)]
+    pub token_usage: Option<codex_protocol::protocol::TokenUsage>,
 }

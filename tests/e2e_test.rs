@@ -399,6 +399,160 @@ async fn web_search_turn(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Create a session with a long system prompt to exceed the 1024-token
+/// minimum for OpenAI prompt caching.
+fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
+    let workflow_id = format!("e2e-cache-{}", uuid::Uuid::new_v4());
+    // Build instructions > 1024 tokens so the prefix is cacheable.
+    let long_instructions = format!(
+        "You are a helpful coding assistant. Be concise. \
+         Always reply in plain text without markdown formatting. \
+         Below is reference context that you should keep in mind:\n\n{}",
+        "The quick brown fox jumps over the lazy dog. ".repeat(100)
+    );
+    let base_input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: long_instructions,
+        approval_policy: AskForApproval::Never,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+    };
+    TemporalAgentSession::new(client.clone(), workflow_id, base_input)
+}
+
+async fn prompt_caching_multi_turn(client: &Client) {
+    let session = new_session_for_caching(client);
+
+    // Turn 1: establish context
+    session
+        .submit(user_turn_op_with_model(
+            "Remember: the secret word is 'pineapple'. Reply with just 'OK'.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 1 failed");
+
+    // Collect events from turn 1, looking for TokenCount
+    let mut turn1_token_count_events = Vec::new();
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for TurnComplete in turn 1");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if let EventMsg::TokenCount(ref tc) = event.msg {
+            turn1_token_count_events.push(tc.clone());
+        }
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    assert!(
+        !turn1_token_count_events.is_empty(),
+        "expected at least one TokenCount event in turn 1"
+    );
+
+    // Verify turn 1 has valid token counts
+    let turn1_last = turn1_token_count_events.last().unwrap();
+    let turn1_info = turn1_last.info.as_ref().expect("turn 1 TokenCount.info should be Some");
+    eprintln!(
+        "turn 1 last_token_usage: input={}, cached={}, output={}, total={}",
+        turn1_info.last_token_usage.input_tokens,
+        turn1_info.last_token_usage.cached_input_tokens,
+        turn1_info.last_token_usage.output_tokens,
+        turn1_info.last_token_usage.total_tokens,
+    );
+    assert!(
+        turn1_info.last_token_usage.input_tokens > 0,
+        "expected input_tokens > 0 in turn 1"
+    );
+    assert!(
+        turn1_info.last_token_usage.total_tokens > 0,
+        "expected total_tokens > 0 in turn 1"
+    );
+
+    // Turn 2: same conversation, should benefit from prompt caching
+    session
+        .submit(user_turn_op_with_model(
+            "What secret word did I tell you? Reply with just the word.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 2 failed");
+
+    // Collect events from turn 2
+    let mut turn2_token_count_events = Vec::new();
+    let timeout2 = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout2 {
+            panic!("timed out waiting for TurnComplete in turn 2");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if let EventMsg::TokenCount(ref tc) = event.msg {
+            turn2_token_count_events.push(tc.clone());
+        }
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    assert!(
+        !turn2_token_count_events.is_empty(),
+        "expected at least one TokenCount event in turn 2"
+    );
+
+    // Verify turn 2 has valid token counts and check for caching
+    let last_tc = turn2_token_count_events.last().unwrap();
+    let info = last_tc.info.as_ref().expect("turn 2 TokenCount.info should be Some");
+    eprintln!(
+        "turn 2 last_token_usage: input={}, cached={}, output={}, total={}",
+        info.last_token_usage.input_tokens,
+        info.last_token_usage.cached_input_tokens,
+        info.last_token_usage.output_tokens,
+        info.last_token_usage.total_tokens,
+    );
+    eprintln!(
+        "turn 2 total_token_usage: input={}, cached={}, output={}, total={}",
+        info.total_token_usage.input_tokens,
+        info.total_token_usage.cached_input_tokens,
+        info.total_token_usage.output_tokens,
+        info.total_token_usage.total_tokens,
+    );
+
+    // Token tracking must work (non-zero values).
+    assert!(
+        info.last_token_usage.input_tokens > 0,
+        "expected input_tokens > 0 in turn 2"
+    );
+    assert!(
+        info.last_token_usage.total_tokens > 0,
+        "expected total_tokens > 0 in turn 2"
+    );
+
+    // Cumulative totals should exceed turn 2 alone.
+    assert!(
+        info.total_token_usage.total_tokens > info.last_token_usage.total_tokens,
+        "cumulative total_tokens ({}) should exceed turn 2 alone ({})",
+        info.total_token_usage.total_tokens,
+        info.last_token_usage.total_tokens,
+    );
+
+    // With a long system prompt (>1024 tokens), cached_input_tokens should
+    // be > 0 on the second turn. This validates prompt caching is active.
+    assert!(
+        info.last_token_usage.cached_input_tokens > 0,
+        "expected cached_input_tokens > 0 in turn 2 (got {}); \
+         prompt caching requires >1024 token prefix",
+        info.last_token_usage.cached_input_tokens,
+    );
+
+    drain_shutdown(&session).await;
+}
+
 async fn reasoning_effort_turn(client: &Client) {
     let session = new_session_with_effort(client, "gpt-4o", ReasoningEffort::Low);
 
@@ -558,6 +712,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: model_selection_with_tool_use ---");
     model_selection_with_tool_use(&client).await;
+
+    eprintln!("--- test: prompt_caching_multi_turn ---");
+    prompt_caching_multi_turn(&client).await;
 
     eprintln!("--- test: reasoning_effort_turn ---");
     reasoning_effort_turn(&client).await;
