@@ -19,6 +19,7 @@ use codex_protocol::user_input::UserInput;
 
 use codex_temporal::activities::CodexActivities;
 use codex_temporal::harness::{CodexHarness, CodexHarnessRun};
+use codex_temporal::picker::{extract_session_id_from_path, sessions_to_threads_page};
 use codex_temporal::session::TemporalAgentSession;
 use codex_temporal::types::{
     CodexWorkflowInput, HarnessInput, SessionEntry, SessionStatus,
@@ -782,6 +783,124 @@ async fn session_resume(client: &Client) {
     drain_shutdown(&resumed).await;
 }
 
+/// Test: session picker data conversion pipeline.
+///
+/// 1. Start harness workflow.
+/// 2. Register two sessions with the harness.
+/// 3. Query harness for running sessions.
+/// 4. Convert via `sessions_to_threads_page()`.
+/// 5. Verify both sessions appear in the `ThreadsPage` items.
+/// 6. Extract session IDs from synthetic PathBufs and verify they match.
+async fn session_picker_conversion(client: &Client) {
+    // 1. Start harness workflow (idempotent).
+    let harness_id = format!("e2e-picker-harness-{}", uuid::Uuid::new_v4());
+    let harness_input = HarnessInput {
+        continued_state: None,
+    };
+    let harness_options = WorkflowStartOptions::new(TASK_QUEUE, &harness_id)
+        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+        .build();
+    client
+        .start_workflow(CodexHarness::run, harness_input, harness_options)
+        .await
+        .expect("failed to start harness workflow");
+
+    let harness_handle = client.get_workflow_handle::<CodexHarnessRun>(&harness_id);
+
+    // 2. Register two sessions.
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let session_id_1 = format!("picker-test-{}", uuid::Uuid::new_v4());
+    let session_id_2 = format!("picker-test-{}", uuid::Uuid::new_v4());
+
+    let entry1 = SessionEntry {
+        session_id: session_id_1.clone(),
+        name: Some("Fix the bug".to_string()),
+        model: "gpt-4o".to_string(),
+        created_at_millis: now_millis,
+        status: SessionStatus::Running,
+    };
+    let entry2 = SessionEntry {
+        session_id: session_id_2.clone(),
+        name: Some("Add feature".to_string()),
+        model: "gpt-4o-mini".to_string(),
+        created_at_millis: now_millis + 1000,
+        status: SessionStatus::Running,
+    };
+
+    harness_handle
+        .signal(
+            CodexHarness::register_session,
+            entry1,
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("register entry1");
+    harness_handle
+        .signal(
+            CodexHarness::register_session,
+            entry2,
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("register entry2");
+
+    // 3. Query harness for running sessions.
+    // Allow a moment for signals to be processed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let sessions_json: String = harness_handle
+        .query(
+            CodexHarness::list_sessions,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await
+        .expect("query list_sessions");
+    let sessions: Vec<SessionEntry> =
+        serde_json::from_str(&sessions_json).expect("invalid sessions JSON");
+    let running: Vec<SessionEntry> = sessions
+        .into_iter()
+        .filter(|s| s.status == SessionStatus::Running)
+        .collect();
+
+    // 4. Convert via sessions_to_threads_page.
+    let page = sessions_to_threads_page(running.clone());
+
+    // 5. Verify both sessions appear.
+    let found_1 = page.items.iter().any(|item| {
+        extract_session_id_from_path(&item.path).as_deref() == Some(session_id_1.as_str())
+    });
+    let found_2 = page.items.iter().any(|item| {
+        extract_session_id_from_path(&item.path).as_deref() == Some(session_id_2.as_str())
+    });
+    assert!(found_1, "session_id_1 should appear in ThreadsPage items");
+    assert!(found_2, "session_id_2 should appear in ThreadsPage items");
+
+    // 6. Verify no pagination (all in one page).
+    assert!(
+        page.next_cursor.is_none(),
+        "Temporal picker page should have no next_cursor"
+    );
+
+    // 7. Verify first_user_message is populated from session name.
+    let item_1 = page
+        .items
+        .iter()
+        .find(|item| {
+            extract_session_id_from_path(&item.path).as_deref() == Some(session_id_1.as_str())
+        })
+        .expect("item_1 not found");
+    assert_eq!(
+        item_1.first_user_message.as_deref(),
+        Some("Fix the bug"),
+        "first_user_message should come from session name"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -937,6 +1056,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: session_resume ---");
     session_resume(&client).await;
+
+    eprintln!("--- test: session_picker_conversion ---");
+    session_picker_conversion(&client).await;
 
     // --- teardown ---
     drop(client);
