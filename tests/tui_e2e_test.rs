@@ -28,9 +28,11 @@ use codex_protocol::ThreadId;
 
 use codex_temporal::activities::CodexActivities;
 use codex_temporal::auth_stub::NoopAuthProvider;
+use codex_temporal::harness::{CodexHarness, CodexHarnessRun};
 use codex_temporal::models_stub::FixedModelsProvider;
+use codex_temporal::picker::{extract_session_id_from_path, sessions_to_threads_page};
 use codex_temporal::session::TemporalAgentSession;
-use codex_temporal::types::CodexWorkflowInput;
+use codex_temporal::types::{CodexWorkflowInput, HarnessInput, SessionEntry, SessionStatus};
 use codex_temporal::workflow::CodexWorkflow;
 
 use codex_tui::app_event::AppEvent;
@@ -47,7 +49,11 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use ratatui::layout::Rect;
 
-use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
+use temporalio_client::{
+    Client, ClientOptions, Connection, ConnectionOptions, WorkflowQueryOptions,
+    WorkflowSignalOptions, WorkflowStartOptions,
+};
+use temporalio_common::protos::temporal::api::enums::v1::WorkflowIdConflictPolicy;
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk::{Worker, WorkerOptions};
@@ -261,6 +267,7 @@ fn start_worker(url: String) {
             let opts = WorkerOptions::new(TASK_QUEUE)
                 .task_types(WorkerTaskTypes::all())
                 .register_workflow::<CodexWorkflow>()
+                .register_workflow::<CodexHarness>()
                 .register_activities(CodexActivities::new())
                 .build();
             let mut worker = Worker::new(&worker_runtime, worker_client, opts)
@@ -461,6 +468,166 @@ async fn tui_interactive_turn(client: &Client) {
     assert!(saw_turn_started, "expected TurnStarted from typed input");
 }
 
+/// Test: Temporal session picker data loading pipeline.
+///
+/// Exercises the full path: register sessions with harness → build a
+/// Temporal-backed `PageLoader` → fire it → receive `BackgroundEvent` →
+/// verify `ThreadsPage` contains the registered sessions with correct IDs.
+///
+/// This is the same data path used by `run_temporal_picker()` in the TUI
+/// binary, but driven programmatically without a live terminal.
+async fn tui_session_picker(client: &Client) {
+    use codex_tui::resume_picker::{BackgroundEvent, PageLoadRequest};
+    use codex_core::ThreadSortKey;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    // 1. Start harness workflow.
+    let harness_id = format!("tui-e2e-picker-harness-{}", uuid::Uuid::new_v4());
+    let harness_input = HarnessInput {
+        continued_state: None,
+    };
+    let harness_options = WorkflowStartOptions::new(TASK_QUEUE, &harness_id)
+        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+        .build();
+    client
+        .start_workflow(CodexHarness::run, harness_input, harness_options)
+        .await
+        .expect("failed to start harness workflow");
+
+    let harness_handle = client.get_workflow_handle::<CodexHarnessRun>(&harness_id);
+
+    // 2. Register two sessions.
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let session_id_a = format!("tui-picker-a-{}", uuid::Uuid::new_v4());
+    let session_id_b = format!("tui-picker-b-{}", uuid::Uuid::new_v4());
+
+    for (id, name) in [
+        (&session_id_a, "Debug the parser"),
+        (&session_id_b, "Write unit tests"),
+    ] {
+        let entry = SessionEntry {
+            session_id: id.clone(),
+            name: Some(name.to_string()),
+            model: "gpt-4o".to_string(),
+            created_at_millis: now_millis,
+            status: SessionStatus::Running,
+        };
+        harness_handle
+            .signal(
+                CodexHarness::register_session,
+                entry,
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .expect("register session");
+    }
+
+    // Brief pause for signal processing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3. Build a PageLoader that queries the harness (same pattern as tui.rs).
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BackgroundEvent>();
+    let loader_client = client.clone();
+    let loader_harness_id = harness_id.clone();
+
+    let page_loader: Arc<dyn Fn(PageLoadRequest) + Send + Sync> =
+        Arc::new(move |request: PageLoadRequest| {
+            let tx = bg_tx.clone();
+            let client = loader_client.clone();
+            let hid = loader_harness_id.clone();
+            tokio::spawn(async move {
+                let handle = client.get_workflow_handle::<CodexHarnessRun>(&hid);
+                let result: Result<Vec<SessionEntry>, Box<dyn std::error::Error + Send + Sync>> =
+                    async {
+                        let json: String = handle
+                            .query(
+                                CodexHarness::list_sessions,
+                                (),
+                                WorkflowQueryOptions::default(),
+                            )
+                            .await?;
+                        let sessions: Vec<SessionEntry> =
+                            serde_json::from_str(&json).unwrap_or_default();
+                        Ok(sessions
+                            .into_iter()
+                            .filter(|s| s.status == SessionStatus::Running)
+                            .collect())
+                    }
+                    .await;
+
+                let page = match result {
+                    Ok(sessions) => Ok(sessions_to_threads_page(sessions)),
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                };
+                let _ = tx.send(BackgroundEvent::PageLoaded {
+                    request_token: request.request_token,
+                    search_token: request.search_token,
+                    page,
+                });
+            });
+        });
+
+    // 4. Fire the loader (simulates picker's start_initial_load).
+    page_loader(PageLoadRequest {
+        cursor: None,
+        request_token: 0,
+        search_token: None,
+        default_provider: "openai".to_string(),
+        sort_key: ThreadSortKey::CreatedAt,
+    });
+
+    // 5. Receive the BackgroundEvent and verify.
+    let event = tokio::time::timeout(Duration::from_secs(10), bg_rx.recv())
+        .await
+        .expect("timed out waiting for PageLoaded event")
+        .expect("bg_rx closed");
+
+    let page = match event {
+        BackgroundEvent::PageLoaded {
+            page, ..
+        } => page.expect("PageLoaded contained an error"),
+    };
+
+    // 6. Verify both sessions appear.
+    let ids: Vec<String> = page
+        .items
+        .iter()
+        .filter_map(|item| extract_session_id_from_path(&item.path))
+        .collect();
+
+    assert!(
+        ids.contains(&session_id_a),
+        "session A should appear in picker page, got: {ids:?}"
+    );
+    assert!(
+        ids.contains(&session_id_b),
+        "session B should appear in picker page, got: {ids:?}"
+    );
+
+    // 7. Verify first_user_message comes from session name.
+    let item_a = page
+        .items
+        .iter()
+        .find(|item| extract_session_id_from_path(&item.path).as_deref() == Some(&session_id_a))
+        .expect("item_a not found");
+    assert_eq!(
+        item_a.first_user_message.as_deref(),
+        Some("Debug the parser"),
+        "first_user_message should come from session name"
+    );
+
+    // 8. No pagination expected.
+    assert!(
+        page.next_cursor.is_none(),
+        "Temporal picker page should have no next_cursor"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test entry-point
 // ---------------------------------------------------------------------------
@@ -495,6 +662,9 @@ async fn tui_e2e_tests_inner() {
 
     eprintln!("--- test: tui_interactive_turn ---");
     tui_interactive_turn(&client).await;
+
+    eprintln!("--- test: tui_session_picker ---");
+    tui_session_picker(&client).await;
 
     eprintln!("--- all TUI E2E tests passed ---");
 }

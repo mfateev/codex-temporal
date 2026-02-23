@@ -11,6 +11,7 @@ pub mod auth_stub;
 pub mod entropy;
 pub mod harness;
 pub mod models_stub;
+pub mod picker;
 pub mod session;
 pub mod sink;
 pub mod storage;
