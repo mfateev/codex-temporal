@@ -110,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reasoning_effort,
         reasoning_summary,
         personality,
+        continued_state: None,
     };
 
     let workflow_id = format!("codex-{}", uuid::Uuid::new_v4());

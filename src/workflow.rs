@@ -6,9 +6,8 @@
 //!
 //! ## Protocol
 //!
-//! - **`receive_user_turn` signal**: Queues a new user turn for processing.
-//! - **`receive_approval` signal**: Resolves a pending tool-call approval.
-//! - **`request_shutdown` signal**: Requests graceful workflow termination.
+//! - **`receive_op` signal**: Generic signal that dispatches all client
+//!   operations (user turns, approvals, shutdown, compact, etc.).
 //! - **`get_events_since` query**: Returns JSON-serialized events from a
 //!   given index (for client polling).
 //!
@@ -29,10 +28,18 @@ use codex_core::{
 };
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
-use codex_protocol::protocol::{Event, EventMsg, TurnCompleteEvent, TurnStartedEvent};
+use codex_protocol::protocol::{
+    ContextCompactedEvent, Event, EventMsg, Op, ReviewDecision, TurnCompleteEvent,
+    TurnStartedEvent,
+};
+use codex_protocol::user_input::UserInput;
 use codex_protocol::ThreadId;
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult};
+use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
+use temporalio_common::protos::coresdk::AsJsonPayloadExt;
+use temporalio_sdk::{
+    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -42,7 +49,7 @@ use crate::storage::InMemoryStorage;
 use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
 use crate::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, PendingApproval, UserTurnInput,
+    CodexWorkflowInput, CodexWorkflowOutput, ContinueAsNewState, PendingApproval, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -54,69 +61,152 @@ pub struct CodexWorkflow {
     pub(crate) events: Arc<BufferEventSink>,
     /// Queue of user turns waiting to be processed.
     user_turns: Vec<UserTurnInput>,
+    /// Counter for generating turn IDs.
+    turn_counter: u32,
     /// Pending tool-call approval (set by tool handler, resolved by signal).
     pub(crate) pending_approval: Option<PendingApproval>,
     /// When true the workflow will exit after the current turn completes.
     shutdown_requested: bool,
+    /// When true the workflow will run compaction and then continue-as-new.
+    compact_requested: bool,
+}
+
+/// Extract the text message from user input items.
+fn extract_message(items: &[UserInput]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build `ContinueAsNewState` from the current workflow state and return
+/// `Err(WorkflowTermination::ContinueAsNew(...))` to trigger CAN.
+fn do_continue_as_new(
+    input: &CodexWorkflowInput,
+    storage: &InMemoryStorage,
+    pending_turns: Vec<UserTurnInput>,
+    total_iterations: u32,
+    turn_counter: u32,
+    token_usage: Option<codex_protocol::protocol::TokenUsage>,
+) -> WorkflowResult<CodexWorkflowOutput> {
+    let state = ContinueAsNewState {
+        rollout_items: storage.items(),
+        pending_user_turns: pending_turns,
+        cumulative_turn_count: turn_counter,
+        cumulative_iterations: total_iterations,
+        cumulative_token_usage: token_usage,
+    };
+
+    let mut can_input = input.clone();
+    can_input.user_message = String::new(); // Not needed after first run.
+    can_input.continued_state = Some(state);
+
+    Err(WorkflowTermination::continue_as_new(
+        ContinueAsNewWorkflowExecution {
+            arguments: vec![can_input.as_json_payload().map_err(|e| {
+                WorkflowTermination::failed(anyhow::anyhow!("failed to serialize CAN input: {e}"))
+            })?],
+            ..Default::default()
+        },
+    ))
 }
 
 #[workflow_methods]
 impl CodexWorkflow {
     #[init]
     pub fn new(_ctx: &WorkflowContextView, input: CodexWorkflowInput) -> Self {
+        // If restoring from continue-as-new, use the carried-over state.
+        if let Some(ref state) = input.continued_state {
+            return Self {
+                user_turns: state.pending_user_turns.clone(),
+                turn_counter: state.cumulative_turn_count,
+                events: Arc::new(BufferEventSink::new()),
+                pending_approval: None,
+                shutdown_requested: false,
+                compact_requested: false,
+                input,
+            };
+        }
+
         // If the workflow input contains a non-empty user_message, seed it as
         // the first turn so the workflow starts processing immediately.
-        let initial_turns = if input.user_message.is_empty() {
-            Vec::new()
+        let (initial_turns, turn_counter) = if input.user_message.is_empty() {
+            (Vec::new(), 0)
         } else {
-            vec![UserTurnInput {
-                turn_id: "turn-0".to_string(),
-                message: input.user_message.clone(),
-                effort: input.reasoning_effort,
-                summary: input.reasoning_summary,
-                personality: input.personality,
-            }]
+            (
+                vec![UserTurnInput {
+                    turn_id: "turn-0".to_string(),
+                    message: input.user_message.clone(),
+                    effort: input.reasoning_effort,
+                    summary: input.reasoning_summary,
+                    personality: input.personality,
+                }],
+                1,
+            )
         };
 
         Self {
             input,
             events: Arc::new(BufferEventSink::new()),
             user_turns: initial_turns,
+            turn_counter,
             pending_approval: None,
             shutdown_requested: false,
+            compact_requested: false,
         }
     }
 
     // ----- signals -----
 
-    /// Queue a new user turn for processing.
+    /// Generic signal that dispatches all client operations.
     #[signal]
-    pub fn receive_user_turn(
-        &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
-        input: UserTurnInput,
-    ) {
-        self.user_turns.push(input);
-    }
-
-    /// Resolve a pending tool-call approval.
-    #[signal]
-    pub fn receive_approval(
-        &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
-        input: ApprovalInput,
-    ) {
-        if let Some(ref mut pa) = self.pending_approval {
-            if pa.call_id == input.call_id {
-                pa.decision = Some(input.approved);
+    pub fn receive_op(&mut self, _ctx: &mut SyncWorkflowContext<Self>, op: Op) {
+        match op {
+            Op::UserTurn {
+                items,
+                effort,
+                summary,
+                personality,
+                ..
+            } => {
+                let message = extract_message(&items);
+                let turn_id = format!("turn-{}", self.turn_counter);
+                self.turn_counter += 1;
+                self.user_turns.push(UserTurnInput {
+                    turn_id,
+                    message,
+                    effort,
+                    summary,
+                    personality,
+                });
+            }
+            Op::ExecApproval { id, decision, .. } => {
+                if let Some(ref mut pa) = self.pending_approval {
+                    if pa.call_id == id {
+                        let approved = matches!(
+                            decision,
+                            ReviewDecision::Approved
+                                | ReviewDecision::ApprovedForSession
+                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                        );
+                        pa.decision = Some(approved);
+                    }
+                }
+            }
+            Op::Shutdown => {
+                self.shutdown_requested = true;
+            }
+            Op::Compact => {
+                self.compact_requested = true;
+            }
+            _ => {
+                // Unknown/unhandled Op — ignore.
             }
         }
-    }
-
-    /// Request graceful shutdown after the current turn finishes.
-    #[signal]
-    pub fn request_shutdown(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
-        self.shutdown_requested = true;
     }
 
     // ----- queries -----
@@ -167,15 +257,46 @@ impl CodexWorkflow {
         // --- session ---
         let conversation_id = ThreadId::new();
         let event_sink: Arc<dyn EventSink> = events.clone();
-        let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+        let storage = Arc::new(InMemoryStorage::new());
+        let storage_backend: Arc<dyn StorageBackend> = Arc::clone(&storage) as _;
 
         let sess = Session::new_minimal(
             conversation_id,
             Arc::clone(&config),
             event_sink,
-            storage,
+            storage_backend,
         )
         .await;
+
+        // --- restore state from continue-as-new (if any) ---
+        if let Some(ref state) = input.continued_state {
+            // Pre-populate storage so it reflects the full rollout history.
+            storage.save(&state.rollout_items).await;
+
+            // Rebuild in-memory conversation history from rollout items.
+            let mut history_items: Vec<ResponseItem> = Vec::new();
+            for item in &state.rollout_items {
+                match item {
+                    codex_protocol::protocol::RolloutItem::ResponseItem(ri) => {
+                        history_items.push(ri.clone());
+                    }
+                    codex_protocol::protocol::RolloutItem::Compacted(compacted) => {
+                        if let Some(ref replacement) = compacted.replacement_history {
+                            // Remote compaction: use the pre-computed replacement.
+                            history_items = replacement.clone();
+                        } else {
+                            // Local compaction: the summary becomes an assistant
+                            // message. Clear prior history and use the compacted
+                            // message as the new baseline.
+                            history_items.clear();
+                            history_items.push(compacted.clone().into());
+                        }
+                    }
+                    _ => {} // Skip SessionMeta, TurnContext, EventMsg
+                }
+            }
+            sess.replace_history(history_items).await;
+        }
 
         // --- tools ---
         // Use codex-core's build_specs to get the full set of tool specs
@@ -192,30 +313,64 @@ impl CodexWorkflow {
             text: input.instructions.clone(),
         };
 
-        let mut total_iterations = 0u32;
+        let mut total_iterations = input
+            .continued_state
+            .as_ref()
+            .map_or(0, |s| s.cumulative_iterations);
         let mut last_agent_message: Option<String> = None;
-        let mut turn_counter = 0u32;
 
         // === main loop: wait for turns, process them, repeat ===
-        ENTROPY
+        let can_result: Option<WorkflowResult<CodexWorkflowOutput>> = ENTROPY
             .scope(entropy, async {
                 loop {
                     // Wait until we have a user turn to process or shutdown.
-                    ctx.wait_condition(|s| !s.user_turns.is_empty() || s.shutdown_requested)
-                        .await;
+                    ctx.wait_condition(|s| {
+                        !s.user_turns.is_empty()
+                            || s.shutdown_requested
+                            || s.compact_requested
+                    })
+                    .await;
+
+                    // Check compact — emit event then continue-as-new.
+                    let compact = ctx.state(|s| s.compact_requested);
+                    if compact {
+                        tracing::info!("compact requested — triggering continue-as-new");
+                        ctx.state_mut(|s| s.compact_requested = false);
+
+                        // TODO: run actual compaction through Session here.
+                        // For now, skip model-based summarization and just
+                        // trigger CAN with the full history as-is.
+
+                        // Emit ContextCompactedEvent so clients know compact
+                        // completed (blocking event before CAN).
+                        events.emit_event_sync(Event {
+                            id: String::new(),
+                            msg: EventMsg::ContextCompacted(ContextCompactedEvent),
+                        });
+
+                        let pending = ctx.state(|s| s.user_turns.clone());
+                        let turn_count = ctx.state(|s| s.turn_counter);
+                        break Some(do_continue_as_new(
+                            &input,
+                            &storage,
+                            pending,
+                            total_iterations,
+                            turn_count,
+                            events.latest_token_usage(),
+                        ));
+                    }
 
                     // Check shutdown before processing.
                     let shutdown = ctx.state(|s| s.shutdown_requested);
                     if shutdown {
                         let remaining = ctx.state(|s| s.user_turns.is_empty());
                         if remaining {
-                            break;
+                            break None;
                         }
                     }
 
                     // Dequeue the next turn.
                     let turn = ctx.state_mut(|s| s.user_turns.remove(0));
-                    turn_counter += 1;
 
                     let turn_id = turn.turn_id.clone();
 
@@ -342,16 +497,36 @@ impl CodexWorkflow {
                         }),
                     });
 
+                    // Check if server suggests continue-as-new (history too large).
+                    if ctx.continue_as_new_suggested() {
+                        tracing::info!("server suggested continue-as-new, triggering CAN");
+                        let pending = ctx.state(|s| s.user_turns.clone());
+                        let turn_count = ctx.state(|s| s.turn_counter);
+                        break Some(do_continue_as_new(
+                            &input,
+                            &storage,
+                            pending,
+                            total_iterations,
+                            turn_count,
+                            events.latest_token_usage(),
+                        ));
+                    }
+
                     // Check if shutdown was requested during this turn.
                     let shutdown = ctx.state(|s| s.shutdown_requested);
                     if shutdown {
-                        break;
+                        break None;
                     }
                 }
             })
             .await;
 
-        // Emit ShutdownComplete
+        // If the loop returned a CAN result, propagate it.
+        if let Some(can) = can_result {
+            return can;
+        }
+
+        // Normal shutdown path.
         events.emit_event_sync(Event {
             id: String::new(),
             msg: EventMsg::ShutdownComplete,

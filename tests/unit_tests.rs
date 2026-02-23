@@ -172,6 +172,7 @@ fn workflow_input_roundtrips_through_json() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -406,6 +407,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -423,6 +425,7 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -453,6 +456,7 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -477,6 +481,7 @@ fn workflow_input_reasoning_effort_roundtrips() {
         reasoning_effort: Some(ReasoningEffort::Low),
         reasoning_summary: ReasoningSummary::Concise,
         personality: Some(Personality::Pragmatic),
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -497,6 +502,81 @@ fn workflow_input_reasoning_fields_default_when_missing() {
         codex_protocol::config_types::ReasoningSummary::Auto
     );
     assert!(input.personality.is_none());
+    assert!(input.continued_state.is_none());
+}
+
+#[test]
+fn continue_as_new_state_roundtrips_through_json() {
+    use codex_protocol::protocol::{RolloutItem, TokenUsage};
+    use codex_protocol::models::ResponseItem;
+    use codex_temporal::types::{ContinueAsNewState, UserTurnInput};
+
+    let state = ContinueAsNewState {
+        rollout_items: vec![RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![],
+            end_turn: None,
+            phase: None,
+        })],
+        pending_user_turns: vec![UserTurnInput {
+            turn_id: "turn-5".to_string(),
+            message: "hello".to_string(),
+            effort: None,
+            summary: codex_protocol::config_types::ReasoningSummary::Auto,
+            personality: None,
+        }],
+        cumulative_turn_count: 5,
+        cumulative_iterations: 42,
+        cumulative_token_usage: Some(TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 50,
+            output_tokens: 25,
+            reasoning_output_tokens: 0,
+            total_tokens: 125,
+        }),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: ContinueAsNewState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.rollout_items.len(), 1);
+    assert_eq!(back.pending_user_turns.len(), 1);
+    assert_eq!(back.pending_user_turns[0].turn_id, "turn-5");
+    assert_eq!(back.cumulative_turn_count, 5);
+    assert_eq!(back.cumulative_iterations, 42);
+    assert!(back.cumulative_token_usage.is_some());
+}
+
+#[test]
+fn workflow_input_with_continued_state_roundtrips() {
+    use codex_temporal::types::ContinueAsNewState;
+
+    let input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        continued_state: Some(ContinueAsNewState {
+            rollout_items: vec![],
+            pending_user_turns: vec![],
+            cumulative_turn_count: 3,
+            cumulative_iterations: 10,
+            cumulative_token_usage: None,
+        }),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert!(back.continued_state.is_some());
+    let state = back.continued_state.unwrap();
+    assert_eq!(state.cumulative_turn_count, 3);
+    assert_eq!(state.cumulative_iterations, 10);
 }
 
 #[test]

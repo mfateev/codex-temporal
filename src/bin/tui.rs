@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reasoning_effort,
         reasoning_summary,
         personality,
+        continued_state: None,
     };
     let session = Arc::new(TemporalAgentSession::new(
         client,

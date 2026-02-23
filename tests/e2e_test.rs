@@ -66,6 +66,7 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -329,6 +330,7 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -349,6 +351,7 @@ fn new_session_with_effort(
         reasoning_effort: Some(effort),
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -419,6 +422,7 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -565,6 +569,70 @@ async fn reasoning_effort_turn(client: &Client) {
     assert!(
         msg.is_some(),
         "expected agent message with reasoning effort Low"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+/// Test: compact triggers continue-as-new and conversation context is preserved.
+///
+/// 1. Submit turn asking to remember a word.
+/// 2. Wait for TurnComplete.
+/// 3. Submit Op::Compact (triggers CAN behind the scenes).
+/// 4. Wait for ContextCompactedEvent.
+/// 5. After CAN, submit another turn asking for the remembered word.
+/// 6. Verify the response contains the word (context was preserved).
+async fn compact_triggers_continue_as_new(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Turn 1: ask the model to remember a word.
+    session
+        .submit(user_turn_op_with_model(
+            "Remember this word exactly: 'elephant'. Just confirm you've remembered it.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 1 failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    assert!(msg.is_some(), "expected agent message from turn 1");
+
+    // Submit compact — this triggers continue-as-new.
+    session
+        .submit(Op::Compact)
+        .await
+        .expect("submit compact failed");
+
+    // Wait for ContextCompactedEvent (emitted before CAN).
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for ContextCompactedEvent");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(event.msg, EventMsg::ContextCompacted(_)) {
+            break;
+        }
+    }
+
+    // After CAN, the workflow has restarted with carried-over state.
+    // Give a brief pause for the new run to be ready.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Turn 2: ask for the remembered word (tests context preservation).
+    session
+        .submit(user_turn_op_with_model(
+            "What word did I ask you to remember? Reply with just the word.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 2 failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    let response = msg.expect("expected agent message from turn 2");
+    assert!(
+        response.to_lowercase().contains("elephant"),
+        "expected 'elephant' in response, got: {response}"
     );
 
     drain_shutdown(&session).await;
@@ -718,6 +786,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: reasoning_effort_turn ---");
     reasoning_effort_turn(&client).await;
+
+    eprintln!("--- test: compact_triggers_continue_as_new ---");
+    compact_triggers_continue_as_new(&client).await;
 
     // --- teardown ---
     drop(client);
