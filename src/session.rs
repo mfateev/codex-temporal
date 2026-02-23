@@ -7,10 +7,8 @@
 //!
 //! | Op variant        | Temporal action                              |
 //! |-------------------|----------------------------------------------|
-//! | `UserTurn`        | start workflow (first) or signal `receive_user_turn` |
-//! | `ExecApproval`    | signal `receive_approval`                    |
-//! | `Shutdown`        | signal `request_shutdown`                    |
-//! | other             | logged + ignored                             |
+//! | `UserTurn`        | start workflow (first) or signal `receive_op` |
+//! | all other Ops     | signal `receive_op`                          |
 //!
 //! Events are retrieved by polling `get_events_since` with adaptive backoff.
 
@@ -19,12 +17,13 @@ use std::sync::Mutex;
 use codex_core::error::{CodexErr, Result as CodexResult};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::{Event, EventMsg, Op, ReviewDecision};
+use codex_protocol::protocol::{Event, EventMsg, Op};
+use codex_protocol::user_input::UserInput;
 use temporalio_client::{
     Client, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
 
-use crate::types::{ApprovalInput, CodexWorkflowInput, UserTurnInput};
+use crate::types::CodexWorkflowInput;
 use crate::workflow::{CodexWorkflow, CodexWorkflowRun};
 
 const TASK_QUEUE: &str = "codex-temporal";
@@ -42,8 +41,6 @@ pub struct TemporalAgentSession {
     events_index: Mutex<usize>,
     /// Local buffer of deserialized events not yet returned to the caller.
     event_buffer: Mutex<Vec<Event>>,
-    /// Turn counter for generating turn IDs.
-    turn_counter: Mutex<u32>,
     /// Set when shutdown has been signaled.
     shutdown: Mutex<bool>,
 }
@@ -59,28 +56,50 @@ impl TemporalAgentSession {
             started: Mutex::new(false),
             events_index: Mutex::new(0),
             event_buffer: Mutex::new(Vec::new()),
-            turn_counter: Mutex::new(0),
             shutdown: Mutex::new(false),
         }
     }
 
+    /// Attach to an existing running workflow.
+    ///
+    /// Unlike `new()`, the workflow is assumed to already be running, so the
+    /// first `Op::UserTurn` will be signalled rather than starting a workflow.
+    pub fn resume(client: Client, session_id: String, base_input: CodexWorkflowInput) -> Self {
+        Self {
+            client,
+            workflow_id: session_id,
+            base_input,
+            started: Mutex::new(true), // already running
+            events_index: Mutex::new(0),
+            event_buffer: Mutex::new(Vec::new()),
+            shutdown: Mutex::new(false),
+        }
+    }
+
+    /// Return the workflow ID (session ID) for this session.
+    pub fn session_id(&self) -> &str {
+        &self.workflow_id
+    }
+
+    /// Fetch all existing events from the workflow and advance the watermark.
+    ///
+    /// Call **before** launching the TUI to populate `initial_messages` so
+    /// the user sees the full conversation history immediately on resume.
+    pub async fn fetch_initial_events(&self) -> CodexResult<Vec<EventMsg>> {
+        let events = self.poll_events().await?;
+        Ok(events.into_iter().map(|e| e.msg).collect())
+    }
+
     /// Extract the text message from user input items.
-    fn extract_message(items: &[codex_protocol::user_input::UserInput]) -> String {
+    fn extract_message(items: &[UserInput]) -> String {
         items
             .iter()
             .filter_map(|item| match item {
-                codex_protocol::user_input::UserInput::Text { text, .. } => Some(text.as_str()),
+                UserInput::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// Generate a new turn ID.
-    fn next_turn_id(&self) -> String {
-        let mut counter = self.turn_counter.lock().expect("lock poisoned");
-        *counter += 1;
-        format!("turn-{}", *counter)
     }
 
     /// Start the workflow with the first user message.
@@ -91,12 +110,6 @@ impl TemporalAgentSession {
         summary: ReasoningSummary,
         personality: Option<Personality>,
     ) -> CodexResult<String> {
-        let turn_id = {
-            let mut counter = self.turn_counter.lock().expect("lock poisoned");
-            *counter += 1;
-            format!("turn-{}", *counter)
-        };
-
         let input = CodexWorkflowInput {
             user_message: message,
             model: self.base_input.model.clone(),
@@ -110,6 +123,7 @@ impl TemporalAgentSession {
                 self.base_input.reasoning_summary
             },
             personality: personality.or(self.base_input.personality),
+            continued_state: None,
         };
 
         let options = WorkflowStartOptions::new(TASK_QUEUE, &self.workflow_id).build();
@@ -123,92 +137,28 @@ impl TemporalAgentSession {
 
         tracing::info!(
             workflow_id = %self.workflow_id,
-            turn_id = %turn_id,
             "workflow started"
         );
 
-        Ok(turn_id)
+        Ok("started".to_string())
     }
 
-    /// Signal a new user turn to an already-running workflow.
-    async fn signal_user_turn(
-        &self,
-        message: String,
-        effort: Option<ReasoningEffort>,
-        summary: ReasoningSummary,
-        personality: Option<Personality>,
-    ) -> CodexResult<String> {
-        let turn_id = self.next_turn_id();
-
-        let handle = self
-            .client
-            .get_workflow_handle::<CodexWorkflowRun>(&self.workflow_id);
-
-        let input = UserTurnInput {
-            turn_id: turn_id.clone(),
-            message,
-            effort,
-            summary,
-            personality,
-        };
-
-        handle
-            .signal(
-                CodexWorkflow::receive_user_turn,
-                input,
-                WorkflowSignalOptions::default(),
-            )
-            .await
-            .map_err(|e| CodexErr::Fatal(format!("failed to signal user turn: {e}")))?;
-
-        Ok(turn_id)
-    }
-
-    /// Signal approval/denial for a pending tool call.
-    async fn signal_approval(
-        &self,
-        call_id: String,
-        approved: bool,
-    ) -> CodexResult<String> {
-        let handle = self
-            .client
-            .get_workflow_handle::<CodexWorkflowRun>(&self.workflow_id);
-
-        let input = ApprovalInput {
-            call_id: call_id.clone(),
-            approved,
-        };
-
-        handle
-            .signal(
-                CodexWorkflow::receive_approval,
-                input,
-                WorkflowSignalOptions::default(),
-            )
-            .await
-            .map_err(|e| CodexErr::Fatal(format!("failed to signal approval: {e}")))?;
-
-        Ok(call_id)
-    }
-
-    /// Signal shutdown to the workflow.
-    async fn signal_shutdown(&self) -> CodexResult<String> {
+    /// Signal an operation to the running workflow.
+    async fn signal_op(&self, op: Op) -> CodexResult<String> {
         let handle = self
             .client
             .get_workflow_handle::<CodexWorkflowRun>(&self.workflow_id);
 
         handle
             .signal(
-                CodexWorkflow::request_shutdown,
-                (),
+                CodexWorkflow::receive_op,
+                op,
                 WorkflowSignalOptions::default(),
             )
             .await
-            .map_err(|e| CodexErr::Fatal(format!("failed to signal shutdown: {e}")))?;
+            .map_err(|e| CodexErr::Fatal(format!("failed to signal op: {e}")))?;
 
-        *self.shutdown.lock().expect("lock poisoned") = true;
-
-        Ok("shutdown".to_string())
+        Ok("ok".to_string())
     }
 
     /// Poll the workflow for new events via query.
@@ -263,64 +213,30 @@ impl TemporalAgentSession {
 #[async_trait::async_trait]
 impl codex_core::AgentSession for TemporalAgentSession {
     async fn submit(&self, op: Op) -> CodexResult<String> {
-        match op {
-            Op::UserTurn {
-                items,
-                effort,
-                summary,
-                personality,
-                ..
-            } => {
-                let message = Self::extract_message(&items);
-                let started = *self.started.lock().expect("lock poisoned");
-                if started {
-                    self.signal_user_turn(message, effort, summary, personality)
-                        .await
-                } else {
-                    self.start_workflow(message, effort, summary, personality)
-                        .await
-                }
-            }
-
-            Op::ExecApproval { id, decision, .. } => {
-                let approved = matches!(
-                    decision,
-                    ReviewDecision::Approved
-                        | ReviewDecision::ApprovedForSession
-                        | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                );
-                self.signal_approval(id, approved).await
-            }
-
-            Op::Shutdown => self.signal_shutdown().await,
-
-            Op::Interrupt => {
-                tracing::warn!("Op::Interrupt not yet implemented for Temporal session");
-                Ok("interrupt-noop".to_string())
-            }
-
-            // The TUI sends these during normal operation. In the Temporal
-            // context they are no-ops — the worker handles execution, there
-            // are no local MCP servers, custom prompts, skills, or history.
-            Op::ListCustomPrompts
-            | Op::ListSkills { .. }
-            | Op::ListMcpTools
-            | Op::AddToHistory { .. }
-            | Op::CleanBackgroundTerminals
-            | Op::DropMemories
-            | Op::UpdateMemories
-            | Op::ReloadUserConfig
-            | Op::Review { .. }
-            | Op::RunUserShellCommand { .. }
-            | Op::Compact
-            | Op::SetThreadName { .. }
-            | Op::Undo => Ok("noop".to_string()),
-
-            other => {
-                tracing::warn!(?other, "unhandled Op variant in TemporalAgentSession");
-                Ok("noop".to_string())
+        // First UserTurn starts the workflow; all other ops are signaled.
+        if let Op::UserTurn {
+            ref items,
+            effort,
+            summary,
+            personality,
+            ..
+        } = op
+        {
+            let started = *self.started.lock().expect("lock poisoned");
+            if !started {
+                let message = Self::extract_message(items);
+                return self
+                    .start_workflow(message, effort, summary, personality)
+                    .await;
             }
         }
+
+        // Track shutdown locally so next_event() can detect it.
+        if matches!(op, Op::Shutdown) {
+            *self.shutdown.lock().expect("lock poisoned") = true;
+        }
+
+        self.signal_op(op).await
     }
 
     async fn next_event(&self) -> CodexResult<Event> {

@@ -7,6 +7,7 @@ use codex_core::ToolSpec;
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
+use codex_protocol::protocol::{RolloutItem, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -145,6 +146,48 @@ pub struct PendingApproval {
 }
 
 // ---------------------------------------------------------------------------
+// Harness types (session registry)
+// ---------------------------------------------------------------------------
+
+/// A session entry in the harness registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntry {
+    /// Workflow ID of the session (e.g. "codex-session-<uuid>").
+    pub session_id: String,
+    /// Optional human-readable name.
+    pub name: Option<String>,
+    /// Model slug used by this session.
+    pub model: String,
+    /// Session creation time as Unix millis.
+    pub created_at_millis: u64,
+    /// Current session status.
+    pub status: SessionStatus,
+}
+
+/// Status of a tracked session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Input to the `CodexHarness` workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessInput {
+    /// State carried over from a previous continue-as-new execution.
+    #[serde(default)]
+    pub continued_state: Option<HarnessState>,
+}
+
+/// State carried across a continue-as-new boundary for the harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessState {
+    /// Known sessions tracked by the harness.
+    pub sessions: Vec<SessionEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Workflow I/O
 // ---------------------------------------------------------------------------
 
@@ -174,6 +217,10 @@ pub struct CodexWorkflowInput {
     /// Optional personality for the model.
     #[serde(default)]
     pub personality: Option<Personality>,
+    /// State carried over from a previous continue-as-new execution.
+    /// `None` on the first run, `Some(...)` on subsequent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_state: Option<ContinueAsNewState>,
 }
 
 /// Output from the codex workflow.
@@ -185,5 +232,25 @@ pub struct CodexWorkflowOutput {
     pub iterations: u32,
     /// Cumulative token usage across all model calls.
     #[serde(default)]
-    pub token_usage: Option<codex_protocol::protocol::TokenUsage>,
+    pub token_usage: Option<TokenUsage>,
+}
+
+// ---------------------------------------------------------------------------
+// Continue-as-new state
+// ---------------------------------------------------------------------------
+
+/// State carried across a continue-as-new boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContinueAsNewState {
+    /// Accumulated conversation history (RolloutItems from InMemoryStorage).
+    pub rollout_items: Vec<RolloutItem>,
+    /// Queued user turns not yet processed.
+    pub pending_user_turns: Vec<UserTurnInput>,
+    /// Cumulative turn count across all CAN runs.
+    pub cumulative_turn_count: u32,
+    /// Cumulative model-to-tool loop iteration count.
+    pub cumulative_iterations: u32,
+    /// Cumulative token usage across all CAN runs.
+    #[serde(default)]
+    pub cumulative_token_usage: Option<TokenUsage>,
 }

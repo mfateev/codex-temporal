@@ -6,8 +6,8 @@ use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ModelCallOutput, PendingApproval,
-    ToolExecOutput, UserTurnInput,
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, HarnessInput, HarnessState,
+    ModelCallOutput, PendingApproval, SessionEntry, SessionStatus, ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::{Clock, RandomSource};
@@ -172,6 +172,7 @@ fn workflow_input_roundtrips_through_json() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -406,6 +407,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -423,6 +425,7 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -453,6 +456,7 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -477,6 +481,7 @@ fn workflow_input_reasoning_effort_roundtrips() {
         reasoning_effort: Some(ReasoningEffort::Low),
         reasoning_summary: ReasoningSummary::Concise,
         personality: Some(Personality::Pragmatic),
+        continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -497,6 +502,81 @@ fn workflow_input_reasoning_fields_default_when_missing() {
         codex_protocol::config_types::ReasoningSummary::Auto
     );
     assert!(input.personality.is_none());
+    assert!(input.continued_state.is_none());
+}
+
+#[test]
+fn continue_as_new_state_roundtrips_through_json() {
+    use codex_protocol::protocol::{RolloutItem, TokenUsage};
+    use codex_protocol::models::ResponseItem;
+    use codex_temporal::types::{ContinueAsNewState, UserTurnInput};
+
+    let state = ContinueAsNewState {
+        rollout_items: vec![RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![],
+            end_turn: None,
+            phase: None,
+        })],
+        pending_user_turns: vec![UserTurnInput {
+            turn_id: "turn-5".to_string(),
+            message: "hello".to_string(),
+            effort: None,
+            summary: codex_protocol::config_types::ReasoningSummary::Auto,
+            personality: None,
+        }],
+        cumulative_turn_count: 5,
+        cumulative_iterations: 42,
+        cumulative_token_usage: Some(TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 50,
+            output_tokens: 25,
+            reasoning_output_tokens: 0,
+            total_tokens: 125,
+        }),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: ContinueAsNewState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.rollout_items.len(), 1);
+    assert_eq!(back.pending_user_turns.len(), 1);
+    assert_eq!(back.pending_user_turns[0].turn_id, "turn-5");
+    assert_eq!(back.cumulative_turn_count, 5);
+    assert_eq!(back.cumulative_iterations, 42);
+    assert!(back.cumulative_token_usage.is_some());
+}
+
+#[test]
+fn workflow_input_with_continued_state_roundtrips() {
+    use codex_temporal::types::ContinueAsNewState;
+
+    let input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        continued_state: Some(ContinueAsNewState {
+            rollout_items: vec![],
+            pending_user_turns: vec![],
+            cumulative_turn_count: 3,
+            cumulative_iterations: 10,
+            cumulative_token_usage: None,
+        }),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert!(back.continued_state.is_some());
+    let state = back.continued_state.unwrap();
+    assert_eq!(state.cumulative_turn_count, 3);
+    assert_eq!(state.cumulative_iterations, 10);
 }
 
 #[test]
@@ -820,5 +900,88 @@ async fn dispatch_read_file_nonexistent_returns_error() {
     assert!(
         exit_code != 0 || output.to_lowercase().contains("error") || output.to_lowercase().contains("no such file"),
         "expected error for nonexistent file, got exit_code={exit_code}, output: {output}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Harness type serde tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_entry_roundtrips_through_json() {
+    let entry = SessionEntry {
+        session_id: "codex-session-abc123".to_string(),
+        name: Some("My session".to_string()),
+        model: "gpt-4o".to_string(),
+        created_at_millis: 1_700_000_000_000,
+        status: SessionStatus::Running,
+    };
+
+    let json = serde_json::to_string(&entry).unwrap();
+    let back: SessionEntry = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.session_id, "codex-session-abc123");
+    assert_eq!(back.name, Some("My session".to_string()));
+    assert_eq!(back.model, "gpt-4o");
+    assert_eq!(back.created_at_millis, 1_700_000_000_000);
+    assert_eq!(back.status, SessionStatus::Running);
+}
+
+#[test]
+fn session_entry_status_variants_roundtrip() {
+    for status in [
+        SessionStatus::Running,
+        SessionStatus::Completed,
+        SessionStatus::Failed,
+    ] {
+        let entry = SessionEntry {
+            session_id: "s1".to_string(),
+            name: None,
+            model: "gpt-4o-mini".to_string(),
+            created_at_millis: 0,
+            status,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, status, "status {status:?} should roundtrip");
+    }
+}
+
+#[test]
+fn harness_state_roundtrips() {
+    let state = HarnessState {
+        sessions: vec![
+            SessionEntry {
+                session_id: "s1".to_string(),
+                name: Some("first".to_string()),
+                model: "gpt-4o".to_string(),
+                created_at_millis: 100,
+                status: SessionStatus::Running,
+            },
+            SessionEntry {
+                session_id: "s2".to_string(),
+                name: None,
+                model: "gpt-4o-mini".to_string(),
+                created_at_millis: 200,
+                status: SessionStatus::Completed,
+            },
+        ],
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: HarnessState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.sessions.len(), 2);
+    assert_eq!(back.sessions[0].session_id, "s1");
+    assert_eq!(back.sessions[1].status, SessionStatus::Completed);
+}
+
+#[test]
+fn harness_input_defaults_when_empty() {
+    let json = r#"{}"#;
+    let input: HarnessInput = serde_json::from_str(json).unwrap();
+    assert!(
+        input.continued_state.is_none(),
+        "continued_state should default to None"
     );
 }
