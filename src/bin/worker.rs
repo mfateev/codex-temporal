@@ -13,6 +13,7 @@ use temporalio_sdk::{Worker, WorkerOptions};
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use codex_temporal::activities::CodexActivities;
+use codex_temporal::harness::CodexHarness;
 use codex_temporal::workflow::CodexWorkflow;
 
 const TASK_QUEUE: &str = "codex-temporal";
@@ -63,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker_options = WorkerOptions::new(TASK_QUEUE)
         .task_types(WorkerTaskTypes::all())
         .register_workflow::<CodexWorkflow>()
+        .register_workflow::<CodexHarness>()
         .register_activities(CodexActivities::new())
         .build();
 

@@ -6,8 +6,8 @@ use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ModelCallOutput, PendingApproval,
-    ToolExecOutput, UserTurnInput,
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, HarnessInput, HarnessState,
+    ModelCallOutput, PendingApproval, SessionEntry, SessionStatus, ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::{Clock, RandomSource};
@@ -900,5 +900,88 @@ async fn dispatch_read_file_nonexistent_returns_error() {
     assert!(
         exit_code != 0 || output.to_lowercase().contains("error") || output.to_lowercase().contains("no such file"),
         "expected error for nonexistent file, got exit_code={exit_code}, output: {output}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Harness type serde tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_entry_roundtrips_through_json() {
+    let entry = SessionEntry {
+        session_id: "codex-session-abc123".to_string(),
+        name: Some("My session".to_string()),
+        model: "gpt-4o".to_string(),
+        created_at_millis: 1_700_000_000_000,
+        status: SessionStatus::Running,
+    };
+
+    let json = serde_json::to_string(&entry).unwrap();
+    let back: SessionEntry = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.session_id, "codex-session-abc123");
+    assert_eq!(back.name, Some("My session".to_string()));
+    assert_eq!(back.model, "gpt-4o");
+    assert_eq!(back.created_at_millis, 1_700_000_000_000);
+    assert_eq!(back.status, SessionStatus::Running);
+}
+
+#[test]
+fn session_entry_status_variants_roundtrip() {
+    for status in [
+        SessionStatus::Running,
+        SessionStatus::Completed,
+        SessionStatus::Failed,
+    ] {
+        let entry = SessionEntry {
+            session_id: "s1".to_string(),
+            name: None,
+            model: "gpt-4o-mini".to_string(),
+            created_at_millis: 0,
+            status,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, status, "status {status:?} should roundtrip");
+    }
+}
+
+#[test]
+fn harness_state_roundtrips() {
+    let state = HarnessState {
+        sessions: vec![
+            SessionEntry {
+                session_id: "s1".to_string(),
+                name: Some("first".to_string()),
+                model: "gpt-4o".to_string(),
+                created_at_millis: 100,
+                status: SessionStatus::Running,
+            },
+            SessionEntry {
+                session_id: "s2".to_string(),
+                name: None,
+                model: "gpt-4o-mini".to_string(),
+                created_at_millis: 200,
+                status: SessionStatus::Completed,
+            },
+        ],
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: HarnessState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.sessions.len(), 2);
+    assert_eq!(back.sessions[0].session_id, "s1");
+    assert_eq!(back.sessions[1].status, SessionStatus::Completed);
+}
+
+#[test]
+fn harness_input_defaults_when_empty() {
+    let json = r#"{}"#;
+    let input: HarnessInput = serde_json::from_str(json).unwrap();
+    assert!(
+        input.continued_state.is_none(),
+        "continued_state should default to None"
     );
 }

@@ -146,6 +146,48 @@ pub struct PendingApproval {
 }
 
 // ---------------------------------------------------------------------------
+// Harness types (session registry)
+// ---------------------------------------------------------------------------
+
+/// A session entry in the harness registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntry {
+    /// Workflow ID of the session (e.g. "codex-session-<uuid>").
+    pub session_id: String,
+    /// Optional human-readable name.
+    pub name: Option<String>,
+    /// Model slug used by this session.
+    pub model: String,
+    /// Session creation time as Unix millis.
+    pub created_at_millis: u64,
+    /// Current session status.
+    pub status: SessionStatus,
+}
+
+/// Status of a tracked session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Input to the `CodexHarness` workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessInput {
+    /// State carried over from a previous continue-as-new execution.
+    #[serde(default)]
+    pub continued_state: Option<HarnessState>,
+}
+
+/// State carried across a continue-as-new boundary for the harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessState {
+    /// Known sessions tracked by the harness.
+    pub sessions: Vec<SessionEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Workflow I/O
 // ---------------------------------------------------------------------------
 

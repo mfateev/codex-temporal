@@ -18,11 +18,18 @@ use codex_protocol::protocol::{
 use codex_protocol::user_input::UserInput;
 
 use codex_temporal::activities::CodexActivities;
+use codex_temporal::harness::{CodexHarness, CodexHarnessRun};
 use codex_temporal::session::TemporalAgentSession;
-use codex_temporal::types::CodexWorkflowInput;
+use codex_temporal::types::{
+    CodexWorkflowInput, HarnessInput, SessionEntry, SessionStatus,
+};
 use codex_temporal::workflow::CodexWorkflow;
 
-use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
+use temporalio_client::{
+    Client, ClientOptions, Connection, ConnectionOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+};
+use temporalio_common::protos::temporal::api::enums::v1::WorkflowIdConflictPolicy;
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk::{Worker, WorkerOptions};
@@ -638,6 +645,143 @@ async fn compact_triggers_continue_as_new(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: session resume via harness workflow.
+///
+/// 1. Start harness workflow.
+/// 2. Start session workflow, register with harness.
+/// 3. Submit turn 1 ("Remember 'blue-moon-42', reply OK"), wait for TurnComplete.
+/// 4. Query harness list_sessions() — assert session appears with Running status.
+/// 5. Create TemporalAgentSession::resume(), call fetch_initial_events() — verify replayed events.
+/// 6. Submit turn 2 via resumed session ("What code did I tell you?").
+/// 7. Assert response contains "blue-moon-42".
+/// 8. Shutdown.
+async fn session_resume(client: &Client) {
+    // 1. Start harness workflow (idempotent).
+    let harness_id = format!("e2e-harness-{}", uuid::Uuid::new_v4());
+    let harness_input = HarnessInput {
+        continued_state: None,
+    };
+    let harness_options = WorkflowStartOptions::new(TASK_QUEUE, &harness_id)
+        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+        .build();
+    client
+        .start_workflow(CodexHarness::run, harness_input, harness_options)
+        .await
+        .expect("failed to start harness workflow");
+
+    // 2. Start a regular session workflow.
+    let session = new_session(client, "gpt-4o-mini");
+    let session_id = session.session_id().to_string();
+
+    // Register with harness.
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let entry = SessionEntry {
+        session_id: session_id.clone(),
+        name: Some("resume test".to_string()),
+        model: "gpt-4o-mini".to_string(),
+        created_at_millis: now_millis,
+        status: SessionStatus::Running,
+    };
+    let harness_handle = client.get_workflow_handle::<CodexHarnessRun>(&harness_id);
+    harness_handle
+        .signal(
+            CodexHarness::register_session,
+            entry,
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("failed to register session with harness");
+
+    // 3. Submit turn 1.
+    session
+        .submit(user_turn_op_with_model(
+            "Remember this exact code: 'blue-moon-42'. Reply with just 'OK'.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 1 failed");
+
+    let msg1 = wait_for_turn_complete(&session).await;
+    assert!(msg1.is_some(), "expected agent message from turn 1");
+
+    // 4. Query harness — session should appear as Running.
+    let sessions_json: String = harness_handle
+        .query(
+            CodexHarness::list_sessions,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await
+        .expect("failed to query list_sessions");
+    let sessions: Vec<SessionEntry> =
+        serde_json::from_str(&sessions_json).expect("invalid sessions JSON");
+    let found = sessions
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .expect("session should appear in harness registry");
+    assert_eq!(
+        found.status,
+        SessionStatus::Running,
+        "session status should be Running"
+    );
+
+    // 5. Resume: create a new TemporalAgentSession attached to the same workflow.
+    let base_input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        continued_state: None,
+    };
+    let resumed = TemporalAgentSession::resume(client.clone(), session_id.clone(), base_input);
+
+    // fetch_initial_events should return events from turn 1.
+    let initial_events = resumed
+        .fetch_initial_events()
+        .await
+        .expect("fetch_initial_events failed");
+    assert!(
+        !initial_events.is_empty(),
+        "expected replayed events from turn 1, got empty"
+    );
+    // Verify we see a TurnComplete in the replayed events.
+    let has_turn_complete = initial_events
+        .iter()
+        .any(|e| matches!(e, EventMsg::TurnComplete(_)));
+    assert!(
+        has_turn_complete,
+        "expected TurnComplete in replayed events"
+    );
+
+    // 6. Submit turn 2 via resumed session.
+    resumed
+        .submit(user_turn_op_with_model(
+            "What code did I tell you to remember? Reply with just the code.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 2 via resumed session failed");
+
+    let msg2 = wait_for_turn_complete(&resumed).await;
+    let response = msg2.expect("expected agent message from turn 2");
+
+    // 7. Assert response contains the remembered code.
+    assert!(
+        response.to_lowercase().contains("blue-moon-42"),
+        "expected 'blue-moon-42' in response, got: {response}"
+    );
+
+    // 8. Shutdown.
+    drain_shutdown(&resumed).await;
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -743,6 +887,7 @@ async fn e2e_tests_inner() {
             let opts = WorkerOptions::new(TASK_QUEUE)
                 .task_types(WorkerTaskTypes::all())
                 .register_workflow::<CodexWorkflow>()
+                .register_workflow::<CodexHarness>()
                 .register_activities(CodexActivities::new())
                 .build();
             let mut worker =
@@ -789,6 +934,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: compact_triggers_continue_as_new ---");
     compact_triggers_continue_as_new(&client).await;
+
+    eprintln!("--- test: session_resume ---");
+    session_resume(&client).await;
 
     // --- teardown ---
     drop(client);

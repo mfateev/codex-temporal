@@ -60,6 +60,36 @@ impl TemporalAgentSession {
         }
     }
 
+    /// Attach to an existing running workflow.
+    ///
+    /// Unlike `new()`, the workflow is assumed to already be running, so the
+    /// first `Op::UserTurn` will be signalled rather than starting a workflow.
+    pub fn resume(client: Client, session_id: String, base_input: CodexWorkflowInput) -> Self {
+        Self {
+            client,
+            workflow_id: session_id,
+            base_input,
+            started: Mutex::new(true), // already running
+            events_index: Mutex::new(0),
+            event_buffer: Mutex::new(Vec::new()),
+            shutdown: Mutex::new(false),
+        }
+    }
+
+    /// Return the workflow ID (session ID) for this session.
+    pub fn session_id(&self) -> &str {
+        &self.workflow_id
+    }
+
+    /// Fetch all existing events from the workflow and advance the watermark.
+    ///
+    /// Call **before** launching the TUI to populate `initial_messages` so
+    /// the user sees the full conversation history immediately on resume.
+    pub async fn fetch_initial_events(&self) -> CodexResult<Vec<EventMsg>> {
+        let events = self.poll_events().await?;
+        Ok(events.into_iter().map(|e| e.msg).collect())
+    }
+
     /// Extract the text message from user input items.
     fn extract_message(items: &[UserInput]) -> String {
         items
