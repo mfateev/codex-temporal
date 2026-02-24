@@ -7,7 +7,8 @@ use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
     ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, HarnessInput, HarnessState,
-    ModelCallOutput, PendingApproval, SessionEntry, SessionStatus, ToolExecOutput, UserTurnInput,
+    ModelCallOutput, PendingApproval, ProjectContextOutput, SessionEntry, SessionStatus,
+    ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::{Clock, RandomSource};
@@ -984,4 +985,167 @@ fn harness_input_defaults_when_empty() {
         input.continued_state.is_none(),
         "continued_state should default to None"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ProjectContextOutput serde tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn project_context_output_roundtrips() {
+    use codex_protocol::protocol::GitInfo;
+
+    let ctx = ProjectContextOutput {
+        cwd: "/home/user/project".to_string(),
+        user_instructions: Some("Do not modify tests.".to_string()),
+        git_info: Some(GitInfo {
+            commit_hash: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+            repository_url: Some("https://github.com/user/project".to_string()),
+        }),
+    };
+
+    let json = serde_json::to_string(&ctx).unwrap();
+    let back: ProjectContextOutput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.cwd, "/home/user/project");
+    assert_eq!(back.user_instructions.as_deref(), Some("Do not modify tests."));
+    let git = back.git_info.unwrap();
+    assert_eq!(git.commit_hash.as_deref(), Some("abc123"));
+    assert_eq!(git.branch.as_deref(), Some("main"));
+    assert_eq!(git.repository_url.as_deref(), Some("https://github.com/user/project"));
+}
+
+#[test]
+fn project_context_output_defaults() {
+    // Missing optional fields should default to None (backward compat).
+    let json = r#"{"cwd":"/tmp"}"#;
+    let ctx: ProjectContextOutput = serde_json::from_str(json).unwrap();
+
+    assert_eq!(ctx.cwd, "/tmp");
+    assert!(ctx.user_instructions.is_none());
+    assert!(ctx.git_info.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// build_context_items tests
+// ---------------------------------------------------------------------------
+
+use codex_temporal::workflow::build_context_items;
+
+#[test]
+fn build_context_items_with_instructions() {
+    let ctx = ProjectContextOutput {
+        cwd: "/home/user/project".to_string(),
+        user_instructions: Some("Always use cargo test.".to_string()),
+        git_info: None,
+    };
+
+    let items = build_context_items(&ctx);
+
+    // Should have 2 items: user instructions + environment context.
+    assert_eq!(items.len(), 2, "expected 2 context items, got {}", items.len());
+
+    // First item: user instructions.
+    let text = extract_message_text(&items[0]);
+    assert!(
+        text.starts_with("# AGENTS.md instructions for /home/user/project"),
+        "user instructions item should start with prefix, got: {text}"
+    );
+    assert!(
+        text.contains("Always use cargo test."),
+        "user instructions item should contain the instructions text"
+    );
+    assert!(
+        text.contains("<INSTRUCTIONS>") && text.contains("</INSTRUCTIONS>"),
+        "user instructions item should be wrapped in INSTRUCTIONS tags"
+    );
+
+    // Second item: environment context.
+    let env_text = extract_message_text(&items[1]);
+    assert!(
+        env_text.contains("<environment_context>"),
+        "env context should have open tag"
+    );
+    assert!(
+        env_text.contains("<cwd>/home/user/project</cwd>"),
+        "env context should contain cwd"
+    );
+    assert!(
+        env_text.contains("<shell>bash</shell>"),
+        "env context should contain shell"
+    );
+}
+
+#[test]
+fn build_context_items_without_instructions() {
+    let ctx = ProjectContextOutput {
+        cwd: "/tmp".to_string(),
+        user_instructions: None,
+        git_info: None,
+    };
+
+    let items = build_context_items(&ctx);
+
+    // Should have only 1 item: environment context (no user instructions).
+    assert_eq!(items.len(), 1, "expected 1 context item (env only), got {}", items.len());
+
+    let env_text = extract_message_text(&items[0]);
+    assert!(
+        env_text.contains("<cwd>/tmp</cwd>"),
+        "env context should contain cwd"
+    );
+}
+
+#[test]
+fn build_context_items_with_git_info() {
+    use codex_protocol::protocol::GitInfo;
+
+    let ctx = ProjectContextOutput {
+        cwd: "/repo".to_string(),
+        user_instructions: None,
+        git_info: Some(GitInfo {
+            commit_hash: Some("deadbeef".to_string()),
+            branch: Some("feature/test".to_string()),
+            repository_url: Some("https://github.com/org/repo".to_string()),
+        }),
+    };
+
+    let items = build_context_items(&ctx);
+    assert_eq!(items.len(), 1, "expected 1 context item (env only), got {}", items.len());
+
+    let env_text = extract_message_text(&items[0]);
+    assert!(
+        env_text.contains("<git>"),
+        "env context should contain git section"
+    );
+    assert!(
+        env_text.contains("<branch>feature/test</branch>"),
+        "env context should contain branch"
+    );
+    assert!(
+        env_text.contains("<commit>deadbeef</commit>"),
+        "env context should contain commit"
+    );
+    assert!(
+        env_text.contains("<repository_url>https://github.com/org/repo</repository_url>"),
+        "env context should contain repository_url"
+    );
+}
+
+/// Helper to extract the text content from a ResponseItem::Message.
+fn extract_message_text(item: &codex_protocol::models::ResponseItem) -> String {
+    match item {
+        codex_protocol::models::ResponseItem::Message { content, .. } => {
+            content
+                .iter()
+                .filter_map(|c| match c {
+                    codex_protocol::models::ContentItem::InputText { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        other => panic!("expected ResponseItem::Message, got {other:?}"),
+    }
 }

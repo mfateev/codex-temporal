@@ -24,7 +24,9 @@ use tokio::sync::Mutex;
 
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
-use crate::types::{ModelCallInput, ModelCallOutput, ToolExecInput, ToolExecOutput};
+use crate::types::{
+    ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput, ToolExecOutput,
+};
 
 /// Resolve the model provider to use for the activity.
 ///
@@ -187,6 +189,51 @@ impl CodexActivities {
         dispatch_tool(input)
             .await
             .map_err(|e| anyhow::anyhow!("tool_exec failed: {e}").into())
+    }
+
+    /// Collect project context from the worker's environment.
+    ///
+    /// Reads AGENTS.md project docs (hierarchical chain from git root to cwd)
+    /// and git repository info (commit, branch, remote URL).  Runs once per
+    /// workflow start; the result is replayed deterministically on recovery.
+    #[activity]
+    pub async fn collect_project_context(
+        _ctx: ActivityContext,
+    ) -> Result<ProjectContextOutput, ActivityError> {
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let cwd_str = cwd.to_string_lossy().to_string();
+
+        tracing::info!(cwd = %cwd_str, "collecting project context");
+
+        // Build a minimal config pointing at the worker's cwd.
+        let codex_home = PathBuf::from("/tmp/codex-temporal");
+        let mut config = codex_core::config::Config::for_harness(codex_home)
+            .map_err(|e| anyhow::anyhow!("failed to build config for project context: {e}"))?;
+        config.cwd = cwd.clone();
+
+        // Read AGENTS.md chain (git root → cwd).
+        let user_instructions = codex_core::project_doc::read_project_docs(&config)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to read project docs");
+                None
+            });
+
+        // Collect git info (commit, branch, remote URL).
+        let git_info = codex_core::git_info::collect_git_info(&cwd).await;
+
+        tracing::info!(
+            has_instructions = user_instructions.is_some(),
+            has_git = git_info.is_some(),
+            "project context collected"
+        );
+
+        Ok(ProjectContextOutput {
+            cwd: cwd_str,
+            user_instructions,
+            git_info,
+        })
     }
 }
 

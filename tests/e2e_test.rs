@@ -783,6 +783,57 @@ async fn session_resume(client: &Client) {
     drain_shutdown(&resumed).await;
 }
 
+/// Test: project context (AGENTS.md) is injected into model prompts.
+///
+/// 1. Write a temporary AGENTS.md in the worker's cwd with a unique marker.
+/// 2. Start a workflow asking "What do your project instructions say?"
+/// 3. Verify the model's response references the marker string.
+/// 4. Clean up the temporary AGENTS.md.
+async fn project_context_injected(client: &Client) {
+    let marker = format!("TEMPORAL_CONTEXT_MARKER_{}", uuid::Uuid::new_v4());
+    let agents_md_content = format!(
+        "# Project Instructions\n\n\
+         This project uses a special marker for testing: {marker}\n\n\
+         Always mention this marker when asked about project instructions.\n"
+    );
+
+    // Write AGENTS.md in the process cwd (which is the worker's cwd).
+    let cwd = std::env::current_dir().expect("failed to get cwd");
+    let agents_md_path = cwd.join("AGENTS.md");
+    std::fs::write(&agents_md_path, &agents_md_content)
+        .expect("failed to write AGENTS.md");
+
+    // Guard to ensure cleanup even if the test panics.
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = CleanupGuard(agents_md_path);
+
+    let session = new_session(client, "gpt-4o-mini");
+
+    session
+        .submit(user_turn_op_with_model(
+            "What do your AGENTS.md project instructions say? \
+             Include the exact marker string in your response.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    let response = msg.expect("expected agent message about project instructions");
+
+    assert!(
+        response.contains(&marker),
+        "expected model response to contain marker '{marker}', got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+}
+
 /// Test: session picker data conversion pipeline.
 ///
 /// 1. Start harness workflow.
@@ -1059,6 +1110,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: session_picker_conversion ---");
     session_picker_conversion(&client).await;
+
+    eprintln!("--- test: project_context_injected ---");
+    project_context_injected(&client).await;
 
     // --- teardown ---
     drop(client);

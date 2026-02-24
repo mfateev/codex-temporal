@@ -7,7 +7,7 @@ use codex_core::ToolSpec;
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
-use codex_protocol::protocol::{RolloutItem, TokenUsage};
+use codex_protocol::protocol::{GitInfo, RolloutItem, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -103,6 +103,26 @@ impl ToolExecOutput {
             },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Project context activity I/O
+// ---------------------------------------------------------------------------
+
+/// Output from the `collect_project_context` activity.
+///
+/// Captures project-level context (AGENTS.md docs, git info, cwd) from the
+/// worker's environment so the workflow can inject it into model prompts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectContextOutput {
+    /// Working directory the worker is running in.
+    pub cwd: String,
+    /// Concatenated AGENTS.md content (hierarchical, from git root to cwd).
+    #[serde(default)]
+    pub user_instructions: Option<String>,
+    /// Git repository info (commit, branch, remote URL).
+    #[serde(default)]
+    pub git_info: Option<GitInfo>,
 }
 
 // ---------------------------------------------------------------------------
