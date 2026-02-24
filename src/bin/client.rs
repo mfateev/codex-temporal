@@ -14,12 +14,10 @@ use temporalio_common::protos::temporal::api::enums::v1::WorkflowIdConflictPolic
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
-use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
-use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::AskForApproval;
+use codex_temporal::config_loader;
 use codex_temporal::harness::{CodexHarness, CodexHarnessRun};
 use codex_temporal::types::{
-    CodexWorkflowInput, HarnessInput, SessionEntry, SessionStatus,
+    HarnessInput, SessionEntry, SessionStatus,
 };
 use codex_temporal::workflow::CodexWorkflow;
 
@@ -164,67 +162,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(server_url = %server_url, user_message = %user_message, "starting codex workflow");
 
-    let approval_policy = match std::env::var("CODEX_APPROVAL_POLICY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "never" => AskForApproval::Never,
-        "untrusted" => AskForApproval::UnlessTrusted,
-        "on-failure" => AskForApproval::OnFailure,
-        _ => AskForApproval::OnRequest,
-    };
-
-    let web_search_mode = match std::env::var("CODEX_WEB_SEARCH")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "live" => Some(WebSearchMode::Live),
-        "cached" => Some(WebSearchMode::Cached),
-        "disabled" => None,
-        _ => None,
-    };
-
-    let reasoning_effort = match std::env::var("CODEX_EFFORT")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        _ => None,
-    };
-
-    let reasoning_summary = match std::env::var("CODEX_REASONING_SUMMARY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "concise" => ReasoningSummary::Concise,
-        "detailed" => ReasoningSummary::Detailed,
-        _ => ReasoningSummary::Auto,
-    };
-
-    let personality = match std::env::var("CODEX_PERSONALITY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "friendly" => Some(Personality::Friendly),
-        "pragmatic" => Some(Personality::Pragmatic),
-        _ => None,
-    };
-
-    let model = std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-
-    let input = CodexWorkflowInput {
-        user_message: user_message.clone(),
-        model: model.clone(),
-        instructions: "You are a helpful coding assistant.".to_string(),
-        approval_policy,
-        web_search_mode,
-        reasoning_effort,
-        reasoning_summary,
-        personality,
-        continued_state: None,
-    };
+    // Load config.toml and apply env-var overrides.
+    let harness_config = config_loader::load_harness_config().await?;
+    let mut input = harness_config.base_input;
+    config_loader::apply_env_overrides(&mut input);
+    input.user_message = user_message.clone();
+    input.model_provider = Some(harness_config.model_provider);
+    let model = input.model.clone();
 
     let workflow_id = format!("codex-session-{}", uuid::Uuid::new_v4());
     tracing::info!(workflow_id = %workflow_id, "starting workflow");

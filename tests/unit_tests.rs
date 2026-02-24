@@ -173,6 +173,8 @@ fn workflow_input_roundtrips_through_json() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
 
@@ -408,6 +410,8 @@ fn workflow_input_approval_policy_never_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
@@ -426,6 +430,8 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
@@ -457,6 +463,8 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
@@ -482,6 +490,8 @@ fn workflow_input_reasoning_effort_roundtrips() {
         reasoning_effort: Some(ReasoningEffort::Low),
         reasoning_summary: ReasoningSummary::Concise,
         personality: Some(Personality::Pragmatic),
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     let json = serde_json::to_string(&input).unwrap();
@@ -562,6 +572,8 @@ fn workflow_input_with_continued_state_roundtrips() {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: Some(ContinueAsNewState {
             rollout_items: vec![],
             pending_user_turns: vec![],
@@ -1148,4 +1160,176 @@ fn extract_message_text(item: &codex_protocol::models::ResponseItem) -> String {
         }
         other => panic!("expected ResponseItem::Message, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Config-loading new fields serde tests
+// ---------------------------------------------------------------------------
+
+use codex_temporal::types::ModelCallInput;
+
+#[test]
+fn workflow_input_developer_instructions_roundtrips() {
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: Some("Always respond in JSON format.".to_string()),
+        model_provider: None,
+        continued_state: None,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(
+        back.developer_instructions.as_deref(),
+        Some("Always respond in JSON format."),
+    );
+}
+
+#[test]
+fn workflow_input_model_provider_roundtrips() {
+    use codex_core::ModelProviderInfo;
+
+    let provider = ModelProviderInfo {
+        name: "test-provider".to_string(),
+        base_url: Some("https://api.example.com/v1".to_string()),
+        env_key: Some("TEST_API_KEY".to_string()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: Default::default(),
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: Some(provider.clone()),
+        continued_state: None,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    let back_provider = back.model_provider.expect("model_provider should be Some");
+    assert_eq!(back_provider.name, "test-provider");
+    assert_eq!(back_provider.base_url.as_deref(), Some("https://api.example.com/v1"));
+    assert_eq!(back_provider.env_key.as_deref(), Some("TEST_API_KEY"));
+}
+
+#[test]
+fn workflow_input_backward_compat_no_provider() {
+    // JSON without the new fields should deserialize with None defaults.
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+
+    assert!(
+        input.developer_instructions.is_none(),
+        "developer_instructions should default to None"
+    );
+    assert!(
+        input.model_provider.is_none(),
+        "model_provider should default to None"
+    );
+}
+
+#[test]
+fn model_call_input_provider_roundtrips() {
+    use codex_core::ModelProviderInfo;
+
+    let provider = ModelProviderInfo {
+        name: "custom-provider".to_string(),
+        base_url: Some("https://custom.api/v1".to_string()),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: Default::default(),
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    let input = ModelCallInput {
+        conversation_id: "conv-1".to_string(),
+        input: vec![],
+        tools: vec![],
+        parallel_tool_calls: false,
+        instructions: "test".to_string(),
+        model_info: codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+            "gpt-4o",
+            &codex_core::config::Config::for_harness(std::path::PathBuf::from("/tmp/codex-test")).unwrap(),
+        ),
+        effort: None,
+        summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        provider: Some(provider),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: ModelCallInput = serde_json::from_str(&json).unwrap();
+
+    let back_provider = back.provider.expect("provider should be Some");
+    assert_eq!(back_provider.name, "custom-provider");
+    assert_eq!(back_provider.base_url.as_deref(), Some("https://custom.api/v1"));
+    assert!(back_provider.env_key.is_none());
+}
+
+#[test]
+fn model_call_input_provider_defaults_to_none() {
+    // Serialize a ModelCallInput without provider, then deserialize to verify
+    // the field defaults to None when absent.
+    let input = ModelCallInput {
+        conversation_id: "c".to_string(),
+        input: vec![],
+        tools: vec![],
+        parallel_tool_calls: false,
+        instructions: "t".to_string(),
+        model_info: codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+            "gpt-4o",
+            &codex_core::config::Config::for_harness(std::path::PathBuf::from("/tmp/codex-test")).unwrap(),
+        ),
+        effort: None,
+        summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        provider: None,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    // The "provider" field should be absent due to skip_serializing_if.
+    assert!(
+        !json.contains("\"provider\""),
+        "provider:None should be skipped in serialization, got: {json}"
+    );
+
+    let back: ModelCallInput = serde_json::from_str(&json).unwrap();
+    assert!(
+        back.provider.is_none(),
+        "provider should default to None, got {:?}",
+        back.provider,
+    );
 }

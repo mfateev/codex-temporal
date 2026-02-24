@@ -498,7 +498,11 @@ impl CodexWorkflow {
                     sess.record_items(&turn_context, &[user_item]).await;
 
                     // --- run the agentic loop for this turn ---
-                    let mut streamer = TemporalModelStreamer::new(ctx.clone(), conversation_id.to_string());
+                    let mut streamer = TemporalModelStreamer::new(
+                        ctx.clone(),
+                        conversation_id.to_string(),
+                        input.model_provider.clone(),
+                    );
                     let handler = TemporalToolHandler::new(
                         ctx.clone(),
                         events.clone(),
@@ -523,6 +527,21 @@ impl CodexWorkflow {
                         // environment context) so the model sees project docs.
                         let history = sess.history_items().await;
                         let mut input_items = context_items.clone();
+
+                        // Inject developer instructions (from config.toml)
+                        // after project context, before conversation history.
+                        if let Some(ref dev_instructions) = input.developer_instructions {
+                            input_items.push(ResponseItem::Message {
+                                id: None,
+                                role: "developer".to_string(),
+                                content: vec![ContentItem::InputText {
+                                    text: dev_instructions.clone(),
+                                }],
+                                end_turn: None,
+                                phase: None,
+                            });
+                        }
+
                         input_items.extend(history);
                         let prompt = Prompt {
                             input: input_items,

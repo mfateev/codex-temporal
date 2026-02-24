@@ -3,7 +3,7 @@
 //! These types are sent across the Temporal activity boundary, so they must
 //! implement `Serialize` + `Deserialize`.
 
-use codex_core::ToolSpec;
+use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
@@ -38,6 +38,9 @@ pub struct ModelCallInput {
     /// Optional personality for the model.
     #[serde(default)]
     pub personality: Option<Personality>,
+    /// Optional model provider info override (from config.toml).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelProviderInfo>,
 }
 
 /// Output from the `model_call` activity.
@@ -237,6 +240,13 @@ pub struct CodexWorkflowInput {
     /// Optional personality for the model.
     #[serde(default)]
     pub personality: Option<Personality>,
+    /// Developer instructions from config.toml, injected as a separate
+    /// developer-role message in the prompt context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
+    /// Model provider info from config.toml (base URL, auth, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<ModelProviderInfo>,
     /// State carried over from a previous continue-as-new execution.
     /// `None` on the first run, `Some(...)` on subsequent runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]

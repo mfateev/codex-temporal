@@ -81,7 +81,26 @@ impl CodexActivities {
         _ctx: ActivityContext,
         input: ModelCallInput,
     ) -> Result<ModelCallOutput, ActivityError> {
-        let provider = self.provider.clone();
+        // Use provider from workflow input (config.toml) if present,
+        // falling back to the activity-level provider. Always apply
+        // the same headless-auth fixup that resolve_provider() does:
+        // activities run without interactive login, so switch to
+        // API-key auth and honour env-var overrides.
+        let provider = {
+            let mut p = input.provider.clone().unwrap_or_else(|| self.provider.clone());
+            // Ensure API-key auth works (activities have no interactive login).
+            p.requires_openai_auth = false;
+            if p.env_key.is_none() {
+                p.env_key = Some("OPENAI_API_KEY".to_string());
+            }
+            if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+                p.base_url = Some(base);
+            }
+            if let Ok(token) = std::env::var("OPENAI_BEARER_TOKEN") {
+                p.experimental_bearer_token = Some(token);
+            }
+            p
+        };
         let conversation_id = ThreadId::from_string(&input.conversation_id)
             .map_err(|e| anyhow::anyhow!("invalid conversation_id: {e}"))?;
 

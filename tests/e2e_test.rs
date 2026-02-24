@@ -74,6 +74,8 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
@@ -338,6 +340,8 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
@@ -359,6 +363,8 @@ fn new_session_with_effort(
         reasoning_effort: Some(effort),
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
@@ -430,6 +436,8 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
@@ -739,6 +747,8 @@ async fn session_resume(client: &Client) {
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     let resumed = TemporalAgentSession::resume(client.clone(), session_id.clone(), base_input);
@@ -829,6 +839,114 @@ async fn project_context_injected(client: &Client) {
     assert!(
         response.contains(&marker),
         "expected model response to contain marker '{marker}', got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+/// Test: config.toml loading flows through to the workflow.
+///
+/// 1. Write a temp config.toml with `model = "gpt-4o-mini"` and custom instructions.
+/// 2. Set CODEX_HOME to the temp dir.
+/// 3. Load config via `load_harness_config()` + `apply_env_overrides()`.
+/// 4. Start a workflow asking "Say hello", verify the response is influenced by
+///    the custom instructions (proving config.toml was loaded and flowed through).
+/// 5. Clean up.
+async fn config_file_loaded(client: &Client) {
+    use codex_temporal::config_loader;
+
+    // Create a temp dir to act as CODEX_HOME.
+    let temp_dir = std::env::temp_dir().join(format!("codex-cfg-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    // Write instructions to a file referenced by config.toml.
+    let instructions_file = temp_dir.join("instructions.md");
+    std::fs::write(
+        &instructions_file,
+        "Always respond in French. Tu dois répondre en français.",
+    )
+    .expect("failed to write instructions file");
+
+    // Write config.toml with custom model and model_instructions_file.
+    let config_content = format!(
+        "model = \"gpt-4o-mini\"\nmodel_instructions_file = \"{}\"\n",
+        instructions_file.to_string_lossy().replace('\\', "/"),
+    );
+    std::fs::write(temp_dir.join("config.toml"), &config_content)
+        .expect("failed to write config.toml");
+
+    // Guard to ensure cleanup even if the test panics.
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = CleanupGuard(temp_dir.clone());
+
+    // Set CODEX_HOME to the temp dir so ConfigBuilder picks it up.
+    let original_codex_home = std::env::var("CODEX_HOME").ok();
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe { std::env::set_var("CODEX_HOME", &temp_dir) };
+
+    // Clear CODEX_MODEL env var so config.toml value is used.
+    let original_codex_model = std::env::var("CODEX_MODEL").ok();
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe { std::env::remove_var("CODEX_MODEL") };
+
+    let harness_config = config_loader::load_harness_config()
+        .await
+        .expect("load_harness_config failed");
+    let mut input = harness_config.base_input;
+    config_loader::apply_env_overrides(&mut input);
+    input.model_provider = Some(harness_config.model_provider);
+
+    // Restore env vars.
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe {
+        match original_codex_home {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_codex_model {
+            Some(val) => std::env::set_var("CODEX_MODEL", val),
+            None => {} // was already unset
+        }
+    }
+
+    // Verify config.toml values were picked up.
+    assert_eq!(
+        input.model, "gpt-4o-mini",
+        "model should come from config.toml"
+    );
+    assert!(
+        input.instructions.contains("français") || input.instructions.contains("French"),
+        "instructions should come from config.toml, got: {}",
+        input.instructions,
+    );
+
+    // Start a workflow with these config-loaded settings.
+    let workflow_id = format!("e2e-cfg-{}", uuid::Uuid::new_v4());
+    input.user_message = "Say hello.".to_string();
+
+    let session = TemporalAgentSession::new(client.clone(), workflow_id, input);
+
+    session
+        .submit(user_turn_op_with_model("Say hello.", "gpt-4o-mini"))
+        .await
+        .expect("submit failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    assert!(msg.is_some(), "expected agent message");
+    let response = msg.unwrap().to_lowercase();
+
+    // The model should respond in French due to the instructions.
+    assert!(
+        response.contains("bonjour")
+            || response.contains("salut")
+            || response.contains("french")
+            || response.contains("français"),
+        "expected French response due to config.toml instructions, got: {response}"
     );
 
     drain_shutdown(&session).await;
@@ -1113,6 +1231,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: project_context_injected ---");
     project_context_injected(&client).await;
+
+    eprintln!("--- test: config_file_loaded ---");
+    config_file_loaded(&client).await;
 
     // --- teardown ---
     drop(client);
