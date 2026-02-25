@@ -444,6 +444,24 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
 }
 
 async fn prompt_caching_multi_turn(client: &Client) {
+    // Prompt caching depends on OpenAI server-side cache state, which can
+    // miss on the first attempt (cold cache). Retry once before failing.
+    let mut last_err = String::new();
+    for attempt in 1..=2 {
+        match prompt_caching_multi_turn_attempt(client).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("prompt_caching_multi_turn attempt {attempt} failed: {e}");
+                last_err = e;
+            }
+        }
+    }
+    panic!("prompt_caching_multi_turn failed after 2 attempts: {last_err}");
+}
+
+/// Single attempt of the prompt-caching test. Returns `Err(message)` if the
+/// cache assertion fails so the caller can retry.
+async fn prompt_caching_multi_turn_attempt(client: &Client) -> Result<(), String> {
     let session = new_session_for_caching(client);
 
     // Turn 1: establish context
@@ -494,6 +512,9 @@ async fn prompt_caching_multi_turn(client: &Client) {
         turn1_info.last_token_usage.total_tokens > 0,
         "expected total_tokens > 0 in turn 1"
     );
+
+    // Brief pause to let OpenAI's server-side prompt cache propagate.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Turn 2: same conversation, should benefit from prompt caching
     session
@@ -563,14 +584,18 @@ async fn prompt_caching_multi_turn(client: &Client) {
 
     // With a long system prompt (>1024 tokens), cached_input_tokens should
     // be > 0 on the second turn. This validates prompt caching is active.
-    assert!(
-        info.last_token_usage.cached_input_tokens > 0,
-        "expected cached_input_tokens > 0 in turn 2 (got {}); \
-         prompt caching requires >1024 token prefix",
-        info.last_token_usage.cached_input_tokens,
-    );
+    // This depends on OpenAI server-side cache state so may fail transiently.
+    if info.last_token_usage.cached_input_tokens == 0 {
+        drain_shutdown(&session).await;
+        return Err(format!(
+            "expected cached_input_tokens > 0 in turn 2 (got {}); \
+             prompt caching requires >1024 token prefix",
+            info.last_token_usage.cached_input_tokens,
+        ));
+    }
 
     drain_shutdown(&session).await;
+    Ok(())
 }
 
 async fn reasoning_effort_turn(client: &Client) {
@@ -969,6 +994,7 @@ async fn config_activity_loads_features(client: &Client) {
     // Write a config.toml with features section to the temp CODEX_HOME.
     let config_content = r#"
 model = "gpt-4o-mini"
+sandbox_mode = "danger-full-access"
 
 [features]
 shell_tool = true
@@ -1026,6 +1052,131 @@ shell_tool = true
     assert!(
         response.contains("config-activity-test"),
         "expected shell echo output in response, got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+
+    // Restore CODEX_HOME.
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe {
+        match original_codex_home {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+}
+
+/// Test: config sandbox policy is enforced during tool execution.
+///
+/// 1. Write a config.toml with `sandbox_mode = "read-only"` to a temp CODEX_HOME.
+/// 2. Start a workflow.
+/// 3. Submit a user turn asking the model to write a file via shell.
+/// 4. The sandbox should block the write, and the model should report failure.
+///
+/// This verifies that `dispatch_tool()` no longer overrides `sandbox_policy`
+/// with `DangerFullAccess` and instead uses the value from config.toml.
+async fn config_sandbox_policy_enforced(client: &Client) {
+    // Create a temp dir to act as CODEX_HOME for the worker.
+    let temp_dir = std::env::temp_dir().join(format!(
+        "codex-sandbox-policy-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    // Write a config.toml with read-only sandbox mode.
+    let config_content = r#"
+model = "gpt-4o-mini"
+sandbox_mode = "read-only"
+"#;
+    std::fs::write(temp_dir.join("config.toml"), config_content)
+        .expect("failed to write config.toml");
+
+    // Guard to ensure cleanup even if the test panics.
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = CleanupGuard(temp_dir.clone());
+
+    // Set CODEX_HOME so the worker's load_config activity finds our config.
+    let original_codex_home = std::env::var("CODEX_HOME").ok();
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe { std::env::set_var("CODEX_HOME", &temp_dir) };
+
+    // Start a workflow — the load_config activity will load config from disk.
+    let workflow_id = format!("e2e-sandbox-policy-{}", uuid::Uuid::new_v4());
+    let base_input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful assistant. Be concise. When asked to run a command, use the shell tool to run it exactly as specified.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+    let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
+
+    // Ask the model to run a write command — this should be blocked by sandbox.
+    let write_target = format!(
+        "/tmp/codex-sandbox-e2e-test-{}",
+        uuid::Uuid::new_v4()
+    );
+    session
+        .submit(user_turn_op_with_model(
+            &format!(
+                "Run this exact shell command: touch {}. Tell me the exit code.",
+                write_target
+            ),
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Wait for ExecApprovalRequest, approve the tool call.
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut approved = false;
+    let mut saw_turn_complete = false;
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            break;
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ExecApprovalRequest(req) => {
+                if !approved {
+                    session
+                        .submit(Op::ExecApproval {
+                            id: req.call_id.clone(),
+                            turn_id: None,
+                            decision: ReviewDecision::Approved,
+                        })
+                        .await
+                        .expect("approve failed");
+                    approved = true;
+                }
+            }
+            EventMsg::TurnComplete(_) => {
+                saw_turn_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_turn_complete, "expected TurnComplete event");
+
+    // The file should NOT have been created — sandbox blocked it.
+    let file_exists = std::path::Path::new(&write_target).exists();
+    assert!(
+        !file_exists,
+        "write target should not exist under read-only sandbox: {write_target}"
     );
 
     drain_shutdown(&session).await;
@@ -1283,6 +1434,23 @@ async fn e2e_tests_inner() {
         Err(_) => panic!("worker thread died before becoming ready"),
     }
 
+    // --- set up default CODEX_HOME with danger-full-access sandbox ---
+    // Most e2e tests need unrestricted shell access. Individual tests that
+    // need a different sandbox policy override CODEX_HOME temporarily.
+    let default_codex_home = std::env::temp_dir().join(format!(
+        "codex-e2e-home-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&default_codex_home).expect("failed to create default CODEX_HOME");
+    std::fs::write(
+        default_codex_home.join("config.toml"),
+        "sandbox_mode = \"danger-full-access\"\n",
+    )
+    .expect("failed to write default config.toml");
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    let original_codex_home = std::env::var("CODEX_HOME").ok();
+    unsafe { std::env::set_var("CODEX_HOME", &default_codex_home) };
+
     // --- run test cases ---
     eprintln!("--- test: model_only_turn ---");
     model_only_turn(&client).await;
@@ -1326,7 +1494,20 @@ async fn e2e_tests_inner() {
     eprintln!("--- test: config_activity_loads_features ---");
     config_activity_loads_features(&client).await;
 
+    eprintln!("--- test: config_sandbox_policy_enforced ---");
+    config_sandbox_policy_enforced(&client).await;
+
     // --- teardown ---
+    // Restore CODEX_HOME.
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe {
+        match original_codex_home {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&default_codex_home);
+
     drop(client);
     drop(runtime);
     let _ = server.shutdown().await;

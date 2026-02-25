@@ -290,7 +290,7 @@ impl CodexActivities {
 /// `ToolRegistry::dispatch` pipeline without starting a Temporal worker.
 pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyhow::Error> {
     use codex_core::config::Constrained;
-    use codex_protocol::protocol::{AskForApproval, SandboxPolicy};
+    use codex_protocol::protocol::AskForApproval;
 
     let cwd = PathBuf::from(&input.cwd);
 
@@ -308,8 +308,8 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     };
     config.model = Some(input.model.clone());
     // Approval is handled at the workflow level by TemporalToolHandler, so
-    // the activity itself runs with full access and no approval prompts.
-    config.permissions.sandbox_policy = Constrained::allow_any(SandboxPolicy::DangerFullAccess);
+    // the activity itself runs with no approval prompts. Sandbox policy comes
+    // from the user's config.toml (or defaults to read-only).
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
     let config = Arc::new(config);
 

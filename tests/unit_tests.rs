@@ -697,6 +697,9 @@ fn workflow_output_token_usage_defaults_to_none() {
 use codex_temporal::activities::dispatch_tool;
 use codex_temporal::types::ToolExecInput;
 
+/// Default TOML config for tests that need unrestricted shell access.
+const FULL_ACCESS_TOML: &str = "model = \"gpt-4o\"\nsandbox_mode = \"danger-full-access\"\n";
+
 /// Helper to build a ToolExecInput for a given tool.
 fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
     ToolExecInput {
@@ -705,7 +708,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         arguments: arguments.to_string(),
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
-        config_toml: None,
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
     }
 }
 
@@ -764,7 +767,7 @@ async fn dispatch_shell_with_cwd() {
         arguments: r#"{"command":["pwd"]}"#.to_string(),
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
-        config_toml: None,
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -774,6 +777,38 @@ async fn dispatch_shell_with_cwd() {
     assert!(
         output.output.contains("/tmp"),
         "pwd output should contain /tmp, got: {}",
+        output.output,
+    );
+}
+
+/// Verify that `dispatch_tool` respects the sandbox policy from config TOML
+/// instead of overriding it with `DangerFullAccess`.
+///
+/// We pass `sandbox_mode = "read-only"` via `config_toml` and attempt a write
+/// command. The sandbox should block it, producing a non-zero exit code.
+#[tokio::test]
+async fn dispatch_tool_respects_config_sandbox_policy() {
+    // Build a TOML string that sets sandbox_mode to read-only.
+    let toml_str = r#"
+model = "gpt-4o"
+sandbox_mode = "read-only"
+"#;
+
+    let input = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: format!("test-sandbox-{}", uuid::Uuid::new_v4()),
+        arguments: r#"{"command":["touch","/tmp/codex-sandbox-test-file"]}"#.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+        config_toml: Some(toml_str.to_string()),
+    };
+
+    let output = dispatch_tool(input).await.expect("dispatch_tool failed");
+
+    // With read-only sandbox, a write command should be blocked.
+    assert_ne!(
+        output.exit_code, 0,
+        "write command should fail under read-only sandbox, got output: {}",
         output.output,
     );
 }
