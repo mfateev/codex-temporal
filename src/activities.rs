@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_core::config::ConfigBuilder;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
     EventSink, ModelClient, ModelProviderInfo, Prompt, ResponseEvent, Session, StorageBackend,
@@ -22,10 +23,12 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::Mutex;
 
+use crate::config_loader::config_from_toml;
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
 use crate::types::{
-    ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput, ToolExecOutput,
+    ConfigOutput, ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput,
+    ToolExecOutput,
 };
 
 /// Resolve the model provider to use for the activity.
@@ -210,6 +213,31 @@ impl CodexActivities {
             .map_err(|e| anyhow::anyhow!("tool_exec failed: {e}").into())
     }
 
+    /// Load the merged config.toml from the worker's environment.
+    ///
+    /// Runs `ConfigBuilder::build_toml_string()` to read and merge all
+    /// config layers from disk, returning the effective config as a TOML
+    /// string. The workflow deserializes this into `ConfigToml` and builds
+    /// a full `Config` using `Config::from_toml()`.
+    #[activity]
+    pub async fn load_config(
+        _ctx: ActivityContext,
+    ) -> Result<ConfigOutput, ActivityError> {
+        tracing::info!("load_config activity invoked");
+
+        let toml_string = ConfigBuilder::default()
+            .build_toml_string()
+            .await
+            .map_err(|e| anyhow::anyhow!("config loading failed: {e}"))?;
+
+        tracing::info!(
+            toml_len = toml_string.len(),
+            "config loaded successfully"
+        );
+
+        Ok(ConfigOutput { config_toml: toml_string })
+    }
+
     /// Collect project context from the worker's environment.
     ///
     /// Reads AGENTS.md project docs (hierarchical chain from git root to cwd)
@@ -264,13 +292,21 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     use codex_core::config::Constrained;
     use codex_protocol::protocol::{AskForApproval, SandboxPolicy};
 
-    // Build a Config with the right model and cwd.
     let cwd = PathBuf::from(&input.cwd);
-    let codex_home = PathBuf::from("/tmp/codex-temporal");
-    let mut config = codex_core::config::Config::for_harness(codex_home)
-        .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
+
+    // Build Config: prefer the activity-loaded config TOML when present,
+    // falling back to Config::for_harness() for backward compatibility.
+    let mut config = if let Some(ref toml_str) = input.config_toml {
+        config_from_toml(toml_str, &cwd, None)
+            .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?
+    } else {
+        let codex_home = PathBuf::from("/tmp/codex-temporal");
+        let mut c = codex_core::config::Config::for_harness(codex_home)
+            .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
+        c.cwd = cwd;
+        c
+    };
     config.model = Some(input.model.clone());
-    config.cwd = cwd;
     // Approval is handled at the workflow level by TemporalToolHandler, so
     // the activity itself runs with full access and no approval prompts.
     config.permissions.sandbox_policy = Constrained::allow_any(SandboxPolicy::DangerFullAccess);

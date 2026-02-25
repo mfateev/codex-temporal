@@ -5,7 +5,9 @@
 //! extracted into [`CodexWorkflowInput`] fields that flow through
 //! Temporal's serialization boundary.
 
-use codex_core::config::ConfigBuilder;
+use std::path::{Path, PathBuf};
+
+use codex_core::config::{Config, ConfigBuilder, ConfigOverrides, ConfigToml};
 use codex_core::ModelProviderInfo;
 use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
 use codex_protocol::openai_models::ReasoningEffort;
@@ -144,4 +146,27 @@ pub fn apply_env_overrides(input: &mut CodexWorkflowInput) {
             _ => input.personality,
         };
     }
+}
+
+/// Reconstruct a [`Config`] from a TOML string previously produced by
+/// [`ConfigBuilder::build_toml_string()`].
+///
+/// This helper is used by both the workflow (to build the real Config from
+/// the `load_config` activity output) and by tool-execution activities (to
+/// reconstruct the Config from the TOML string passed via `ToolExecInput`).
+///
+/// No file I/O is performed — `user_instructions` (AGENTS.md content) is
+/// provided by the caller so it can come from project-context collection.
+pub fn config_from_toml(
+    toml_str: &str,
+    cwd: &Path,
+    user_instructions: Option<String>,
+) -> Result<Config, Box<dyn std::error::Error>> {
+    let config_toml: ConfigToml = toml::from_str(toml_str)?;
+    let codex_home = PathBuf::from("/tmp/codex-temporal");
+    let overrides = ConfigOverrides {
+        cwd: Some(cwd.to_path_buf()),
+        ..Default::default()
+    };
+    Ok(Config::from_toml(config_toml, overrides, codex_home, user_instructions)?)
 }

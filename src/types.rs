@@ -71,6 +71,11 @@ pub struct ToolExecInput {
     pub model: String,
     /// Working directory for tool execution.
     pub cwd: String,
+    /// Merged config TOML string (from load_config activity).
+    /// When present, used to reconstruct a full Config with real features,
+    /// sandbox policy, etc. When absent, falls back to Config::for_harness().
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_toml: Option<String>,
 }
 
 /// Output from the `tool_exec` activity.
@@ -126,6 +131,21 @@ pub struct ProjectContextOutput {
     /// Git repository info (commit, branch, remote URL).
     #[serde(default)]
     pub git_info: Option<GitInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// Config activity I/O
+// ---------------------------------------------------------------------------
+
+/// Output from the `load_config` activity.
+///
+/// Contains the merged config.toml content as a TOML string, which can be
+/// deserialized into `ConfigToml` and used to construct a full `Config` via
+/// `Config::from_toml()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigOutput {
+    /// Merged config.toml content as a TOML string.
+    pub config_toml: String,
 }
 
 // ---------------------------------------------------------------------------

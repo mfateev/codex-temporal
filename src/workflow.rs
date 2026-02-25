@@ -14,11 +14,9 @@
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use codex_core::config::Config;
 use codex_core::entropy::{EntropyProviders, ENTROPY};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
@@ -44,6 +42,7 @@ use temporalio_sdk::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::config_loader::config_from_toml;
 use crate::entropy::{TemporalClock, TemporalRandomSource};
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
@@ -51,7 +50,7 @@ use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
-    CodexWorkflowInput, CodexWorkflowOutput, ContinueAsNewState, PendingApproval,
+    CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, ContinueAsNewState, PendingApproval,
     ProjectContextOutput, UserTurnInput,
 };
 
@@ -300,31 +299,48 @@ impl CodexWorkflow {
             clock: Arc::new(TemporalClock::new(wf_time)),
         };
 
-        // --- project context (activity — runs outside sandbox) ---
-        let project_context: ProjectContextOutput = ctx
-            .start_activity(
-                CodexActivities::collect_project_context,
-                (),
-                ActivityOptions {
-                    schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                    ..Default::default()
-                },
-            )
-            .await
+        // --- startup activities (run outside sandbox) ---
+        // Launch load_config and collect_project_context concurrently.
+        let config_activity = ctx.start_activity(
+            CodexActivities::load_config,
+            (),
+            ActivityOptions {
+                schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                ..Default::default()
+            },
+        );
+        let project_context_activity = ctx.start_activity(
+            CodexActivities::collect_project_context,
+            (),
+            ActivityOptions {
+                schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                ..Default::default()
+            },
+        );
+
+        let (config_result, project_context_result) =
+            futures::future::join(config_activity, project_context_activity).await;
+
+        let config_output: ConfigOutput = config_result
+            .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
+        let project_context: ProjectContextOutput = project_context_result
             .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
 
         let context_items = build_context_items(&project_context);
 
         // --- config ---
-        let codex_home = PathBuf::from("/tmp/codex-temporal");
-        let mut config = Config::for_harness(codex_home)
-            .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
+        // Build a full Config from the activity-loaded TOML, with user
+        // instructions (AGENTS.md) from project context.
+        let mut config = config_from_toml(
+            &config_output.config_toml,
+            std::path::Path::new(&project_context.cwd),
+            project_context.user_instructions.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?;
         config.model = Some(input.model.clone());
         config.model_reasoning_effort = input.reasoning_effort;
         config.model_reasoning_summary = input.reasoning_summary;
         config.personality = input.personality;
-        // Use the worker's actual cwd (from project context activity).
-        config.cwd = PathBuf::from(&project_context.cwd);
         let config = Arc::new(config);
 
         // --- model info ---
@@ -510,6 +526,7 @@ impl CodexWorkflow {
                         input.approval_policy,
                         input.model.clone(),
                         config.cwd.to_string_lossy().to_string(),
+                        Some(config_output.config_toml.clone()),
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));

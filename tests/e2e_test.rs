@@ -952,6 +952,94 @@ async fn config_file_loaded(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: config activity loads features from worker-side config.toml.
+///
+/// 1. Write a config.toml with features enabled to a temp CODEX_HOME.
+/// 2. Start a workflow that uses a shell tool.
+/// 3. The load_config activity on the worker picks up the config.
+/// 4. Verify the tool executes successfully (proving config flowed through).
+async fn config_activity_loads_features(client: &Client) {
+    // Create a temp dir to act as CODEX_HOME for the worker.
+    let temp_dir = std::env::temp_dir().join(format!(
+        "codex-cfg-activity-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+    // Write a config.toml with features section to the temp CODEX_HOME.
+    let config_content = r#"
+model = "gpt-4o-mini"
+
+[features]
+shell_tool = true
+"#;
+    std::fs::write(temp_dir.join("config.toml"), config_content)
+        .expect("failed to write config.toml");
+
+    // Guard to ensure cleanup even if the test panics.
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = CleanupGuard(temp_dir.clone());
+
+    // Set CODEX_HOME so the worker's load_config activity finds our config.
+    let original_codex_home = std::env::var("CODEX_HOME").ok();
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe { std::env::set_var("CODEX_HOME", &temp_dir) };
+
+    // Start a workflow — the load_config activity will load config from disk.
+    let workflow_id = format!("e2e-cfg-activity-{}", uuid::Uuid::new_v4());
+    let base_input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful assistant. Be concise.".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+    let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
+
+    // Ask the model to use a shell tool — this exercises the full pipeline:
+    // load_config activity → config_from_toml in workflow → tool dispatch.
+    session
+        .submit(user_turn_op_with_model(
+            "Run 'echo config-activity-test' in the shell and tell me the output.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    assert!(
+        msg.is_some(),
+        "expected agent message after tool execution"
+    );
+    let response = msg.unwrap();
+    assert!(
+        response.contains("config-activity-test"),
+        "expected shell echo output in response, got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+
+    // Restore CODEX_HOME.
+    // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
+    unsafe {
+        match original_codex_home {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+}
+
 /// Test: session picker data conversion pipeline.
 ///
 /// 1. Start harness workflow.
@@ -1234,6 +1322,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: config_file_loaded ---");
     config_file_loaded(&client).await;
+
+    eprintln!("--- test: config_activity_loads_features ---");
+    config_activity_loads_features(&client).await;
 
     // --- teardown ---
     drop(client);

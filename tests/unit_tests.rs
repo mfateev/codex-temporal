@@ -6,9 +6,9 @@ use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, HarnessInput, HarnessState,
-    ModelCallOutput, PendingApproval, ProjectContextOutput, SessionEntry, SessionStatus,
-    ToolExecOutput, UserTurnInput,
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, HarnessInput,
+    HarnessState, ModelCallOutput, PendingApproval, ProjectContextOutput, SessionEntry,
+    SessionStatus, ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::{Clock, RandomSource};
@@ -705,6 +705,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         arguments: arguments.to_string(),
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
+        config_toml: None,
     }
 }
 
@@ -763,6 +764,7 @@ async fn dispatch_shell_with_cwd() {
         arguments: r#"{"command":["pwd"]}"#.to_string(),
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
+        config_toml: None,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -1331,5 +1333,90 @@ fn model_call_input_provider_defaults_to_none() {
         back.provider.is_none(),
         "provider should default to None, got {:?}",
         back.provider,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Config activity tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_output_roundtrips() {
+    let original = ConfigOutput {
+        config_toml: "model = \"gpt-4o\"\napproval_policy = \"on-request\"\n".to_string(),
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    let back: ConfigOutput = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.config_toml, original.config_toml);
+}
+
+#[test]
+fn tool_exec_input_config_toml_roundtrip() {
+    // With config_toml present.
+    let input_with = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "c1".to_string(),
+        arguments: "{}".to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+        config_toml: Some("model = \"gpt-4o\"\n".to_string()),
+    };
+    let json_with = serde_json::to_string(&input_with).unwrap();
+    assert!(
+        json_with.contains("config_toml"),
+        "config_toml should be serialized when Some"
+    );
+    let back_with: ToolExecInput = serde_json::from_str(&json_with).unwrap();
+    assert_eq!(back_with.config_toml, input_with.config_toml);
+
+    // With config_toml absent (backward compat).
+    let input_none = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "c2".to_string(),
+        arguments: "{}".to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+        config_toml: None,
+    };
+    let json_none = serde_json::to_string(&input_none).unwrap();
+    assert!(
+        !json_none.contains("config_toml"),
+        "config_toml:None should be skipped in serialization"
+    );
+
+    // Deserializing old-format JSON without config_toml should default to None.
+    let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
+    let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
+    assert!(
+        back_old.config_toml.is_none(),
+        "missing config_toml should default to None"
+    );
+}
+
+#[test]
+fn config_from_toml_constructs_features() {
+    use codex_core::features::Feature;
+    use codex_temporal::config_loader::config_from_toml;
+
+    // Build a Config from a minimal TOML string.
+    let toml_str = r#"
+model = "gpt-4o"
+approval_policy = "never"
+"#;
+    let config = config_from_toml(toml_str, std::path::Path::new("/tmp"), None)
+        .expect("config_from_toml should succeed");
+
+    // Model should be set from the TOML.
+    assert_eq!(
+        config.model.as_deref(),
+        Some("gpt-4o"),
+        "model should be set from TOML"
+    );
+
+    // The ShellTool feature should be enabled by default — this confirms
+    // that Features were properly constructed (not empty).
+    assert!(
+        config.features.enabled(Feature::ShellTool),
+        "ShellTool feature should be enabled by default"
     );
 }
