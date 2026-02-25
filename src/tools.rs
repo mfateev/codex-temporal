@@ -19,6 +19,7 @@ use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::{AskForApproval, Event, EventMsg, ExecApprovalRequestEvent};
+use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use temporalio_sdk::{ActivityOptions, WorkflowContext};
 use tokio_util::sync::CancellationToken;
@@ -31,12 +32,13 @@ use crate::workflow::CodexWorkflow;
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
 /// dispatches approved calls as Temporal activities.
 ///
-/// The approval behavior depends on the configured [`AskForApproval`] policy:
+/// The approval behavior uses a three-tier safety classification
+/// (mirroring codex-core's `exec_policy`):
 ///
-/// - **`Never`** — execute immediately, no approval prompt.
-/// - **`OnRequest`** / **`OnFailure`** — always prompt for approval.
-/// - **`UnlessTrusted`** — auto-approve commands that pass
-///   `is_known_safe_command()`; prompt for everything else.
+/// 1. **Safe** (`is_known_safe_command`) — auto-approve under any policy.
+/// 2. **Dangerous** (`command_might_be_dangerous`) — always prompt (except
+///    `Never`, which cannot prompt; sandbox enforcement still applies).
+/// 3. **Unknown** — defer to the configured [`AskForApproval`] policy.
 pub struct TemporalToolHandler {
     ctx: WorkflowContext<CodexWorkflow>,
     events: Arc<BufferEventSink>,
@@ -107,12 +109,25 @@ impl ToolCallHandler for TemporalToolHandler {
             .unwrap_or_else(|| vec![arguments.clone()]);
 
         Box::pin(async move {
-            // Determine whether this call needs user approval based on policy.
-            let needs_approval = match approval_policy {
-                AskForApproval::Never => false,
-                AskForApproval::UnlessTrusted => !is_known_safe_command(&command),
-                // OnRequest and OnFailure both require explicit approval.
-                AskForApproval::OnRequest | AskForApproval::OnFailure => true,
+            // Determine whether this call needs user approval based on a
+            // three-tier safety classification (mirrors codex-core exec_policy):
+            //   1. Safe (is_known_safe_command)  → auto-approve
+            //   2. Dangerous (command_might_be_dangerous) → always prompt
+            //   3. Unknown → defer to policy
+            let needs_approval = if is_known_safe_command(&command) {
+                // Known read-only command — safe under any policy.
+                false
+            } else if command_might_be_dangerous(&command) {
+                // Explicitly dangerous — always require approval (except Never,
+                // which can't prompt, so the sandbox must handle it).
+                !matches!(approval_policy, AskForApproval::Never)
+            } else {
+                // Unknown command — defer to policy.
+                match approval_policy {
+                    AskForApproval::Never => false,
+                    AskForApproval::UnlessTrusted => true,
+                    AskForApproval::OnRequest | AskForApproval::OnFailure => true,
+                }
             };
 
             if needs_approval {
