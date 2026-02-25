@@ -1309,6 +1309,87 @@ async fn session_picker_conversion(client: &Client) {
     );
 }
 
+/// Test: safe commands are auto-approved even under OnRequest policy.
+///
+/// The three-tier classification recognizes `ls` as a known safe command and
+/// skips the approval prompt regardless of the configured policy.
+///
+/// We ask the model to run `ls /tmp` with `OnRequest` policy. Under the old
+/// binary logic every command would require approval; under the new three-tier
+/// logic, `ls` (or `bash -c "ls /tmp"`) is classified as safe and auto-approved.
+///
+/// If the model happens to generate a non-safe wrapper, we approve it and
+/// still verify the turn completes — but the primary assertion is that no
+/// `ExecApprovalRequest` is emitted for the expected safe command.
+async fn command_safety_auto_approves_safe_commands(client: &Client) {
+    use codex_shell_command::is_safe_command::is_known_safe_command;
+
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Submit with OnRequest policy — would normally require approval.
+    let op = Op::UserTurn {
+        items: vec![UserInput::Text {
+            text: "Use shell to run the command: ls /tmp".to_string(),
+            text_elements: vec![],
+        }],
+        cwd: std::env::current_dir().unwrap_or_else(|_| "/tmp".into()),
+        approval_policy: AskForApproval::OnRequest,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        model: "gpt-4o-mini".to_string(),
+        effort: None,
+        summary: ReasoningSummary::Auto,
+        final_output_json_schema: None,
+        collaboration_mode: None,
+        personality: None,
+    };
+    session.submit(op).await.expect("submit failed");
+
+    // Wait for TurnComplete. If we get an ExecApprovalRequest, check whether
+    // the command truly was safe — if so, the three-tier logic has a bug.
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ExecApprovalRequest(req) => {
+                // The model generated a command that wasn't classified as safe.
+                // Verify it truly isn't safe (i.e. the three-tier logic is correct).
+                assert!(
+                    !is_known_safe_command(&req.command),
+                    "command {:?} IS known-safe but still got ExecApprovalRequest — \
+                     three-tier logic bug",
+                    req.command,
+                );
+                eprintln!(
+                    "  note: model generated non-safe command {:?}, approving",
+                    req.command,
+                );
+                // Approve and keep waiting for TurnComplete.
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("approval failed");
+            }
+            EventMsg::TurnComplete(tc) => {
+                assert!(
+                    tc.last_agent_message.is_some(),
+                    "expected non-empty agent message in TurnComplete"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -1496,6 +1577,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: config_sandbox_policy_enforced ---");
     config_sandbox_policy_enforced(&client).await;
+
+    eprintln!("--- test: command_safety_auto_approves_safe_commands ---");
+    command_safety_auto_approves_safe_commands(&client).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.

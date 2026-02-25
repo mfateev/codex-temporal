@@ -1455,3 +1455,67 @@ approval_policy = "never"
         "ShellTool feature should be enabled by default"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Command safety three-tier classification tests
+// ---------------------------------------------------------------------------
+
+use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
+use codex_shell_command::is_safe_command::is_known_safe_command;
+
+/// Mirror of the three-tier `needs_approval` logic in `TemporalToolHandler`.
+fn needs_approval(command: &[String], policy: AskForApproval) -> bool {
+    if is_known_safe_command(command) {
+        false
+    } else if command_might_be_dangerous(command) {
+        !matches!(policy, AskForApproval::Never)
+    } else {
+        match policy {
+            AskForApproval::Never => false,
+            AskForApproval::UnlessTrusted => true,
+            AskForApproval::OnRequest | AskForApproval::OnFailure => true,
+        }
+    }
+}
+
+#[test]
+fn dangerous_command_needs_approval_under_unless_trusted() {
+    let cmd: Vec<String> = vec!["rm", "-rf", "/"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert!(
+        needs_approval(&cmd, AskForApproval::UnlessTrusted),
+        "dangerous command should require approval under UnlessTrusted"
+    );
+}
+
+#[test]
+fn dangerous_command_needs_approval_under_on_failure() {
+    let cmd: Vec<String> = vec!["rm", "-rf", "/"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert!(
+        needs_approval(&cmd, AskForApproval::OnFailure),
+        "dangerous command should require approval under OnFailure"
+    );
+}
+
+#[test]
+fn safe_command_skips_approval_under_on_failure() {
+    let cmd: Vec<String> = vec!["ls"].into_iter().map(String::from).collect();
+    assert!(
+        !needs_approval(&cmd, AskForApproval::OnFailure),
+        "safe command should skip approval under OnFailure"
+    );
+}
+
+#[test]
+fn safe_command_skips_approval_under_on_request() {
+    let cmd: Vec<String> = vec!["ls"].into_iter().map(String::from).collect();
+    assert!(
+        !needs_approval(&cmd, AskForApproval::OnRequest),
+        "safe command should skip approval under OnRequest"
+    );
+}
