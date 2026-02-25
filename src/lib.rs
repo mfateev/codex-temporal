@@ -8,6 +8,7 @@
 
 pub mod activities;
 pub mod auth_stub;
+pub mod config_loader;
 pub mod entropy;
 pub mod harness;
 pub mod models_stub;

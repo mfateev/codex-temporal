@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_core::config::ConfigBuilder;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
     EventSink, ModelClient, ModelProviderInfo, Prompt, ResponseEvent, Session, StorageBackend,
@@ -22,9 +23,13 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::Mutex;
 
+use crate::config_loader::config_from_toml;
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
-use crate::types::{ModelCallInput, ModelCallOutput, ToolExecInput, ToolExecOutput};
+use crate::types::{
+    ConfigOutput, ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput,
+    ToolExecOutput,
+};
 
 /// Resolve the model provider to use for the activity.
 ///
@@ -79,7 +84,26 @@ impl CodexActivities {
         _ctx: ActivityContext,
         input: ModelCallInput,
     ) -> Result<ModelCallOutput, ActivityError> {
-        let provider = self.provider.clone();
+        // Use provider from workflow input (config.toml) if present,
+        // falling back to the activity-level provider. Always apply
+        // the same headless-auth fixup that resolve_provider() does:
+        // activities run without interactive login, so switch to
+        // API-key auth and honour env-var overrides.
+        let provider = {
+            let mut p = input.provider.clone().unwrap_or_else(|| self.provider.clone());
+            // Ensure API-key auth works (activities have no interactive login).
+            p.requires_openai_auth = false;
+            if p.env_key.is_none() {
+                p.env_key = Some("OPENAI_API_KEY".to_string());
+            }
+            if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+                p.base_url = Some(base);
+            }
+            if let Ok(token) = std::env::var("OPENAI_BEARER_TOKEN") {
+                p.experimental_bearer_token = Some(token);
+            }
+            p
+        };
         let conversation_id = ThreadId::from_string(&input.conversation_id)
             .map_err(|e| anyhow::anyhow!("invalid conversation_id: {e}"))?;
 
@@ -188,6 +212,76 @@ impl CodexActivities {
             .await
             .map_err(|e| anyhow::anyhow!("tool_exec failed: {e}").into())
     }
+
+    /// Load the merged config.toml from the worker's environment.
+    ///
+    /// Runs `ConfigBuilder::build_toml_string()` to read and merge all
+    /// config layers from disk, returning the effective config as a TOML
+    /// string. The workflow deserializes this into `ConfigToml` and builds
+    /// a full `Config` using `Config::from_toml()`.
+    #[activity]
+    pub async fn load_config(
+        _ctx: ActivityContext,
+    ) -> Result<ConfigOutput, ActivityError> {
+        tracing::info!("load_config activity invoked");
+
+        let toml_string = ConfigBuilder::default()
+            .build_toml_string()
+            .await
+            .map_err(|e| anyhow::anyhow!("config loading failed: {e}"))?;
+
+        tracing::info!(
+            toml_len = toml_string.len(),
+            "config loaded successfully"
+        );
+
+        Ok(ConfigOutput { config_toml: toml_string })
+    }
+
+    /// Collect project context from the worker's environment.
+    ///
+    /// Reads AGENTS.md project docs (hierarchical chain from git root to cwd)
+    /// and git repository info (commit, branch, remote URL).  Runs once per
+    /// workflow start; the result is replayed deterministically on recovery.
+    #[activity]
+    pub async fn collect_project_context(
+        _ctx: ActivityContext,
+    ) -> Result<ProjectContextOutput, ActivityError> {
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let cwd_str = cwd.to_string_lossy().to_string();
+
+        tracing::info!(cwd = %cwd_str, "collecting project context");
+
+        // Build a minimal config pointing at the worker's cwd.
+        let codex_home = PathBuf::from("/tmp/codex-temporal");
+        let mut config = codex_core::config::Config::for_harness(codex_home)
+            .map_err(|e| anyhow::anyhow!("failed to build config for project context: {e}"))?;
+        config.cwd = cwd.clone();
+
+        // Read AGENTS.md chain (git root → cwd).
+        let user_instructions = codex_core::project_doc::read_project_docs(&config)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to read project docs");
+                None
+            });
+
+        // Collect git info (commit, branch, remote URL).
+        let git_info = codex_core::git_info::collect_git_info(&cwd).await;
+
+        tracing::info!(
+            has_instructions = user_instructions.is_some(),
+            has_git = git_info.is_some(),
+            "project context collected"
+        );
+
+        Ok(ProjectContextOutput {
+            cwd: cwd_str,
+            user_instructions,
+            git_info,
+        })
+    }
 }
 
 /// Core tool dispatch logic, independent of the Temporal `ActivityContext`.
@@ -196,18 +290,26 @@ impl CodexActivities {
 /// `ToolRegistry::dispatch` pipeline without starting a Temporal worker.
 pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyhow::Error> {
     use codex_core::config::Constrained;
-    use codex_protocol::protocol::{AskForApproval, SandboxPolicy};
+    use codex_protocol::protocol::AskForApproval;
 
-    // Build a Config with the right model and cwd.
     let cwd = PathBuf::from(&input.cwd);
-    let codex_home = PathBuf::from("/tmp/codex-temporal");
-    let mut config = codex_core::config::Config::for_harness(codex_home)
-        .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
+
+    // Build Config: prefer the activity-loaded config TOML when present,
+    // falling back to Config::for_harness() for backward compatibility.
+    let mut config = if let Some(ref toml_str) = input.config_toml {
+        config_from_toml(toml_str, &cwd, None)
+            .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?
+    } else {
+        let codex_home = PathBuf::from("/tmp/codex-temporal");
+        let mut c = codex_core::config::Config::for_harness(codex_home)
+            .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
+        c.cwd = cwd;
+        c
+    };
     config.model = Some(input.model.clone());
-    config.cwd = cwd;
     // Approval is handled at the workflow level by TemporalToolHandler, so
-    // the activity itself runs with full access and no approval prompts.
-    config.permissions.sandbox_policy = Constrained::allow_any(SandboxPolicy::DangerFullAccess);
+    // the activity itself runs with no approval prompts. Sandbox policy comes
+    // from the user's config.toml (or defaults to read-only).
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
     let config = Arc::new(config);
 

@@ -123,6 +123,8 @@ impl TemporalAgentSession {
                 self.base_input.reasoning_summary
             },
             personality: personality.or(self.base_input.personality),
+            developer_instructions: self.base_input.developer_instructions.clone(),
+            model_provider: self.base_input.model_provider.clone(),
             continued_state: None,
         };
 

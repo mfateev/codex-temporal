@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use codex_core::{ModelStreamer, Prompt, ResponseEvent, ResponseStream};
+use codex_core::{ModelProviderInfo, ModelStreamer, Prompt, ResponseEvent, ResponseStream};
 use codex_otel::OtelManager;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
@@ -18,11 +18,16 @@ use crate::workflow::CodexWorkflow;
 pub struct TemporalModelStreamer {
     ctx: WorkflowContext<CodexWorkflow>,
     conversation_id: String,
+    provider: Option<ModelProviderInfo>,
 }
 
 impl TemporalModelStreamer {
-    pub fn new(ctx: WorkflowContext<CodexWorkflow>, conversation_id: String) -> Self {
-        Self { ctx, conversation_id }
+    pub fn new(
+        ctx: WorkflowContext<CodexWorkflow>,
+        conversation_id: String,
+        provider: Option<ModelProviderInfo>,
+    ) -> Self {
+        Self { ctx, conversation_id, provider }
     }
 }
 
@@ -46,6 +51,7 @@ impl ModelStreamer for TemporalModelStreamer {
             effort,
             summary,
             personality: prompt.personality,
+            provider: self.provider.clone(),
         };
 
         let opts = ActivityOptions {

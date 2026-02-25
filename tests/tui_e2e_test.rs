@@ -170,6 +170,8 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         reasoning_effort: None,
         reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
         personality: None,
+        developer_instructions: None,
+        model_provider: None,
         continued_state: None,
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)

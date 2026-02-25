@@ -14,11 +14,9 @@
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use codex_core::config::Config;
 use codex_core::entropy::{EntropyProviders, ENTROPY};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
@@ -38,18 +36,22 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_sdk::{
-    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+    WorkflowTermination,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::config_loader::config_from_toml;
 use crate::entropy::{TemporalClock, TemporalRandomSource};
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
 use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
+use crate::activities::CodexActivities;
 use crate::types::{
-    CodexWorkflowInput, CodexWorkflowOutput, ContinueAsNewState, PendingApproval, UserTurnInput,
+    CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, ContinueAsNewState, PendingApproval,
+    ProjectContextOutput, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -81,6 +83,64 @@ fn extract_message(items: &[UserInput]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Build ephemeral context items from project context, matching codex-core's
+/// `UserInstructions` and `EnvironmentContext` patterns.
+///
+/// These items are prepended to the prompt each iteration (not stored in
+/// session history), giving the model awareness of the project's AGENTS.md
+/// docs and working directory.
+pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
+    let mut items = Vec::new();
+
+    // User instructions (AGENTS.md) — matches codex-core's UserInstructions format.
+    if let Some(ref instructions) = ctx.user_instructions {
+        items.push(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n{contents}\n</INSTRUCTIONS>",
+                    cwd = ctx.cwd,
+                    contents = instructions,
+                ),
+            }],
+            end_turn: None,
+            phase: None,
+        });
+    }
+
+    // Environment context — matches codex-core's EnvironmentContext XML format.
+    let mut env_lines = vec!["<environment_context>".to_string()];
+    env_lines.push(format!("  <cwd>{}</cwd>", ctx.cwd));
+    env_lines.push("  <shell>bash</shell>".to_string());
+    if let Some(ref git) = ctx.git_info {
+        env_lines.push("  <git>".to_string());
+        if let Some(ref branch) = git.branch {
+            env_lines.push(format!("    <branch>{branch}</branch>"));
+        }
+        if let Some(ref commit) = git.commit_hash {
+            env_lines.push(format!("    <commit>{commit}</commit>"));
+        }
+        if let Some(ref url) = git.repository_url {
+            env_lines.push(format!("    <repository_url>{url}</repository_url>"));
+        }
+        env_lines.push("  </git>".to_string());
+    }
+    env_lines.push("</environment_context>".to_string());
+
+    items.push(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: env_lines.join("\n"),
+        }],
+        end_turn: None,
+        phase: None,
+    });
+
+    items
 }
 
 /// Build `ContinueAsNewState` from the current workflow state and return
@@ -239,10 +299,44 @@ impl CodexWorkflow {
             clock: Arc::new(TemporalClock::new(wf_time)),
         };
 
+        // --- startup activities (run outside sandbox) ---
+        // Launch load_config and collect_project_context concurrently.
+        let config_activity = ctx.start_activity(
+            CodexActivities::load_config,
+            (),
+            ActivityOptions {
+                schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                ..Default::default()
+            },
+        );
+        let project_context_activity = ctx.start_activity(
+            CodexActivities::collect_project_context,
+            (),
+            ActivityOptions {
+                schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                ..Default::default()
+            },
+        );
+
+        let (config_result, project_context_result) =
+            futures::future::join(config_activity, project_context_activity).await;
+
+        let config_output: ConfigOutput = config_result
+            .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
+        let project_context: ProjectContextOutput = project_context_result
+            .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
+
+        let context_items = build_context_items(&project_context);
+
         // --- config ---
-        let codex_home = PathBuf::from("/tmp/codex-temporal");
-        let mut config = Config::for_harness(codex_home)
-            .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
+        // Build a full Config from the activity-loaded TOML, with user
+        // instructions (AGENTS.md) from project context.
+        let mut config = config_from_toml(
+            &config_output.config_toml,
+            std::path::Path::new(&project_context.cwd),
+            project_context.user_instructions.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?;
         config.model = Some(input.model.clone());
         config.model_reasoning_effort = input.reasoning_effort;
         config.model_reasoning_summary = input.reasoning_summary;
@@ -420,7 +514,11 @@ impl CodexWorkflow {
                     sess.record_items(&turn_context, &[user_item]).await;
 
                     // --- run the agentic loop for this turn ---
-                    let mut streamer = TemporalModelStreamer::new(ctx.clone(), conversation_id.to_string());
+                    let mut streamer = TemporalModelStreamer::new(
+                        ctx.clone(),
+                        conversation_id.to_string(),
+                        input.model_provider.clone(),
+                    );
                     let handler = TemporalToolHandler::new(
                         ctx.clone(),
                         events.clone(),
@@ -428,6 +526,7 @@ impl CodexWorkflow {
                         input.approval_policy,
                         input.model.clone(),
                         config.cwd.to_string_lossy().to_string(),
+                        Some(config_output.config_toml.clone()),
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
@@ -440,10 +539,29 @@ impl CodexWorkflow {
                             break;
                         }
 
-                        // Rebuild prompt from accumulated session history.
+                        // Rebuild prompt from accumulated session history,
+                        // prepending ephemeral context items (AGENTS.md +
+                        // environment context) so the model sees project docs.
                         let history = sess.history_items().await;
+                        let mut input_items = context_items.clone();
+
+                        // Inject developer instructions (from config.toml)
+                        // after project context, before conversation history.
+                        if let Some(ref dev_instructions) = input.developer_instructions {
+                            input_items.push(ResponseItem::Message {
+                                id: None,
+                                role: "developer".to_string(),
+                                content: vec![ContentItem::InputText {
+                                    text: dev_instructions.clone(),
+                                }],
+                                end_turn: None,
+                                phase: None,
+                            });
+                        }
+
+                        input_items.extend(history);
                         let prompt = Prompt {
-                            input: history,
+                            input: input_items,
                             tools: tools.clone(),
                             parallel_tool_calls: false,
                             base_instructions: base_instructions.clone(),

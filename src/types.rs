@@ -3,11 +3,11 @@
 //! These types are sent across the Temporal activity boundary, so they must
 //! implement `Serialize` + `Deserialize`.
 
-use codex_core::ToolSpec;
+use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
-use codex_protocol::protocol::{RolloutItem, TokenUsage};
+use codex_protocol::protocol::{GitInfo, RolloutItem, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -38,6 +38,9 @@ pub struct ModelCallInput {
     /// Optional personality for the model.
     #[serde(default)]
     pub personality: Option<Personality>,
+    /// Optional model provider info override (from config.toml).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelProviderInfo>,
 }
 
 /// Output from the `model_call` activity.
@@ -68,6 +71,11 @@ pub struct ToolExecInput {
     pub model: String,
     /// Working directory for tool execution.
     pub cwd: String,
+    /// Merged config TOML string (from load_config activity).
+    /// When present, used to reconstruct a full Config with real features,
+    /// sandbox policy, etc. When absent, falls back to Config::for_harness().
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_toml: Option<String>,
 }
 
 /// Output from the `tool_exec` activity.
@@ -103,6 +111,41 @@ impl ToolExecOutput {
             },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Project context activity I/O
+// ---------------------------------------------------------------------------
+
+/// Output from the `collect_project_context` activity.
+///
+/// Captures project-level context (AGENTS.md docs, git info, cwd) from the
+/// worker's environment so the workflow can inject it into model prompts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectContextOutput {
+    /// Working directory the worker is running in.
+    pub cwd: String,
+    /// Concatenated AGENTS.md content (hierarchical, from git root to cwd).
+    #[serde(default)]
+    pub user_instructions: Option<String>,
+    /// Git repository info (commit, branch, remote URL).
+    #[serde(default)]
+    pub git_info: Option<GitInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// Config activity I/O
+// ---------------------------------------------------------------------------
+
+/// Output from the `load_config` activity.
+///
+/// Contains the merged config.toml content as a TOML string, which can be
+/// deserialized into `ConfigToml` and used to construct a full `Config` via
+/// `Config::from_toml()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigOutput {
+    /// Merged config.toml content as a TOML string.
+    pub config_toml: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +260,13 @@ pub struct CodexWorkflowInput {
     /// Optional personality for the model.
     #[serde(default)]
     pub personality: Option<Personality>,
+    /// Developer instructions from config.toml, injected as a separate
+    /// developer-role message in the prompt context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
+    /// Model provider info from config.toml (base URL, auth, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<ModelProviderInfo>,
     /// State carried over from a previous continue-as-new execution.
     /// `None` on the first run, `Some(...)` on subsequent runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]

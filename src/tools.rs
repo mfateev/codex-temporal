@@ -44,6 +44,8 @@ pub struct TemporalToolHandler {
     approval_policy: AskForApproval,
     model: String,
     cwd: String,
+    /// Merged config TOML string to forward to tool-execution activities.
+    config_toml: Option<String>,
 }
 
 impl TemporalToolHandler {
@@ -54,6 +56,7 @@ impl TemporalToolHandler {
         approval_policy: AskForApproval,
         model: String,
         cwd: String,
+        config_toml: Option<String>,
     ) -> Self {
         Self {
             ctx,
@@ -62,6 +65,7 @@ impl TemporalToolHandler {
             approval_policy,
             model,
             cwd,
+            config_toml,
         }
     }
 }
@@ -88,6 +92,7 @@ impl ToolCallHandler for TemporalToolHandler {
         let tool_name = call.tool_name.clone();
         let model = self.model.clone();
         let cwd = self.cwd.clone();
+        let config_toml = self.config_toml.clone();
 
         // Parse command from arguments for the approval request event.
         let command: Vec<String> = serde_json::from_str(&arguments)
@@ -167,6 +172,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 arguments,
                 model,
                 cwd,
+                config_toml,
             };
 
             let opts = ActivityOptions {
