@@ -37,6 +37,8 @@ codex-otel = { path = "../codex/codex-rs/otel" }
 codex-tui = { path = "../codex/codex-rs/tui" }
 codex-shell-command = { path = "../codex/codex-rs/shell-command" }
 codex-apply-patch = { path = "../codex/codex-rs/apply-patch" }
+codex-rmcp-client = { path = "../codex/codex-rs/rmcp-client" }
+rmcp = { version = "0.15.0", default-features = false, features = ["base64", "macros", "schemars"] }
 
 
 # Patches required by codex-core/codex-tui transitive dependencies

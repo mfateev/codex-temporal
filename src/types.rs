@@ -3,6 +3,8 @@
 //! These types are sent across the Temporal activity boundary, so they must
 //! implement `Serialize` + `Deserialize`.
 
+use std::collections::HashMap;
+
 use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
@@ -146,6 +148,70 @@ pub struct ProjectContextOutput {
 pub struct ConfigOutput {
     /// Merged config.toml content as a TOML string.
     pub config_toml: String,
+}
+
+// ---------------------------------------------------------------------------
+// MCP discovery activity I/O
+// ---------------------------------------------------------------------------
+
+/// Input to the `discover_mcp_tools` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpDiscoverInput {
+    /// Merged config.toml content as a TOML string.
+    pub config_toml: String,
+    /// Working directory (needed to build Config).
+    pub cwd: String,
+}
+
+/// Output from the `discover_mcp_tools` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpDiscoverOutput {
+    /// Qualified tool name ("mcp__server__tool") → serialized `rmcp::model::Tool`.
+    pub tools: HashMap<String, serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool call activity I/O
+// ---------------------------------------------------------------------------
+
+/// Input to the `mcp_tool_call` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolCallInput {
+    /// Qualified MCP tool name (e.g. "mcp__echo__echo").
+    pub qualified_name: String,
+    /// The call_id from the model.
+    pub call_id: String,
+    /// JSON string of tool arguments from the model.
+    pub arguments: String,
+}
+
+/// Output from the `mcp_tool_call` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolCallOutput {
+    /// The call_id echoed back.
+    pub call_id: String,
+    /// Serialized `codex_protocol::mcp::CallToolResult`, or error string.
+    pub result: Result<serde_json::Value, String>,
+}
+
+impl McpToolCallOutput {
+    /// Convert this output into a `ResponseInputItem::McpToolCallOutput`.
+    pub fn into_response_input_item(self) -> ResponseInputItem {
+        let result = match self.result {
+            Ok(value) => {
+                match serde_json::from_value::<codex_protocol::mcp::CallToolResult>(value) {
+                    Ok(ctr) => Ok(ctr),
+                    Err(e) => Err(format!("failed to deserialize CallToolResult: {e}")),
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        ResponseInputItem::McpToolCallOutput {
+            call_id: self.call_id,
+            result,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,4 +369,7 @@ pub struct ContinueAsNewState {
     /// Cumulative token usage across all CAN runs.
     #[serde(default)]
     pub cumulative_token_usage: Option<TokenUsage>,
+    /// Discovered MCP tool schemas (carried across CAN to avoid re-discovery).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_tools: HashMap<String, serde_json::Value>,
 }
