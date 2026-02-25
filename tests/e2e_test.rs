@@ -1390,6 +1390,107 @@ async fn command_safety_auto_approves_safe_commands(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+async fn mcp_tool_call_e2e(client: &Client) {
+    // Write a bash stdio MCP echo server to a temp file.
+    let tmp_dir = std::env::temp_dir().join(format!("codex-mcp-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
+
+    let script_path = tmp_dir.join("echo_mcp_server.sh");
+    std::fs::write(
+        &script_path,
+        r#"#!/usr/bin/env bash
+# Minimal MCP stdio echo server for testing.
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    method=$(echo "$line" | jq -r '.method // empty')
+    id=$(echo "$line" | jq '.id')
+    case "$method" in
+        initialize)
+            echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"echo-test\",\"version\":\"0.1.0\"}}}"
+            ;;
+        notifications/initialized)
+            ;;
+        tools/list)
+            echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echoes the message back\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\",\"description\":\"Message to echo\"}},\"required\":[\"message\"]}}]}}"
+            ;;
+        tools/call)
+            msg=$(echo "$line" | jq -r '.params.arguments.message // "no message"')
+            echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"echo: $msg\"}]}}"
+            ;;
+        *)
+            if [ "$id" != "null" ] && [ -n "$id" ]; then
+                echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
+            fi
+            ;;
+    esac
+done
+"#,
+    )
+    .expect("failed to write MCP server script");
+
+    // Make the script executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to chmod MCP server script");
+    }
+
+    // Write a config.toml that registers the echo MCP server.
+    let codex_home = tmp_dir.join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("failed to create codex home");
+    let config_content = format!(
+        r#"sandbox_mode = "danger-full-access"
+
+[mcp_servers.echo]
+command = "bash"
+args = ["{}"]
+"#,
+        script_path.to_string_lossy().replace('\\', "/")
+    );
+    std::fs::write(codex_home.join("config.toml"), &config_content)
+        .expect("failed to write config.toml");
+
+    // Override CODEX_HOME so the load_config activity picks up our config.
+    // SAFETY: e2e tests run sequentially.
+    let prev_codex_home = std::env::var("CODEX_HOME").ok();
+    unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
+
+    let session = new_session(client, "gpt-4o-mini");
+
+    session
+        .submit(user_turn_op(
+            "Use the mcp__echo__echo tool to echo the message 'hello from temporal'. \
+             Report what the tool returned.",
+        ))
+        .await
+        .expect("submit failed");
+
+    let turn_complete_msg = wait_for_turn_complete(&session).await;
+    assert!(
+        turn_complete_msg.is_some(),
+        "expected non-empty agent message in TurnComplete"
+    );
+    let msg = turn_complete_msg.unwrap().to_lowercase();
+    assert!(
+        msg.contains("hello from temporal"),
+        "expected agent message to contain 'hello from temporal', got: {}",
+        msg,
+    );
+
+    drain_shutdown(&session).await;
+
+    // Restore CODEX_HOME.
+    // SAFETY: e2e tests run sequentially.
+    unsafe {
+        match prev_codex_home {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -1580,6 +1681,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: command_safety_auto_approves_safe_commands ---");
     command_safety_auto_approves_safe_commands(&client).await;
+
+    eprintln!("--- test: mcp_tool_call_e2e ---");
+    mcp_tool_call_e2e(&client).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.

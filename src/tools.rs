@@ -8,6 +8,7 @@
 //! 4. If approved, executes the tool as a Temporal activity
 //! 5. If denied, returns an error response
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -26,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::activities::CodexActivities;
 use crate::sink::BufferEventSink;
-use crate::types::{PendingApproval, ToolExecInput};
+use crate::types::{McpToolCallInput, PendingApproval, ToolExecInput};
 use crate::workflow::CodexWorkflow;
 
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
@@ -48,6 +49,9 @@ pub struct TemporalToolHandler {
     cwd: String,
     /// Merged config TOML string to forward to tool-execution activities.
     config_toml: Option<String>,
+    /// Set of qualified MCP tool names (e.g. "mcp__echo__echo").
+    /// Tool calls matching these names bypass approval and route to MCP.
+    mcp_tool_names: HashSet<String>,
 }
 
 impl TemporalToolHandler {
@@ -59,6 +63,7 @@ impl TemporalToolHandler {
         model: String,
         cwd: String,
         config_toml: Option<String>,
+        mcp_tool_names: HashSet<String>,
     ) -> Self {
         Self {
             ctx,
@@ -68,6 +73,7 @@ impl TemporalToolHandler {
             model,
             cwd,
             config_toml,
+            mcp_tool_names,
         }
     }
 }
@@ -95,6 +101,7 @@ impl ToolCallHandler for TemporalToolHandler {
         let model = self.model.clone();
         let cwd = self.cwd.clone();
         let config_toml = self.config_toml.clone();
+        let is_mcp_tool = self.mcp_tool_names.contains(&tool_name);
 
         // Parse command from arguments for the approval request event.
         let command: Vec<String> = serde_json::from_str(&arguments)
@@ -109,6 +116,30 @@ impl ToolCallHandler for TemporalToolHandler {
             .unwrap_or_else(|| vec![arguments.clone()]);
 
         Box::pin(async move {
+            // MCP tools bypass the approval flow — the user explicitly
+            // configured these servers, so they are trusted.
+            if is_mcp_tool {
+                let input = McpToolCallInput {
+                    qualified_name: tool_name,
+                    call_id: call_id.clone(),
+                    arguments,
+                };
+
+                let opts = ActivityOptions {
+                    start_to_close_timeout: Some(Duration::from_secs(120)),
+                    heartbeat_timeout: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                };
+
+                let output = ctx
+                    .start_activity(CodexActivities::mcp_tool_call, input, opts)
+                    .await
+                    .map_err(|e| {
+                        CodexErr::Fatal(format!("mcp_tool_call activity failed: {e}"))
+                    })?;
+
+                return Ok(output.into_response_input_item());
+            }
             // Determine whether this call needs user approval based on a
             // three-tier safety classification (mirrors codex-core exec_policy):
             //   1. Safe (is_known_safe_command)  → auto-approve

@@ -14,6 +14,7 @@
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -50,8 +51,8 @@ use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
-    CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, ContinueAsNewState, PendingApproval,
-    ProjectContextOutput, UserTurnInput,
+    CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
+    McpDiscoverOutput, PendingApproval, ProjectContextOutput, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -152,6 +153,7 @@ fn do_continue_as_new(
     total_iterations: u32,
     turn_counter: u32,
     token_usage: Option<codex_protocol::protocol::TokenUsage>,
+    mcp_tools: HashMap<String, serde_json::Value>,
 ) -> WorkflowResult<CodexWorkflowOutput> {
     let state = ContinueAsNewState {
         rollout_items: storage.items(),
@@ -159,6 +161,7 @@ fn do_continue_as_new(
         cumulative_turn_count: turn_counter,
         cumulative_iterations: total_iterations,
         cumulative_token_usage: token_usage,
+        mcp_tools,
     };
 
     let mut can_input = input.clone();
@@ -328,6 +331,45 @@ impl CodexWorkflow {
 
         let context_items = build_context_items(&project_context);
 
+        // --- MCP discovery ---
+        // Reuse discovered tools from CAN state, or run discovery activity.
+        let mcp_tools: HashMap<String, serde_json::Value> =
+            if let Some(ref state) = input.continued_state {
+                if !state.mcp_tools.is_empty() {
+                    tracing::info!(
+                        tools = state.mcp_tools.len(),
+                        "reusing MCP tools from continue-as-new state"
+                    );
+                }
+                state.mcp_tools.clone()
+            } else {
+                let mcp_discover_input = McpDiscoverInput {
+                    config_toml: config_output.config_toml.clone(),
+                    cwd: project_context.cwd.clone(),
+                };
+                let mcp_output: McpDiscoverOutput = ctx
+                    .start_activity(
+                        CodexActivities::discover_mcp_tools,
+                        mcp_discover_input,
+                        ActivityOptions {
+                            schedule_to_close_timeout: Some(std::time::Duration::from_secs(60)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("MCP discovery failed: {e}");
+                        McpDiscoverOutput {
+                            tools: HashMap::new(),
+                        }
+                    });
+                mcp_output.tools
+            };
+
+        if !mcp_tools.is_empty() {
+            tracing::info!(tools = mcp_tools.len(), "MCP tools available");
+        }
+
         // --- config ---
         // Build a full Config from the activity-loaded TOML, with user
         // instructions (AGENTS.md) from project context.
@@ -400,7 +442,32 @@ impl CodexWorkflow {
             features: &config.features,
             web_search_mode: input.web_search_mode,
         });
-        let builder = build_specs(&tools_config, None, None, &[]);
+
+        // Convert serialized MCP tools back to rmcp::model::Tool for build_specs.
+        let rmcp_tools: Option<HashMap<String, rmcp::model::Tool>> = if mcp_tools.is_empty() {
+            None
+        } else {
+            let mut map = HashMap::new();
+            for (name, value) in &mcp_tools {
+                match serde_json::from_value::<rmcp::model::Tool>(value.clone()) {
+                    Ok(tool) => {
+                        map.insert(name.clone(), tool);
+                    }
+                    Err(e) => {
+                        tracing::warn!(tool = %name, error = %e, "failed to deserialize MCP tool, skipping");
+                    }
+                }
+            }
+            if map.is_empty() { None } else { Some(map) }
+        };
+
+        // Collect MCP tool names for the tool handler.
+        let mcp_tool_names: HashSet<String> = rmcp_tools
+            .as_ref()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let builder = build_specs(&tools_config, rmcp_tools, None, &[]);
         let (configured_specs, _registry) = builder.build();
         let tools: Vec<ToolSpec> = configured_specs.into_iter().map(|cs| cs.spec).collect();
         let base_instructions = BaseInstructions {
@@ -451,6 +518,7 @@ impl CodexWorkflow {
                             total_iterations,
                             turn_count,
                             events.latest_token_usage(),
+                            mcp_tools.clone(),
                         ));
                     }
 
@@ -527,6 +595,7 @@ impl CodexWorkflow {
                         input.model.clone(),
                         config.cwd.to_string_lossy().to_string(),
                         Some(config_output.config_toml.clone()),
+                        mcp_tool_names.clone(),
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
@@ -627,6 +696,7 @@ impl CodexWorkflow {
                             total_iterations,
                             turn_count,
                             events.latest_token_usage(),
+                            mcp_tools.clone(),
                         ));
                     }
 

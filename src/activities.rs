@@ -24,11 +24,12 @@ use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::Mutex;
 
 use crate::config_loader::config_from_toml;
+use crate::mcp::HarnessMcpManager;
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
 use crate::types::{
-    ConfigOutput, ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput,
-    ToolExecOutput,
+    ConfigOutput, McpDiscoverInput, McpDiscoverOutput, McpToolCallInput, McpToolCallOutput,
+    ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput, ToolExecOutput,
 };
 
 /// Resolve the model provider to use for the activity.
@@ -62,6 +63,8 @@ fn resolve_provider() -> ModelProviderInfo {
 /// Activity implementations for the codex workflow.
 pub struct CodexActivities {
     provider: ModelProviderInfo,
+    /// Persistent MCP server connections (initialized via `discover_mcp_tools`).
+    mcp_manager: Arc<Mutex<HarnessMcpManager>>,
 }
 
 impl CodexActivities {
@@ -69,6 +72,7 @@ impl CodexActivities {
     pub fn new() -> Self {
         Self {
             provider: resolve_provider(),
+            mcp_manager: Arc::new(Mutex::new(HarnessMcpManager::new())),
         }
     }
 }
@@ -236,6 +240,106 @@ impl CodexActivities {
         );
 
         Ok(ConfigOutput { config_toml: toml_string })
+    }
+
+    /// Discover MCP tools from configured servers.
+    ///
+    /// Connects to all enabled MCP servers from config.toml, performs the
+    /// MCP handshake, and lists available tools. Results are cached in the
+    /// `mcp_manager` for subsequent `mcp_tool_call` invocations.
+    #[activity]
+    pub async fn discover_mcp_tools(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: McpDiscoverInput,
+    ) -> Result<McpDiscoverOutput, ActivityError> {
+        tracing::info!("discover_mcp_tools activity invoked");
+
+        let cwd = std::path::PathBuf::from(&input.cwd);
+        let config = config_from_toml(&input.config_toml, &cwd, None)
+            .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?;
+
+        let mcp_servers = config.mcp_servers.get().clone();
+        if mcp_servers.is_empty() {
+            tracing::info!("no MCP servers configured");
+            return Ok(McpDiscoverOutput {
+                tools: std::collections::HashMap::new(),
+            });
+        }
+
+        tracing::info!(servers = mcp_servers.len(), "initializing MCP servers");
+
+        let mut manager = self.mcp_manager.lock().await;
+        let discovered = manager
+            .initialize(&mcp_servers)
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP discovery failed: {e}"))?;
+
+        // Serialize each rmcp::model::Tool to serde_json::Value for the
+        // activity boundary.
+        let tools = discovered
+            .into_iter()
+            .filter_map(|(name, tool)| {
+                match serde_json::to_value(&tool) {
+                    Ok(value) => Some((name, value)),
+                    Err(e) => {
+                        tracing::warn!(tool = %name, error = %e, "failed to serialize MCP tool");
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        tracing::info!("MCP discovery complete");
+        Ok(McpDiscoverOutput { tools })
+    }
+
+    /// Execute a tool call on an MCP server.
+    ///
+    /// Routes the call to the appropriate server based on the qualified
+    /// tool name prefix (`mcp__server__tool`).
+    #[activity]
+    pub async fn mcp_tool_call(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: McpToolCallInput,
+    ) -> Result<McpToolCallOutput, ActivityError> {
+        tracing::info!(
+            tool = %input.qualified_name,
+            call_id = %input.call_id,
+            "mcp_tool_call activity invoked"
+        );
+
+        let arguments: Option<serde_json::Value> = if input.arguments.is_empty() {
+            None
+        } else {
+            match serde_json::from_str(&input.arguments) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    return Ok(McpToolCallOutput {
+                        call_id: input.call_id,
+                        result: Err(format!("invalid JSON arguments: {e}")),
+                    });
+                }
+            }
+        };
+
+        let manager = self.mcp_manager.lock().await;
+        let result = match manager
+            .call_tool(&input.qualified_name, arguments)
+            .await
+        {
+            Ok(call_result) => match serde_json::to_value(&call_result) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(format!("failed to serialize CallToolResult: {e}")),
+            },
+            Err(e) => Err(format!("{e}")),
+        };
+
+        Ok(McpToolCallOutput {
+            call_id: input.call_id,
+            result,
+        })
     }
 
     /// Collect project context from the worker's environment.

@@ -546,6 +546,7 @@ fn continue_as_new_state_roundtrips_through_json() {
             reasoning_output_tokens: 0,
             total_tokens: 125,
         }),
+        mcp_tools: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -580,6 +581,7 @@ fn workflow_input_with_continued_state_roundtrips() {
             cumulative_turn_count: 3,
             cumulative_iterations: 10,
             cumulative_token_usage: None,
+            mcp_tools: std::collections::HashMap::new(),
         }),
     };
 
@@ -1518,4 +1520,246 @@ fn safe_command_skips_approval_under_on_request() {
         !needs_approval(&cmd, AskForApproval::OnRequest),
         "safe command should skip approval under OnRequest"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MCP types tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mcp_discover_output_serde_roundtrip() {
+    use codex_temporal::types::McpDiscoverOutput;
+
+    let mut tools = std::collections::HashMap::new();
+    tools.insert(
+        "mcp__echo__echo".to_string(),
+        serde_json::json!({
+            "name": "echo",
+            "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}}
+        }),
+    );
+
+    let output = McpDiscoverOutput { tools };
+    let json = serde_json::to_string(&output).unwrap();
+    let back: McpDiscoverOutput = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.tools.len(), 1);
+    assert!(back.tools.contains_key("mcp__echo__echo"));
+}
+
+#[test]
+fn mcp_tool_call_input_serde_roundtrip() {
+    use codex_temporal::types::McpToolCallInput;
+
+    let input = McpToolCallInput {
+        qualified_name: "mcp__echo__echo".to_string(),
+        call_id: "call-123".to_string(),
+        arguments: r#"{"message":"hello"}"#.to_string(),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: McpToolCallInput = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.qualified_name, "mcp__echo__echo");
+    assert_eq!(back.call_id, "call-123");
+    assert_eq!(back.arguments, r#"{"message":"hello"}"#);
+}
+
+#[test]
+fn mcp_tool_call_output_serde_roundtrip_ok() {
+    use codex_temporal::types::McpToolCallOutput;
+
+    let output = McpToolCallOutput {
+        call_id: "call-456".to_string(),
+        result: Ok(serde_json::json!({
+            "content": [{"type": "text", "text": "hello back"}],
+        })),
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: McpToolCallOutput = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.call_id, "call-456");
+    assert!(back.result.is_ok());
+}
+
+#[test]
+fn mcp_tool_call_output_serde_roundtrip_err() {
+    use codex_temporal::types::McpToolCallOutput;
+
+    let output = McpToolCallOutput {
+        call_id: "call-789".to_string(),
+        result: Err("tool not found".to_string()),
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: McpToolCallOutput = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.call_id, "call-789");
+    assert!(back.result.is_err());
+    assert_eq!(back.result.unwrap_err(), "tool not found");
+}
+
+#[test]
+fn mcp_tool_call_output_into_response_item_ok() {
+    use codex_temporal::types::McpToolCallOutput;
+    use codex_protocol::models::ResponseInputItem;
+
+    let output = McpToolCallOutput {
+        call_id: "call-resp".to_string(),
+        result: Ok(serde_json::json!({
+            "content": [{"type": "text", "text": "result text"}],
+        })),
+    };
+
+    let item = output.into_response_input_item();
+    match item {
+        ResponseInputItem::McpToolCallOutput { call_id, result } => {
+            assert_eq!(call_id, "call-resp");
+            assert!(result.is_ok());
+            let ctr = result.unwrap();
+            assert_eq!(ctr.content.len(), 1);
+        }
+        other => panic!("expected McpToolCallOutput, got {:?}", other),
+    }
+}
+
+#[test]
+fn mcp_tool_call_output_into_response_item_err() {
+    use codex_temporal::types::McpToolCallOutput;
+    use codex_protocol::models::ResponseInputItem;
+
+    let output = McpToolCallOutput {
+        call_id: "call-err".to_string(),
+        result: Err("server crashed".to_string()),
+    };
+
+    let item = output.into_response_input_item();
+    match item {
+        ResponseInputItem::McpToolCallOutput { call_id, result } => {
+            assert_eq!(call_id, "call-err");
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "server crashed");
+        }
+        other => panic!("expected McpToolCallOutput, got {:?}", other),
+    }
+}
+
+#[test]
+fn continue_as_new_state_with_mcp_tools() {
+    use codex_temporal::types::ContinueAsNewState;
+
+    let mut mcp_tools = std::collections::HashMap::new();
+    mcp_tools.insert(
+        "mcp__srv__tool".to_string(),
+        serde_json::json!({"name": "tool", "inputSchema": {"type": "object"}}),
+    );
+
+    let state = ContinueAsNewState {
+        rollout_items: vec![],
+        pending_user_turns: vec![],
+        cumulative_turn_count: 1,
+        cumulative_iterations: 2,
+        cumulative_token_usage: None,
+        mcp_tools: mcp_tools.clone(),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: ContinueAsNewState = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.mcp_tools.len(), 1);
+    assert!(back.mcp_tools.contains_key("mcp__srv__tool"));
+}
+
+#[test]
+fn continue_as_new_state_mcp_tools_default_when_missing() {
+    use codex_temporal::types::ContinueAsNewState;
+
+    // JSON without mcp_tools field — should default to empty.
+    let json = r#"{
+        "rollout_items": [],
+        "pending_user_turns": [],
+        "cumulative_turn_count": 0,
+        "cumulative_iterations": 0
+    }"#;
+
+    let state: ContinueAsNewState = serde_json::from_str(json).unwrap();
+    assert!(state.mcp_tools.is_empty());
+}
+
+#[tokio::test]
+async fn config_toml_roundtrip_preserves_mcp_servers() {
+    use codex_core::config::ConfigBuilder;
+    use codex_temporal::config_loader::config_from_toml;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "codex-mcp-config-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        tmp.join("config.toml"),
+        r#"
+sandbox_mode = "danger-full-access"
+
+[mcp_servers.testserver]
+command = "echo"
+args = ["hello"]
+"#,
+    )
+    .unwrap();
+
+    // SAFETY: unit tests using CODEX_HOME must be sequential.
+    let prev = std::env::var("CODEX_HOME").ok();
+    unsafe { std::env::set_var("CODEX_HOME", &tmp) };
+
+    let toml_string = ConfigBuilder::default()
+        .build_toml_string()
+        .await
+        .expect("build_toml_string failed");
+
+    // Restore CODEX_HOME immediately.
+    unsafe {
+        match &prev {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Verify mcp_servers survived the round-trip.
+    assert!(
+        toml_string.contains("mcp_servers") || toml_string.contains("testserver"),
+        "TOML output should contain mcp_servers section, got:\n{}",
+        toml_string
+    );
+
+    let cwd = std::path::PathBuf::from("/tmp");
+    let config = config_from_toml(&toml_string, &cwd, None)
+        .expect("config_from_toml failed");
+    let servers = config.mcp_servers.get();
+    assert!(
+        servers.contains_key("testserver"),
+        "expected 'testserver' in mcp_servers, got keys: {:?}",
+        servers.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mcp_tool_name_detection() {
+    use codex_core::mcp::split_qualified_tool_name;
+
+    // Valid MCP tool names.
+    let result = split_qualified_tool_name("mcp__echo__echo");
+    assert_eq!(result, Some(("echo".to_string(), "echo".to_string())));
+
+    let result = split_qualified_tool_name("mcp__server__nested__tool");
+    assert_eq!(
+        result,
+        Some(("server".to_string(), "nested__tool".to_string()))
+    );
+
+    // Non-MCP tool names should return None.
+    assert_eq!(split_qualified_tool_name("shell"), None);
+    assert_eq!(split_qualified_tool_name("read_file"), None);
+    assert_eq!(split_qualified_tool_name("other__server__tool"), None);
+
+    // Malformed MCP names.
+    assert_eq!(split_qualified_tool_name("mcp__server__"), None);
+    assert_eq!(split_qualified_tool_name("mcp__"), None);
 }
