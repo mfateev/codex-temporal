@@ -1,13 +1,13 @@
 //! Deterministic entropy providers backed by the Temporal workflow context.
 //!
 //! Temporal workflows must be deterministic — no direct calls to
-//! `Uuid::new_v4()`, `Instant::now()`, or `SystemTime::now()`.  Instead,
+//! `Uuid::new_v4()` or `SystemTime::now()`.  Instead,
 //! these providers use the workflow's random seed and logical clock.
 
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use codex_core::entropy::{Clock, RandomSource};
 
@@ -78,14 +78,13 @@ impl RandomSource for TemporalRandomSource {
 
 /// Deterministic clock backed by the workflow's logical time.
 ///
-/// `now()` returns a monotonically advancing `Instant` derived from the
-/// workflow time.  `wall_time()` returns the workflow's logical wall clock.
+/// `wall_time()` returns the workflow's logical wall clock.
 #[derive(Debug)]
 pub struct TemporalClock {
     /// Workflow start time (set once at workflow init).
     epoch: SystemTime,
-    /// Monotonic counter used to synthesise `Instant` values.
-    /// Each call to `now()` increments this so durations are always > 0.
+    /// Monotonic counter used to synthesise wall-clock values.
+    /// Each call increments this so durations are always > 0.
     tick: AtomicU64,
 }
 
@@ -106,14 +105,6 @@ impl TemporalClock {
 }
 
 impl Clock for TemporalClock {
-    fn now(&self) -> Instant {
-        // We can't construct an arbitrary Instant, but we can use the real
-        // clock — the important thing is that UUIDs and randomness are
-        // deterministic.  Instant is only used for duration measurements
-        // within a single turn, which is acceptable.
-        Instant::now()
-    }
-
     fn wall_time(&self) -> SystemTime {
         let ticks = self.tick.fetch_add(1, Ordering::Relaxed);
         self.epoch + Duration::from_millis(ticks)
