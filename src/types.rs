@@ -254,6 +254,15 @@ pub struct PendingApproval {
     pub decision: Option<bool>,
 }
 
+/// Pending `request_user_input` state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingUserInput {
+    /// The call_id for the `request_user_input` tool call.
+    pub call_id: String,
+    /// Set to `Some(...)` when the client responds via `Op::UserInputAnswer`.
+    pub response: Option<codex_protocol::request_user_input::RequestUserInputResponse>,
+}
+
 // ---------------------------------------------------------------------------
 // Harness types (session registry)
 // ---------------------------------------------------------------------------
