@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::activities::CodexActivities;
 use crate::sink::BufferEventSink;
 use crate::types::{McpToolCallInput, PendingApproval, ToolExecInput};
-use crate::workflow::CodexWorkflow;
+use crate::workflow::AgentWorkflow;
 
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
 /// dispatches approved calls as Temporal activities.
@@ -41,7 +41,7 @@ use crate::workflow::CodexWorkflow;
 ///    `Never`, which cannot prompt; sandbox enforcement still applies).
 /// 3. **Unknown** — defer to the configured [`AskForApproval`] policy.
 pub struct TemporalToolHandler {
-    ctx: WorkflowContext<CodexWorkflow>,
+    ctx: WorkflowContext<AgentWorkflow>,
     events: Arc<BufferEventSink>,
     turn_id: String,
     approval_policy: AskForApproval,
@@ -56,7 +56,7 @@ pub struct TemporalToolHandler {
 
 impl TemporalToolHandler {
     pub fn new(
-        ctx: WorkflowContext<CodexWorkflow>,
+        ctx: WorkflowContext<AgentWorkflow>,
         events: Arc<BufferEventSink>,
         turn_id: String,
         approval_policy: AskForApproval,
@@ -156,8 +156,10 @@ impl ToolCallHandler for TemporalToolHandler {
                 // Unknown command — defer to policy.
                 match approval_policy {
                     AskForApproval::Never => false,
-                    AskForApproval::UnlessTrusted => true,
-                    AskForApproval::OnRequest | AskForApproval::OnFailure => true,
+                    AskForApproval::UnlessTrusted
+                    | AskForApproval::OnRequest
+                    | AskForApproval::OnFailure
+                    | AskForApproval::Reject(_) => true,
                 }
             };
 
@@ -182,6 +184,9 @@ impl ToolCallHandler for TemporalToolHandler {
                         reason: None,
                         network_approval_context: None,
                         proposed_execpolicy_amendment: None,
+                        proposed_network_policy_amendments: None,
+                        additional_permissions: None,
+                        available_decisions: None,
                         parsed_cmd: Vec::new(),
                     }),
                 };

@@ -1,15 +1,13 @@
 //! Deterministic entropy providers backed by the Temporal workflow context.
 //!
 //! Temporal workflows must be deterministic — no direct calls to
-//! `Uuid::new_v4()`, `Instant::now()`, or `SystemTime::now()`.  Instead,
-//! these providers use the workflow's random seed and logical clock.
+//! `Uuid::new_v4()`.  This module provides a deterministic random source
+//! seeded from the workflow's random seed.
 
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
-
-use codex_core::entropy::{Clock, RandomSource};
+use codex_core::entropy::RandomSource;
 
 /// Deterministic random source seeded from the workflow's random seed.
 ///
@@ -76,53 +74,3 @@ impl RandomSource for TemporalRandomSource {
     }
 }
 
-/// Deterministic clock backed by the workflow's logical time.
-///
-/// `now()` returns a monotonically advancing `Instant` derived from the
-/// workflow time.  `wall_time()` returns the workflow's logical wall clock.
-#[derive(Debug)]
-pub struct TemporalClock {
-    /// Workflow start time (set once at workflow init).
-    epoch: SystemTime,
-    /// Monotonic counter used to synthesise `Instant` values.
-    /// Each call to `now()` increments this so durations are always > 0.
-    tick: AtomicU64,
-}
-
-impl TemporalClock {
-    pub fn new(workflow_time: SystemTime) -> Self {
-        Self {
-            epoch: workflow_time,
-            tick: AtomicU64::new(0),
-        }
-    }
-
-    /// Update the logical wall-clock (called when Temporal advances time).
-    pub fn advance(&self, _new_time: SystemTime) {
-        // For now we just increment the tick; full time tracking can be
-        // added when we have access to updated workflow time per activation.
-        self.tick.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-impl Clock for TemporalClock {
-    fn now(&self) -> Instant {
-        // We can't construct an arbitrary Instant, but we can use the real
-        // clock — the important thing is that UUIDs and randomness are
-        // deterministic.  Instant is only used for duration measurements
-        // within a single turn, which is acceptable.
-        Instant::now()
-    }
-
-    fn wall_time(&self) -> SystemTime {
-        let ticks = self.tick.fetch_add(1, Ordering::Relaxed);
-        self.epoch + Duration::from_millis(ticks)
-    }
-
-    fn unix_millis(&self) -> u64 {
-        self.wall_time()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-}
