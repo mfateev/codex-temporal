@@ -15,6 +15,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
     AskForApproval, EventMsg, Op, ReviewDecision, SandboxPolicy,
 };
+use codex_protocol::request_user_input::{RequestUserInputAnswer, RequestUserInputResponse};
 use codex_protocol::user_input::UserInput;
 
 use codex_temporal::activities::CodexActivities;
@@ -1713,6 +1714,79 @@ async fn interrupt_cancels_turn(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: request_user_input tool round-trip.
+///
+/// 1. Submit a prompt that instructs the model to call `request_user_input`.
+/// 2. Wait for `EventMsg::RequestUserInput` — assert non-empty call_id and questions.
+/// 3. Respond with `Op::UserInputAnswer` keyed by each question id.
+/// 4. Wait for `TurnComplete` (auto-approve stray exec requests).
+/// 5. Assert the model produced a response.
+async fn request_user_input_flow(client: &Client) {
+    let session = new_session(client, "gpt-4o");
+
+    session
+        .submit(user_turn_op(
+            "You must use the request_user_input tool to ask me exactly one yes/no question before responding. Do not use any other tools.",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Wait for RequestUserInput event.
+    let event_data;
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for RequestUserInput event");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if let EventMsg::RequestUserInput(rui) = &event.msg {
+            event_data = rui.clone();
+            break;
+        }
+    }
+
+    // Assert non-empty call_id and at least one question.
+    assert!(
+        !event_data.call_id.is_empty(),
+        "expected non-empty call_id in RequestUserInput event"
+    );
+    assert!(
+        !event_data.questions.is_empty(),
+        "expected at least one question in RequestUserInput event"
+    );
+
+    // Build answers keyed by each question's id.
+    let mut answers = std::collections::HashMap::new();
+    for q in &event_data.questions {
+        answers.insert(
+            q.id.clone(),
+            RequestUserInputAnswer {
+                answers: vec!["yes".to_string()],
+            },
+        );
+    }
+
+    // Send the user input answer.
+    session
+        .submit(Op::UserInputAnswer {
+            id: event_data.call_id.clone(),
+            response: RequestUserInputResponse { answers },
+        })
+        .await
+        .expect("user_input_answer submit failed");
+
+    // Wait for TurnComplete (auto-approve stray exec requests).
+    let turn_complete_msg = wait_for_turn_complete(&session).await;
+
+    assert!(
+        turn_complete_msg.is_some(),
+        "expected non-empty last_agent_message in TurnComplete after user input"
+    );
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Session workflow (multi-agent) tests
 // ---------------------------------------------------------------------------
@@ -2065,6 +2139,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: interrupt_cancels_turn ---");
     interrupt_cancels_turn(&client).await;
+
+    eprintln!("--- test: request_user_input_flow ---");
+    request_user_input_flow(&client).await;
 
     eprintln!("--- test: session_spawns_main_agent ---");
     session_spawns_main_agent(&client).await;
