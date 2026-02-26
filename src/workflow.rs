@@ -51,7 +51,7 @@ use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
-    McpDiscoverOutput, PendingApproval, ProjectContextOutput, UserTurnInput,
+    McpDiscoverOutput, PendingApproval, PendingUserInput, ProjectContextOutput, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -67,6 +67,9 @@ pub struct AgentWorkflow {
     turn_counter: u32,
     /// Pending tool-call approval (set by tool handler, resolved by signal).
     pub(crate) pending_approval: Option<PendingApproval>,
+    /// Pending `request_user_input` tool call (set by tool handler, resolved
+    /// by `Op::UserInputAnswer` signal).
+    pub(crate) pending_user_input: Option<PendingUserInput>,
     /// When true the workflow will exit after the current turn completes.
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
@@ -196,6 +199,7 @@ impl AgentWorkflow {
                 turn_counter: state.cumulative_turn_count,
                 events: Arc::new(BufferEventSink::new()),
                 pending_approval: None,
+                pending_user_input: None,
                 shutdown_requested: false,
                 compact_requested: false,
                 approval_policy_override: state.approval_policy_override,
@@ -227,6 +231,7 @@ impl AgentWorkflow {
             user_turns: initial_turns,
             turn_counter,
             pending_approval: None,
+            pending_user_input: None,
             shutdown_requested: false,
             compact_requested: false,
             approval_policy_override: None,
@@ -274,6 +279,13 @@ impl AgentWorkflow {
                                 | ReviewDecision::ApprovedExecpolicyAmendment { .. }
                         );
                         pa.decision = Some(approved);
+                    }
+                }
+            }
+            Op::UserInputAnswer { id, response, .. } => {
+                if let Some(ref mut pui) = self.pending_user_input {
+                    if pui.call_id == id {
+                        pui.response = Some(response);
                     }
                 }
             }

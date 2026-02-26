@@ -18,8 +18,9 @@ use std::time::Duration;
 use codex_core::error::CodexErr;
 use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
-use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::{FunctionCallOutputPayload, ResponseInputItem};
 use codex_protocol::protocol::{AskForApproval, Event, EventMsg, ExecApprovalRequestEvent};
+use codex_protocol::request_user_input::{RequestUserInputArgs, RequestUserInputEvent};
 use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use temporalio_sdk::{ActivityOptions, WorkflowContext};
@@ -27,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::activities::CodexActivities;
 use crate::sink::BufferEventSink;
-use crate::types::{McpToolCallInput, PendingApproval, ToolExecInput};
+use crate::types::{McpToolCallInput, PendingApproval, PendingUserInput, ToolExecInput};
 use crate::workflow::AgentWorkflow;
 
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
@@ -140,6 +141,69 @@ impl ToolCallHandler for TemporalToolHandler {
 
                 return Ok(output.into_response_input_item());
             }
+            // request_user_input — intercept and handle via signal/wait
+            // (same pattern as exec approval).
+            if tool_name == "request_user_input" {
+                let args: RequestUserInputArgs = serde_json::from_str(&arguments)
+                    .map_err(|e| {
+                        CodexErr::Fatal(format!("invalid request_user_input args: {e}"))
+                    })?;
+
+                // Set pending state.
+                ctx.state_mut(|s| {
+                    s.pending_user_input = Some(PendingUserInput {
+                        call_id: call_id.clone(),
+                        response: None,
+                    });
+                });
+
+                // Emit event to client.
+                events.emit_event_sync(Event {
+                    id: turn_id.clone(),
+                    msg: EventMsg::RequestUserInput(RequestUserInputEvent {
+                        call_id: call_id.clone(),
+                        turn_id,
+                        questions: args.questions,
+                    }),
+                });
+
+                // Wait for response or interrupt.
+                ctx.wait_condition(|s| {
+                    s.pending_user_input
+                        .as_ref()
+                        .map_or(true, |p| p.response.is_some())
+                        || s.interrupt_requested
+                })
+                .await;
+
+                // Handle interrupt.
+                let interrupted = ctx.state(|s| s.interrupt_requested);
+                if interrupted {
+                    ctx.state_mut(|s| s.pending_user_input = None);
+                    let output = serde_json::json!({"error": "interrupted"}).to_string();
+                    return Ok(ResponseInputItem::FunctionCallOutput {
+                        call_id,
+                        output: FunctionCallOutputPayload::from_text(output),
+                    });
+                }
+
+                // Extract response and return as tool output.
+                let response = ctx.state_mut(|s| {
+                    let resp = s
+                        .pending_user_input
+                        .as_ref()
+                        .and_then(|p| p.response.clone());
+                    s.pending_user_input = None;
+                    resp
+                });
+
+                let output = serde_json::to_string(&response).unwrap_or_default();
+                return Ok(ResponseInputItem::FunctionCallOutput {
+                    call_id,
+                    output: FunctionCallOutputPayload::from_text(output),
+                });
+            }
+
             // Determine whether this call needs user approval based on a
             // three-tier safety classification (mirrors codex-core exec_policy):
             //   1. Safe (is_known_safe_command)  → auto-approve
