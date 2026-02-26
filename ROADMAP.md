@@ -4,7 +4,7 @@
 
 Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistry dispatch (shell, apply_patch, read_file, list_dir, grep_files, view_image, web search), tool approval gating with three-tier command safety and policy modes, full TUI reuse with interactive session picker, deterministic entropy, OpenAI Responses API calls via codex ModelClient with stable conversation_id, prompt caching, token usage tracking, reasoning effort/summary/personality, config.toml loading via activity, real sandbox policy from config, project context injection (AGENTS.md + git info), MCP server support (stdio/HTTP), continue-as-new, session resume via CodexHarness registry, event polling with watermarks.
 
-71 unit tests, 17 e2e tests, 4 TUI e2e tests.
+73 unit tests, 19 e2e tests, 4 TUI e2e tests.
 
 ---
 
@@ -27,7 +27,7 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 ## Phase 3: Approval Policies & Sandbox
 
 11. ~~**Policy modes**~~ — ✅ `Never`/`OnRequest`/`OnFailure`/`UnlessTrusted` in workflow; `CODEX_APPROVAL_POLICY` env var
-12. **Policy amendment signals** — update policies mid-workflow
+12. ~~**Policy amendment signals**~~ — ✅ `Op::OverrideTurnContext` updates `approval_policy_override` mid-workflow; persists across CAN; `effective_approval_policy()` helper; tool handler re-reads policy each iteration
 13. **Worker sandbox** — bubblewrap/container isolation for tool activities
 14. ~~**Command safety analysis**~~ — ✅ codex-core three-tier classification: safe (auto-approve), dangerous (always prompt), unknown (defer to policy); 8 unit tests
 
@@ -71,7 +71,7 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 35. ~~**Personality**~~ — ✅ `CodexWorkflowInput.personality` + per-turn override via `UserTurnInput`; `CODEX_PERSONALITY` env var; flows through to `Prompt.personality`
 36. **Notifications** — email/webhook on completion or approval requests
 37. **Apps/connectors** — discovery through MCP gateway activities
-38. **Interrupt** — signal cancels current activity, returns control to user
+38. ~~**Interrupt**~~ — ✅ `Op::Interrupt` sets flag checked at iteration boundaries and during approval waits; emits `TurnAborted(Interrupted)` event; returns denied-style response from tool handler to avoid codex-core drain panic
 39. **Code review** — `/review` triggers specialized model call on git diff
 
 ## Phase 10: Production Hardening
@@ -97,10 +97,10 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 | ~~6~~ | ~~4 — Config/auth~~ | ✅ Partial (config.toml done); real auth/models/credentials remaining |
 | ~~7~~ | ~~7 — MCP/skills~~ | ✅ Partial (MCP done); skills loading remaining |
 | 8 | 6 — Multi-agent | Power feature |
-| 9 | 9 — Advanced | Nice-to-haves (memory, interrupt, code review) |
+| 9 | 9 — Advanced | Nice-to-haves (memory, ~~interrupt~~, code review); interrupt done |
 | 10 | 10 — Hardening | Before any real deployment |
 
 ## Summary
 
-**Completed:** 27 of 45 items (60%)
-**Remaining:** 18 items across phases 1–10 (multi-provider, JS REPL, policy amendments, worker sandbox, real auth, models provider, credential store, fork/new, rollout export, thread metadata, multi-agent ×3, skills ×2, ghost commits, /diff, memory, notifications, apps, interrupt, code review, timeouts, resource limits, observability, graceful shutdown, error handling)
+**Completed:** 29 of 45 items (64%)
+**Remaining:** 16 items across phases 1–10 (multi-provider, JS REPL, worker sandbox, real auth, models provider, credential store, fork/new, rollout export, thread metadata, multi-agent ×3, skills ×2, ghost commits, /diff, memory, notifications, apps, code review, timeouts, resource limits, observability, graceful shutdown, error handling)
