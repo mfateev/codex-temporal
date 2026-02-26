@@ -9,7 +9,7 @@ use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
-use codex_protocol::protocol::{GitInfo, RolloutItem, TokenUsage};
+use codex_protocol::protocol::{AskForApproval, GitInfo, RolloutItem, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -372,4 +372,7 @@ pub struct ContinueAsNewState {
     /// Discovered MCP tool schemas (carried across CAN to avoid re-discovery).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
+    /// Overridden approval policy (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy_override: Option<AskForApproval>,
 }

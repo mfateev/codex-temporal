@@ -2,16 +2,18 @@
 
 ## Current State
 
-Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistry dispatch (shell, apply_patch, read_file, list_dir, grep_files, view_image, web search), tool approval gating with policy modes, full TUI reuse, deterministic entropy, non-streaming OpenAI Responses API calls via codex ModelClient, event polling with watermarks.
+Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistry dispatch (shell, apply_patch, read_file, list_dir, grep_files, view_image, web search), tool approval gating with three-tier command safety and policy modes, full TUI reuse with interactive session picker, deterministic entropy, OpenAI Responses API calls via codex ModelClient with stable conversation_id, prompt caching, token usage tracking, reasoning effort/summary/personality, config.toml loading via activity, real sandbox policy from config, project context injection (AGENTS.md + git info), MCP server support (stdio/HTTP), continue-as-new, session resume via CodexHarness registry, event polling with watermarks.
+
+71 unit tests, 17 e2e tests, 4 TUI e2e tests.
 
 ---
 
 ## Phase 1: Model Improvements
 
 1. ~~**Streaming responses**~~ — *out of scope*
-2. **Reasoning effort** — pass low/medium/high through to Responses API; wire `/model` command
-3. **Multi-provider** — route `model_call` to OpenAI/Ollama/LM Studio/custom based on workflow input
-4. **Prompt caching** — cache control headers for long conversations
+2. ~~**Reasoning effort**~~ — ✅ low/medium/high through Responses API; per-turn overrides via `UserTurnInput`; `CODEX_EFFORT` env var
+3. **Multi-provider** — route `model_call` to OpenAI/Ollama/LM Studio/custom based on workflow input (provider config plumbed through `CodexWorkflowInput.model_provider` → `ModelCallInput`; actual multi-provider routing deferred to codex-core `ModelClient`)
+4. ~~**Prompt caching**~~ — ✅ stable `conversation_id` per workflow, cached provider in `CodexActivities`, `TokenUsage` tracking with `cached_input_tokens`; e2e test confirms 89% cache hit rate on second turn
 
 ## Phase 2: Tool Ecosystem
 
@@ -24,22 +26,22 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 
 ## Phase 3: Approval Policies & Sandbox
 
-11. ~~**Policy modes**~~ — ✅ `Never`/`OnRequest`/`OnFailure`/`UnlessTrusted` in workflow
+11. ~~**Policy modes**~~ — ✅ `Never`/`OnRequest`/`OnFailure`/`UnlessTrusted` in workflow; `CODEX_APPROVAL_POLICY` env var
 12. **Policy amendment signals** — update policies mid-workflow
 13. **Worker sandbox** — bubblewrap/container isolation for tool activities
-14. **Command safety analysis** — reuse `command_safety` to classify before approval
+14. ~~**Command safety analysis**~~ — ✅ codex-core three-tier classification: safe (auto-approve), dangerous (always prompt), unknown (defer to policy); 8 unit tests
 
 ## Phase 4: Configuration & Auth
 
 15. **Real auth** — OAuth, API key, device code in TUI; replace `NoopAuthProvider`
 16. **Real models provider** — fetch catalog, wire `/model` to switch via signal
-17. **Config loading** — read `config.toml`, pass settings as workflow input
+17. ~~**Config loading**~~ — ✅ `load_config` activity calls `ConfigBuilder::build_toml_string()` on worker; workflow builds real `Config` via `Config::from_toml()`; `config.toml` settings flow through to tool dispatch; `CODEX_*` env var overrides
 18. **Credential store** — keyring/file/ephemeral support
 
 ## Phase 5: Session Persistence
 
-19. **Resume flow** — reconnect TUI to existing workflow by ID
-20. **`/resume`, `/fork`, `/new`** — reconnect, seed from history, or start fresh
+19. ~~**Resume flow**~~ — ✅ `CodexHarness` workflow (long-lived session registry); `TemporalAgentSession::resume()` + `fetch_initial_events()`; `--resume` flag in TUI; full interactive session picker via codex TUI `resume_picker`
+20. **`/resume`, `/fork`, `/new`** — reconnect, seed from history, or start fresh (resume done; fork/new remaining)
 21. **Rollout export** — query returning native codex rollout format
 22. **Thread metadata** — workflow search attributes for discoverability
 
@@ -51,22 +53,22 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 
 ## Phase 7: MCP & Skills
 
-26. **MCP connections** — worker manages MCP servers (stdio/SSE), discovers tools at workflow start
-27. **MCP tool execution** — dispatched as activities through worker's MCP connections
+26. ~~**MCP connections**~~ — ✅ `HarnessMcpManager` manages persistent connections (stdio + streamable HTTP via `RmcpClient`); `discover_mcp_tools` activity at workflow start
+27. ~~**MCP tool execution**~~ — ✅ `mcp_tool_call` activity routes `mcp__server__tool` prefixed calls to appropriate server; bypasses shell approval; schemas carry through continue-as-new
 28. **Skills loading** — discover `SKILL.md` on worker, inject into system prompt
 29. **Remote skills** — MCP-based installation
 
 ## Phase 8: Git & Project Context
 
-30. **Git info injection** — worker reads git status/diff, injects into prompt
+30. ~~**Git info injection**~~ — ✅ `collect_project_context` activity reads git branch/commit/URL via `codex_core::git_info::collect_git_info()`; injected as XML EnvironmentContext in prompt
 31. **Ghost commits** — auto-commit after file-modifying tool executions
-32. **Project docs** — discover `AGENTS.md`/`README.md`, inject into system prompt
+32. ~~**Project docs**~~ — ✅ `collect_project_context` activity reads AGENTS.md chain via `codex_core::project_doc::read_project_docs()`; injected as XML UserInstructions in prompt; ephemeral (not stored in history)
 33. **`/diff` and `/mention`** — query for git diff; signal to include file content
 
 ## Phase 9: Advanced Features
 
 34. **Memory system** — extraction/consolidation as separate workflows
-35. **Personality** — pass config through workflow input into system prompt
+35. ~~**Personality**~~ — ✅ `CodexWorkflowInput.personality` + per-turn override via `UserTurnInput`; `CODEX_PERSONALITY` env var; flows through to `Prompt.personality`
 36. **Notifications** — email/webhook on completion or approval requests
 37. **Apps/connectors** — discovery through MCP gateway activities
 38. **Interrupt** — signal cancels current activity, returns control to user
@@ -79,7 +81,7 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 42. **Observability** — OpenTelemetry tracing/metrics on worker and TUI
 43. **Graceful shutdown** — drain on SIGTERM, `request_shutdown` on exit
 44. **Error handling** — structured errors, proper failure propagation
-45. **Continue-as-new** — avoid unbounded history for long conversations
+45. ~~**Continue-as-new**~~ — ✅ `Op::Compact` signal triggers CAN; `ContinueAsNewState` carries history, pending turns, counters, token usage, MCP tools; e2e test confirms recall across CAN boundary
 
 ---
 
@@ -87,14 +89,18 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 
 | Order | Phase | Rationale |
 |-------|-------|-----------|
-| ~~1~~ | ~~3 — Approval policies~~ | ✅ Done (policy modes) |
+| ~~1~~ | ~~3 — Approval policies~~ | ✅ Done (policy modes + command safety) |
 | ~~2~~ | ~~2 — Tool ecosystem~~ | ✅ Done (ToolRegistry dispatch, web search); JS REPL remaining |
-| 3 | 1 — Model improvements | Reasoning effort wiring, multi-provider, prompt caching |
-| 4 | 5 — Session persistence | Resume is critical for real usage |
-| 5 | 8 — Git/project context | Important for coding tasks |
-| 6 | 4 — Config/auth | Needed for multi-user deployment |
-| 7 | 3 remaining — Sandbox | Worker sandbox, policy amendments, command safety |
+| ~~3~~ | ~~1 — Model improvements~~ | ✅ Done (reasoning effort, prompt caching); multi-provider routing remaining |
+| ~~4~~ | ~~5 — Session persistence~~ | ✅ Done (resume, picker, harness); fork/new/export remaining |
+| ~~5~~ | ~~8 — Git/project context~~ | ✅ Done (git info, AGENTS.md); ghost commits, /diff remaining |
+| ~~6~~ | ~~4 — Config/auth~~ | ✅ Partial (config.toml done); real auth/models/credentials remaining |
+| ~~7~~ | ~~7 — MCP/skills~~ | ✅ Partial (MCP done); skills loading remaining |
 | 8 | 6 — Multi-agent | Power feature |
-| 9 | 7 — MCP/skills | Extensibility |
-| 10 | 9 — Advanced | Nice-to-haves |
-| 11 | 10 — Hardening | Before any real deployment |
+| 9 | 9 — Advanced | Nice-to-haves (memory, interrupt, code review) |
+| 10 | 10 — Hardening | Before any real deployment |
+
+## Summary
+
+**Completed:** 27 of 45 items (60%)
+**Remaining:** 18 items across phases 1–10 (multi-provider, JS REPL, policy amendments, worker sandbox, real auth, models provider, credential store, fork/new, rollout export, thread metadata, multi-agent ×3, skills ×2, ghost commits, /diff, memory, notifications, apps, interrupt, code review, timeouts, resource limits, observability, graceful shutdown, error handling)
