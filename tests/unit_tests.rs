@@ -909,16 +909,22 @@ async fn dispatch_with_experimental_tools(
 }
 
 #[tokio::test]
-async fn dispatch_read_file_reads_etc_hostname() {
+async fn dispatch_read_file_reads_system_file() {
+    let file_path = if cfg!(target_os = "linux") {
+        "/etc/hostname"
+    } else {
+        "/etc/hosts" // exists on both macOS and Linux
+    };
+
+    let args = format!(r#"{{"file_path":"{}"}}"#, file_path);
     let (output, exit_code) = dispatch_with_experimental_tools(
         "read_file",
-        r#"{"file_path":"/etc/hostname"}"#,
+        &args,
         &["read_file"],
     )
     .await;
 
     assert_eq!(exit_code, 0, "read_file should succeed: {output}");
-    // /etc/hostname should contain some text (the container hostname).
     assert!(
         !output.is_empty(),
         "read_file output should not be empty",

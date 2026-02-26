@@ -1391,6 +1391,16 @@ async fn command_safety_auto_approves_safe_commands(client: &Client) {
 }
 
 async fn mcp_tool_call_e2e(client: &Client) {
+    // The bash MCP echo server script requires jq for JSON parsing.
+    if std::process::Command::new("jq")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("  skipping mcp_tool_call_e2e: jq not installed");
+        return;
+    }
+
     // Write a bash stdio MCP echo server to a temp file.
     let tmp_dir = std::env::temp_dir().join(format!("codex-mcp-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
