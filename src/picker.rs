@@ -41,6 +41,8 @@ pub fn sessions_to_threads_page(sessions: Vec<SessionEntry>) -> ThreadsPage {
                 git_sha: None,
                 git_origin_url: None,
                 source: None,
+                agent_nickname: None,
+                agent_role: None,
                 model_provider: None,
                 cli_version: None,
                 created_at: Some(ts.clone()),

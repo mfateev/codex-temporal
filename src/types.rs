@@ -297,12 +297,15 @@ pub struct HarnessState {
 }
 
 // ---------------------------------------------------------------------------
-// Workflow I/O
+// Workflow I/O (AgentWorkflow — formerly CodexWorkflow)
 // ---------------------------------------------------------------------------
 
-/// Input to the codex workflow.
+/// Input to the agent workflow.
+///
+/// Renamed from `CodexWorkflowInput`; the old name is kept as a type alias
+/// for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexWorkflowInput {
+pub struct AgentWorkflowInput {
     /// The user message to process.
     pub user_message: String,
     /// Model to use (e.g. "gpt-4o").
@@ -337,11 +340,38 @@ pub struct CodexWorkflowInput {
     /// `None` on the first run, `Some(...)` on subsequent runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_state: Option<ContinueAsNewState>,
+
+    // --- multi-agent fields (all optional for backward compat) ---
+
+    /// Agent role name (e.g. "default", "explorer", "worker").
+    #[serde(default = "default_role")]
+    pub role: String,
+    /// Pre-resolved merged config TOML from SessionWorkflow.
+    /// When `Some`, the agent skips the `load_config` activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_toml: Option<String>,
+    /// Pre-collected project context from SessionWorkflow.
+    /// When `Some`, the agent skips the `collect_project_context` activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_context: Option<ProjectContextOutput>,
+    /// Pre-discovered MCP tools from SessionWorkflow.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_tools: HashMap<String, serde_json::Value>,
 }
 
-/// Output from the codex workflow.
+fn default_role() -> String {
+    "default".to_string()
+}
+
+/// Backward-compatible alias.
+pub type CodexWorkflowInput = AgentWorkflowInput;
+
+/// Output from the agent workflow.
+///
+/// Renamed from `CodexWorkflowOutput`; the old name is kept as a type alias
+/// for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexWorkflowOutput {
+pub struct AgentWorkflowOutput {
     /// The final assistant message, if any.
     pub last_agent_message: Option<String>,
     /// Number of model→tool loop iterations executed.
@@ -349,6 +379,176 @@ pub struct CodexWorkflowOutput {
     /// Cumulative token usage across all model calls.
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+}
+
+/// Backward-compatible alias.
+pub type CodexWorkflowOutput = AgentWorkflowOutput;
+
+// ---------------------------------------------------------------------------
+// SessionWorkflow I/O (parent / control plane)
+// ---------------------------------------------------------------------------
+
+/// Input to the `SessionWorkflow` (parent workflow that manages agents).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkflowInput {
+    /// The initial user message to forward to the main agent.
+    pub user_message: String,
+    /// Model to use (e.g. "gpt-4o").
+    pub model: String,
+    /// Base instructions / system prompt.
+    pub instructions: String,
+    /// Tool approval policy.
+    #[serde(default)]
+    pub approval_policy: AskForApproval,
+    /// Web search mode.
+    #[serde(default)]
+    pub web_search_mode: Option<codex_protocol::config_types::WebSearchMode>,
+    /// Optional reasoning effort level.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Reasoning summary mode.
+    #[serde(default)]
+    pub reasoning_summary: ReasoningSummary,
+    /// Optional personality.
+    #[serde(default)]
+    pub personality: Option<Personality>,
+    /// Developer instructions from config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
+    /// Model provider info from config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<ModelProviderInfo>,
+    /// State carried over from a previous continue-as-new execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_state: Option<SessionContinueAsNewState>,
+}
+
+impl From<AgentWorkflowInput> for SessionWorkflowInput {
+    fn from(input: AgentWorkflowInput) -> Self {
+        Self {
+            user_message: input.user_message,
+            model: input.model,
+            instructions: input.instructions,
+            approval_policy: input.approval_policy,
+            web_search_mode: input.web_search_mode,
+            reasoning_effort: input.reasoning_effort,
+            reasoning_summary: input.reasoning_summary,
+            personality: input.personality,
+            developer_instructions: input.developer_instructions,
+            model_provider: input.model_provider,
+            continued_state: None,
+        }
+    }
+}
+
+/// Output from the `SessionWorkflow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkflowOutput {
+    /// Summary of all agents that ran in this session.
+    pub agents: Vec<AgentSummary>,
+}
+
+/// Summary of an agent's execution within a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSummary {
+    /// Unique agent identifier (e.g. "{session_id}/main").
+    pub agent_id: String,
+    /// Role name (e.g. "default", "explorer").
+    pub role: String,
+    /// Final lifecycle status.
+    pub status: AgentLifecycle,
+    /// Number of model→tool loop iterations.
+    pub iterations: u32,
+    /// Cumulative token usage.
+    #[serde(default)]
+    pub token_usage: Option<TokenUsage>,
+}
+
+/// Lifecycle status of an agent within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentLifecycle {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// State carried across a continue-as-new boundary for `SessionWorkflow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionContinueAsNewState {
+    /// Tracked agents from the previous run.
+    pub agents: Vec<AgentRecord>,
+    /// Cached config TOML string.
+    pub config_toml: String,
+    /// Cached project context.
+    pub project_context: ProjectContextOutput,
+    /// Cached MCP tools.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_tools: HashMap<String, serde_json::Value>,
+}
+
+/// Record of a child agent workflow tracked by `SessionWorkflow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRecord {
+    /// Unique agent identifier (workflow ID of the child AgentWorkflow).
+    pub agent_id: String,
+    /// Workflow ID of the child AgentWorkflow (same as agent_id).
+    pub workflow_id: String,
+    /// Role name.
+    pub role: String,
+    /// Current lifecycle status.
+    pub status: AgentLifecycle,
+}
+
+/// Signal payload for spawning a new agent in the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnAgentInput {
+    /// Role to assign to the new agent (e.g. "explorer", "worker").
+    pub role: String,
+    /// Initial message for the new agent.
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Role resolution activity I/O
+// ---------------------------------------------------------------------------
+
+/// Input to the `resolve_role_config` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveRoleConfigInput {
+    /// Merged config TOML string (base config).
+    pub config_toml: String,
+    /// Working directory.
+    pub cwd: String,
+    /// Role name to resolve (e.g. "explorer").
+    pub role_name: String,
+}
+
+/// Output from the `resolve_role_config` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveRoleConfigOutput {
+    /// Merged config TOML string after applying the role overlay.
+    pub config_toml: String,
+    /// Resolved model slug.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Resolved instructions.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Resolved reasoning effort.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Resolved reasoning summary.
+    #[serde(default)]
+    pub reasoning_summary: ReasoningSummary,
+    /// Resolved personality.
+    #[serde(default)]
+    pub personality: Option<Personality>,
+    /// Resolved developer instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
+    /// Resolved model provider info.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<ModelProviderInfo>,
 }
 
 // ---------------------------------------------------------------------------

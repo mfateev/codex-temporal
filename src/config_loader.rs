@@ -2,7 +2,7 @@
 //!
 //! Provides shared config loading used by both CLI and TUI binaries.
 //! Config is loaded client-side (outside the workflow sandbox) and
-//! extracted into [`CodexWorkflowInput`] fields that flow through
+//! extracted into [`SessionWorkflowInput`] fields that flow through
 //! Temporal's serialization boundary.
 
 use std::path::{Path, PathBuf};
@@ -13,14 +13,14 @@ use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode}
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 
-use crate::types::CodexWorkflowInput;
+use crate::types::SessionWorkflowInput;
 
 /// Holds the result of loading config.toml: a template
-/// [`CodexWorkflowInput`] and the resolved model provider info.
+/// [`SessionWorkflowInput`] and the resolved model provider info.
 pub struct HarnessConfig {
     /// Template workflow input with fields populated from config.toml.
     /// The `user_message` field is left empty — callers fill it in.
-    pub base_input: CodexWorkflowInput,
+    pub base_input: SessionWorkflowInput,
     /// Model provider resolved from config.toml (for the worker/activity).
     pub model_provider: ModelProviderInfo,
 }
@@ -61,7 +61,7 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
 
     // --- reasoning ---
     let reasoning_effort = config.model_reasoning_effort;
-    let reasoning_summary = config.model_reasoning_summary;
+    let reasoning_summary = config.model_reasoning_summary.unwrap_or_default();
 
     // --- personality ---
     let personality = config.personality;
@@ -69,7 +69,7 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
     // --- model provider ---
     let model_provider = config.model_provider.clone();
 
-    let base_input = CodexWorkflowInput {
+    let base_input = SessionWorkflowInput {
         user_message: String::new(),
         model,
         instructions,
@@ -93,7 +93,7 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
 ///
 /// Environment variables take highest priority for backward compatibility
 /// with the pre-config.toml workflow.
-pub fn apply_env_overrides(input: &mut CodexWorkflowInput) {
+pub fn apply_env_overrides(input: &mut SessionWorkflowInput) {
     // CODEX_MODEL
     if let Ok(model) = std::env::var("CODEX_MODEL") {
         input.model = model;

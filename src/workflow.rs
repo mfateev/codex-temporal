@@ -16,7 +16,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use codex_core::entropy::{EntropyProviders, ENTROPY};
 use codex_core::models_manager::manager::ModelsManager;
@@ -44,14 +43,14 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::config_loader::config_from_toml;
-use crate::entropy::{TemporalClock, TemporalRandomSource};
+use crate::entropy::TemporalRandomSource;
 use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
 use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
-    CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
+    AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, ProjectContextOutput, UserTurnInput,
 };
 
@@ -59,8 +58,8 @@ use crate::types::{
 const MAX_ITERATIONS: u32 = 50;
 
 #[workflow]
-pub struct CodexWorkflow {
-    input: CodexWorkflowInput,
+pub struct AgentWorkflow {
+    input: AgentWorkflowInput,
     pub(crate) events: Arc<BufferEventSink>,
     /// Queue of user turns waiting to be processed.
     user_turns: Vec<UserTurnInput>,
@@ -153,7 +152,7 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
 /// Build `ContinueAsNewState` from the current workflow state and return
 /// `Err(WorkflowTermination::ContinueAsNew(...))` to trigger CAN.
 fn do_continue_as_new(
-    input: &CodexWorkflowInput,
+    input: &AgentWorkflowInput,
     storage: &InMemoryStorage,
     pending_turns: Vec<UserTurnInput>,
     total_iterations: u32,
@@ -161,7 +160,7 @@ fn do_continue_as_new(
     token_usage: Option<codex_protocol::protocol::TokenUsage>,
     mcp_tools: HashMap<String, serde_json::Value>,
     approval_policy_override: Option<AskForApproval>,
-) -> WorkflowResult<CodexWorkflowOutput> {
+) -> WorkflowResult<AgentWorkflowOutput> {
     let state = ContinueAsNewState {
         rollout_items: storage.items(),
         pending_user_turns: pending_turns,
@@ -187,9 +186,9 @@ fn do_continue_as_new(
 }
 
 #[workflow_methods]
-impl CodexWorkflow {
+impl AgentWorkflow {
     #[init]
-    pub fn new(_ctx: &WorkflowContextView, input: CodexWorkflowInput) -> Self {
+    pub fn new(_ctx: &WorkflowContextView, input: AgentWorkflowInput) -> Self {
         // If restoring from continue-as-new, use the carried-over state.
         if let Some(ref state) = input.continued_state {
             return Self {
@@ -318,81 +317,95 @@ impl CodexWorkflow {
     // ----- run -----
 
     #[run]
-    pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<CodexWorkflowOutput> {
+    pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<AgentWorkflowOutput> {
         let input = ctx.state(|s| s.input.clone());
         let events = ctx.state(|s| s.events.clone());
 
         // --- deterministic entropy ---
         let seed = ctx.random_seed();
-        let wf_time = ctx.workflow_time().unwrap_or(SystemTime::UNIX_EPOCH);
         let entropy = EntropyProviders {
             random: Arc::new(TemporalRandomSource::new(seed)),
-            clock: Arc::new(TemporalClock::new(wf_time)),
         };
 
-        // --- startup activities (run outside sandbox) ---
-        // Launch load_config and collect_project_context concurrently.
-        let config_activity = ctx.start_activity(
-            CodexActivities::load_config,
-            (),
-            ActivityOptions {
-                schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                ..Default::default()
-            },
-        );
-        let project_context_activity = ctx.start_activity(
-            CodexActivities::collect_project_context,
-            (),
-            ActivityOptions {
-                schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                ..Default::default()
-            },
-        );
+        // --- startup: load config, project context, MCP tools ---
+        // If pre-resolved by SessionWorkflow, use directly; otherwise fall
+        // back to activities (backward compat for standalone tests).
+        let (config_output, project_context, mcp_tools) =
+            if input.config_toml.is_some() && input.project_context.is_some() {
+                let config_output = ConfigOutput {
+                    config_toml: input.config_toml.clone().unwrap(),
+                };
+                let project_context = input.project_context.clone().unwrap();
+                let mcp_tools = input.mcp_tools.clone();
+                tracing::info!("using pre-resolved config/context from parent workflow");
+                (config_output, project_context, mcp_tools)
+            } else {
+                // Launch load_config and collect_project_context concurrently.
+                let config_activity = ctx.start_activity(
+                    CodexActivities::load_config,
+                    (),
+                    ActivityOptions {
+                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                        ..Default::default()
+                    },
+                );
+                let project_context_activity = ctx.start_activity(
+                    CodexActivities::collect_project_context,
+                    (),
+                    ActivityOptions {
+                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                        ..Default::default()
+                    },
+                );
 
-        let (config_result, project_context_result) =
-            futures::future::join(config_activity, project_context_activity).await;
+                let (config_result, project_context_result) =
+                    futures::future::join(config_activity, project_context_activity).await;
 
-        let config_output: ConfigOutput = config_result
-            .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
-        let project_context: ProjectContextOutput = project_context_result
-            .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
+                let config_output: ConfigOutput = config_result
+                    .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
+                let project_context: ProjectContextOutput = project_context_result
+                    .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
+
+                // MCP discovery: reuse from CAN state or run activity.
+                let mcp_tools: HashMap<String, serde_json::Value> =
+                    if let Some(ref state) = input.continued_state {
+                        if !state.mcp_tools.is_empty() {
+                            tracing::info!(
+                                tools = state.mcp_tools.len(),
+                                "reusing MCP tools from continue-as-new state"
+                            );
+                        }
+                        state.mcp_tools.clone()
+                    } else {
+                        let mcp_discover_input = McpDiscoverInput {
+                            config_toml: config_output.config_toml.clone(),
+                            cwd: project_context.cwd.clone(),
+                        };
+                        let mcp_output: McpDiscoverOutput = ctx
+                            .start_activity(
+                                CodexActivities::discover_mcp_tools,
+                                mcp_discover_input,
+                                ActivityOptions {
+                                    schedule_to_close_timeout: Some(
+                                        std::time::Duration::from_secs(60),
+                                    ),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("MCP discovery failed: {e}");
+                                McpDiscoverOutput {
+                                    tools: HashMap::new(),
+                                }
+                            });
+                        mcp_output.tools
+                    };
+
+                (config_output, project_context, mcp_tools)
+            };
 
         let context_items = build_context_items(&project_context);
-
-        // --- MCP discovery ---
-        // Reuse discovered tools from CAN state, or run discovery activity.
-        let mcp_tools: HashMap<String, serde_json::Value> =
-            if let Some(ref state) = input.continued_state {
-                if !state.mcp_tools.is_empty() {
-                    tracing::info!(
-                        tools = state.mcp_tools.len(),
-                        "reusing MCP tools from continue-as-new state"
-                    );
-                }
-                state.mcp_tools.clone()
-            } else {
-                let mcp_discover_input = McpDiscoverInput {
-                    config_toml: config_output.config_toml.clone(),
-                    cwd: project_context.cwd.clone(),
-                };
-                let mcp_output: McpDiscoverOutput = ctx
-                    .start_activity(
-                        CodexActivities::discover_mcp_tools,
-                        mcp_discover_input,
-                        ActivityOptions {
-                            schedule_to_close_timeout: Some(std::time::Duration::from_secs(60)),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("MCP discovery failed: {e}");
-                        McpDiscoverOutput {
-                            tools: HashMap::new(),
-                        }
-                    });
-                mcp_output.tools
-            };
 
         if !mcp_tools.is_empty() {
             tracing::info!(tools = mcp_tools.len(), "MCP tools available");
@@ -409,7 +422,7 @@ impl CodexWorkflow {
         .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?;
         config.model = Some(input.model.clone());
         config.model_reasoning_effort = input.reasoning_effort;
-        config.model_reasoning_summary = input.reasoning_summary;
+        config.model_reasoning_summary = Some(input.reasoning_summary);
         config.personality = input.personality;
         let config = Arc::new(config);
 
@@ -459,7 +472,7 @@ impl CodexWorkflow {
                     _ => {} // Skip SessionMeta, TurnContext, EventMsg
                 }
             }
-            sess.replace_history(history_items).await;
+            sess.replace_history(history_items, None).await;
         }
 
         // --- tools ---
@@ -469,6 +482,7 @@ impl CodexWorkflow {
             model_info: &model_info,
             features: &config.features,
             web_search_mode: input.web_search_mode,
+            session_source: codex_protocol::protocol::SessionSource::Exec,
         });
 
         // Convert serialized MCP tools back to rmcp::model::Tool for build_specs.
@@ -509,7 +523,7 @@ impl CodexWorkflow {
         let mut last_agent_message: Option<String> = None;
 
         // === main loop: wait for turns, process them, repeat ===
-        let can_result: Option<WorkflowResult<CodexWorkflowOutput>> = ENTROPY
+        let can_result: Option<WorkflowResult<AgentWorkflowOutput>> = ENTROPY
             .scope(entropy, async {
                 loop {
                     // Wait until we have a user turn to process or shutdown.
@@ -596,7 +610,7 @@ impl CodexWorkflow {
                             c.model_reasoning_effort = turn.effort;
                         }
                         if turn.summary != ReasoningSummary::default() {
-                            c.model_reasoning_summary = turn.summary;
+                            c.model_reasoning_summary = Some(turn.summary);
                         }
                         if turn.personality.is_some() {
                             c.personality = turn.personality;
@@ -784,7 +798,7 @@ impl CodexWorkflow {
             msg: EventMsg::ShutdownComplete,
         });
 
-        Ok(CodexWorkflowOutput {
+        Ok(AgentWorkflowOutput {
             last_agent_message,
             iterations: total_iterations,
             token_usage: events.latest_token_usage(),
@@ -799,5 +813,9 @@ impl CodexWorkflow {
 }
 
 /// Re-export the macro-generated `Run` marker type so other modules (e.g.
-/// `session.rs`) can parameterize `WorkflowHandle<Client, CodexWorkflowRun>`.
-pub use codex_workflow::Run as CodexWorkflowRun;
+/// `session.rs`) can parameterize `WorkflowHandle<Client, AgentWorkflowRun>`.
+pub use agent_workflow::Run as AgentWorkflowRun;
+
+/// Backward-compatible aliases.
+pub type CodexWorkflow = AgentWorkflow;
+pub type CodexWorkflowRun = AgentWorkflowRun;

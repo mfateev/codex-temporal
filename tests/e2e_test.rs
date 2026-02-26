@@ -24,6 +24,7 @@ use codex_temporal::session::TemporalAgentSession;
 use codex_temporal::types::{
     CodexWorkflowInput, HarnessInput, SessionEntry, SessionStatus,
 };
+use codex_temporal::session_workflow::SessionWorkflow;
 use codex_temporal::workflow::CodexWorkflow;
 
 use temporalio_client::{
@@ -77,6 +78,10 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -343,6 +348,10 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -366,6 +375,10 @@ fn new_session_with_effort(
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -439,6 +452,10 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -775,6 +792,10 @@ async fn session_resume(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let resumed = TemporalAgentSession::resume(client.clone(), session_id.clone(), base_input);
 
@@ -1030,6 +1051,10 @@ shell_tool = true
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -1119,6 +1144,10 @@ sandbox_mode = "read-only"
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -1685,6 +1714,158 @@ async fn interrupt_cancels_turn(client: &Client) {
 }
 
 // ---------------------------------------------------------------------------
+// Session workflow (multi-agent) tests
+// ---------------------------------------------------------------------------
+
+/// Test that SessionWorkflow spawns a main AgentWorkflow and processes a turn.
+///
+/// 1. Create TemporalAgentSession (now starts SessionWorkflow → AgentWorkflow).
+/// 2. Submit a user turn.
+/// 3. Wait for TurnComplete with a response.
+async fn session_spawns_main_agent(client: &Client) {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let workflow_id = format!("e2e-session-{}", uuid::Uuid::new_v4());
+    let base_input = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+    let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
+
+    session
+        .submit(user_turn_op("Say the word 'pineapple' and nothing else."))
+        .await
+        .expect("submit failed");
+
+    let mut saw_turn_started = false;
+    let turn_complete_msg;
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::TurnStarted(_) => saw_turn_started = true,
+            EventMsg::TurnComplete(tc) => {
+                turn_complete_msg = tc.last_agent_message.clone();
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_turn_started, "expected TurnStarted event");
+    assert!(
+        turn_complete_msg.is_some(),
+        "expected non-empty last_agent_message in TurnComplete"
+    );
+    let msg = turn_complete_msg.unwrap().to_lowercase();
+    assert!(
+        msg.contains("pineapple"),
+        "expected 'pineapple' in response, got: {msg}"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+/// Test that SessionWorkflow can spawn additional agents via signal.
+///
+/// 1. Start session with a user turn.
+/// 2. Wait for TurnComplete.
+/// 3. Signal spawn_agent with role "default" and a message.
+/// 4. Query list_agents — verify two agents exist.
+async fn session_spawn_additional_agent(client: &Client) {
+    use codex_temporal::session_workflow::{SessionWorkflow, SessionWorkflowRun};
+    use codex_temporal::types::{AgentRecord, SessionWorkflowInput, SpawnAgentInput};
+
+    let session_id = format!("e2e-multi-agent-{}", uuid::Uuid::new_v4());
+    let base_input = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+    let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
+
+    // Start session by submitting first turn.
+    session
+        .submit(user_turn_op("Say hello."))
+        .await
+        .expect("submit failed");
+
+    // Wait for TurnComplete.
+    let timeout_at = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout_at {
+            panic!("timed out waiting for first TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    // Spawn another agent via signal.
+    session
+        .spawn_agent(SpawnAgentInput {
+            role: "default".to_string(),
+            message: "Say goodbye.".to_string(),
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    // Give the SessionWorkflow time to process the spawn.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Query list_agents on the SessionWorkflow.
+    let handle = client.get_workflow_handle::<SessionWorkflowRun>(&session_id);
+    let agents_json: String = handle
+        .query(
+            SessionWorkflow::list_agents,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await
+        .expect("list_agents query failed");
+
+    let agents: Vec<AgentRecord> = serde_json::from_str(&agents_json).unwrap_or_default();
+
+    assert!(
+        agents.len() >= 2,
+        "expected at least 2 agents, got {}: {:?}",
+        agents.len(),
+        agents
+    );
+
+    // Verify the main agent is present.
+    assert!(
+        agents.iter().any(|a| a.agent_id.ends_with("/main")),
+        "expected main agent in list: {:?}",
+        agents
+    );
+
+    drain_shutdown(&session).await;
+}
+
+// ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
 
@@ -1788,6 +1969,7 @@ async fn e2e_tests_inner() {
 
             let opts = WorkerOptions::new(TASK_QUEUE)
                 .task_types(WorkerTaskTypes::all())
+                .register_workflow::<SessionWorkflow>()
                 .register_workflow::<CodexWorkflow>()
                 .register_workflow::<CodexHarness>()
                 .register_activities(CodexActivities::new())
@@ -1883,6 +2065,12 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: interrupt_cancels_turn ---");
     interrupt_cancels_turn(&client).await;
+
+    eprintln!("--- test: session_spawns_main_agent ---");
+    session_spawns_main_agent(&client).await;
+
+    eprintln!("--- test: session_spawn_additional_agent ---");
+    session_spawn_additional_agent(&client).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.

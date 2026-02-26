@@ -16,10 +16,10 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use codex_temporal::config_loader;
 use codex_temporal::harness::{CodexHarness, CodexHarnessRun};
+use codex_temporal::session_workflow::SessionWorkflow;
 use codex_temporal::types::{
     HarnessInput, SessionEntry, SessionStatus,
 };
-use codex_temporal::workflow::CodexWorkflow;
 
 const TASK_QUEUE: &str = "codex-temporal";
 
@@ -175,9 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let options = WorkflowStartOptions::new(TASK_QUEUE, &workflow_id).build();
 
-    // Start the workflow using the CodexWorkflow's run definition.
+    // Start the SessionWorkflow (which spawns the main AgentWorkflow child).
     let handle = client
-        .start_workflow(CodexWorkflow::run, input, options)
+        .start_workflow(SessionWorkflow::run, input, options)
         .await?;
 
     tracing::info!(

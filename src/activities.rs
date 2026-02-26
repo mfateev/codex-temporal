@@ -29,7 +29,8 @@ use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
 use crate::types::{
     ConfigOutput, McpDiscoverInput, McpDiscoverOutput, McpToolCallInput, McpToolCallOutput,
-    ModelCallInput, ModelCallOutput, ProjectContextOutput, ToolExecInput, ToolExecOutput,
+    ModelCallInput, ModelCallOutput, ProjectContextOutput, ResolveRoleConfigInput,
+    ResolveRoleConfigOutput, ToolExecInput, ToolExecOutput,
 };
 
 /// Resolve the model provider to use for the activity.
@@ -117,8 +118,7 @@ impl CodexActivities {
             provider,
             SessionSource::Exec,
             None,  // model_verbosity
-            false, // websockets
-            false, // websockets v2
+            None,  // responses_websocket_version
             false, // request compression
             false, // timing metrics
             None,  // beta features header
@@ -386,6 +386,51 @@ impl CodexActivities {
             git_info,
         })
     }
+
+    /// Resolve role-specific config by applying a role overlay on top of the
+    /// base config.
+    ///
+    /// Uses `codex_core::agent::role::apply_role_to_config` to merge the
+    /// role's config layer (built-in or user-defined) into the base config,
+    /// then extracts the resolved fields.
+    #[activity]
+    pub async fn resolve_role_config(
+        _ctx: ActivityContext,
+        input: ResolveRoleConfigInput,
+    ) -> Result<ResolveRoleConfigOutput, ActivityError> {
+        tracing::info!(role = %input.role_name, "resolve_role_config activity invoked");
+
+        let cwd = PathBuf::from(&input.cwd);
+        let mut config = config_from_toml(&input.config_toml, &cwd, None)
+            .map_err(|e| anyhow::anyhow!("failed to build config from TOML: {e}"))?;
+
+        codex_core::apply_role_to_config(&mut config, Some(&input.role_name))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to apply role '{}': {e}", input.role_name))?;
+
+        // Extract the merged TOML string from the config layer stack.
+        let merged_toml = toml::to_string(&config.config_layer_stack.effective_config())
+            .map_err(|e| anyhow::anyhow!("failed to serialize merged config: {e}"))?;
+
+        let output = ResolveRoleConfigOutput {
+            config_toml: merged_toml,
+            model: config.model.clone(),
+            instructions: config.base_instructions.clone(),
+            reasoning_effort: config.model_reasoning_effort,
+            reasoning_summary: config.model_reasoning_summary.unwrap_or_default(),
+            personality: config.personality,
+            developer_instructions: config.developer_instructions.clone(),
+            model_provider: Some(config.model_provider.clone()),
+        };
+
+        tracing::info!(
+            role = %input.role_name,
+            model = ?output.model,
+            "role config resolved"
+        );
+
+        Ok(output)
+    }
 }
 
 /// Core tool dispatch logic, independent of the Temporal `ActivityContext`.
@@ -427,6 +472,7 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
         model_info: &model_info,
         features: &config.features,
         web_search_mode: None,
+        session_source: SessionSource::Exec,
     });
     let builder = build_specs(&tools_config, None, None, &[]);
     let (_specs, registry) = builder.build();

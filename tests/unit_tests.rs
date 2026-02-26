@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use codex_temporal::entropy::{TemporalClock, TemporalRandomSource};
+use codex_temporal::entropy::TemporalRandomSource;
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
@@ -11,10 +11,9 @@ use codex_temporal::types::{
     SessionStatus, ToolExecOutput, UserTurnInput,
 };
 
-use codex_core::entropy::{Clock, RandomSource};
+use codex_core::entropy::RandomSource;
 use codex_core::{EventSink, StorageBackend};
 use codex_protocol::protocol::RolloutItem;
-use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
 // Entropy tests
@@ -48,25 +47,6 @@ fn temporal_random_f64_in_range() {
     }
 }
 
-#[test]
-fn temporal_clock_wall_time_advances() {
-    let epoch = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    let clock = TemporalClock::new(epoch);
-
-    let t1 = clock.wall_time();
-    let t2 = clock.wall_time();
-
-    assert!(t2 > t1, "wall_time should advance monotonically");
-}
-
-#[test]
-fn temporal_clock_unix_millis_reasonable() {
-    let epoch = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    let clock = TemporalClock::new(epoch);
-    let millis = clock.unix_millis();
-
-    assert!(millis >= 1_700_000_000_000, "should be after epoch, got {millis}");
-}
 
 // ---------------------------------------------------------------------------
 // EventSink tests
@@ -176,6 +156,10 @@ fn workflow_input_roundtrips_through_json() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -413,6 +397,10 @@ fn workflow_input_approval_policy_never_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -433,6 +421,10 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -466,6 +458,10 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -493,6 +489,10 @@ fn workflow_input_reasoning_effort_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -585,6 +585,10 @@ fn workflow_input_with_continued_state_roundtrips() {
             mcp_tools: std::collections::HashMap::new(),
             approval_policy_override: None,
         }),
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -854,6 +858,7 @@ async fn dispatch_with_experimental_tools(
         model_info: &model_info,
         features: &config.features,
         web_search_mode: None,
+        session_source: codex_protocol::protocol::SessionSource::Exec,
     });
     let builder = build_specs(&tools_config, None, None, &[]);
     let (_specs, registry) = builder.build();
@@ -1229,6 +1234,10 @@ fn workflow_input_developer_instructions_roundtrips() {
         developer_instructions: Some("Always respond in JSON format.".to_string()),
         model_provider: None,
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1273,6 +1282,10 @@ fn workflow_input_model_provider_roundtrips() {
         developer_instructions: None,
         model_provider: Some(provider.clone()),
         continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1482,8 +1495,10 @@ fn needs_approval(command: &[String], policy: AskForApproval) -> bool {
     } else {
         match policy {
             AskForApproval::Never => false,
-            AskForApproval::UnlessTrusted => true,
-            AskForApproval::OnRequest | AskForApproval::OnFailure => true,
+            AskForApproval::UnlessTrusted
+            | AskForApproval::OnRequest
+            | AskForApproval::OnFailure
+            | AskForApproval::Reject(_) => true,
         }
     }
 }
@@ -1807,4 +1822,329 @@ fn mcp_tool_name_detection() {
     // Malformed MCP names.
     assert_eq!(split_qualified_tool_name("mcp__server__"), None);
     assert_eq!(split_qualified_tool_name("mcp__"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-agent type serde tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_workflow_input_roundtrips_through_json() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let input = SessionWorkflowInput {
+        user_message: "Hello".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "Be helpful.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: SessionWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.user_message, "Hello");
+    assert_eq!(back.model, "gpt-4o");
+    assert_eq!(back.instructions, "Be helpful.");
+}
+
+#[test]
+fn session_workflow_input_backward_compat_defaults() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    // Minimal JSON without optional fields.
+    let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
+    let input: SessionWorkflowInput = serde_json::from_str(json).unwrap();
+
+    assert_eq!(input.user_message, "hi");
+    assert!(input.continued_state.is_none());
+    assert!(input.developer_instructions.is_none());
+    assert!(input.model_provider.is_none());
+}
+
+#[test]
+fn agent_workflow_input_backward_compat_without_new_fields() {
+    // JSON without the new multi-agent fields should deserialize fine.
+    let json = r#"{
+        "user_message": "test",
+        "model": "gpt-4o",
+        "instructions": "be helpful"
+    }"#;
+    let input: CodexWorkflowInput = serde_json::from_str(json).unwrap();
+
+    assert_eq!(input.role, "default");
+    assert!(input.config_toml.is_none());
+    assert!(input.project_context.is_none());
+    assert!(input.mcp_tools.is_empty());
+}
+
+#[test]
+fn agent_workflow_input_with_new_fields_roundtrips() {
+    let input = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+        role: "explorer".to_string(),
+        config_toml: Some("model = \"gpt-5\"".to_string()),
+        project_context: Some(ProjectContextOutput {
+            cwd: "/tmp".to_string(),
+            user_instructions: None,
+            git_info: None,
+        }),
+        mcp_tools: {
+            let mut m = std::collections::HashMap::new();
+            m.insert("mcp__echo__echo".to_string(), serde_json::json!({"name": "echo"}));
+            m
+        },
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.role, "explorer");
+    assert_eq!(back.config_toml.as_deref(), Some("model = \"gpt-5\""));
+    assert!(back.project_context.is_some());
+    assert_eq!(back.mcp_tools.len(), 1);
+}
+
+#[test]
+fn session_continue_as_new_state_roundtrips() {
+    use codex_temporal::types::SessionContinueAsNewState;
+    use codex_temporal::types::AgentRecord;
+    use codex_temporal::types::AgentLifecycle;
+
+    let state = SessionContinueAsNewState {
+        agents: vec![AgentRecord {
+            agent_id: "session/main".to_string(),
+            workflow_id: "session/main".to_string(),
+            role: "default".to_string(),
+            status: AgentLifecycle::Running,
+        }],
+        config_toml: "model = \"gpt-4o\"".to_string(),
+        project_context: ProjectContextOutput {
+            cwd: "/tmp".to_string(),
+            user_instructions: None,
+            git_info: None,
+        },
+        mcp_tools: std::collections::HashMap::new(),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: SessionContinueAsNewState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.agents.len(), 1);
+    assert_eq!(back.agents[0].agent_id, "session/main");
+    assert_eq!(back.config_toml, "model = \"gpt-4o\"");
+}
+
+#[test]
+fn spawn_agent_input_roundtrips() {
+    use codex_temporal::types::SpawnAgentInput;
+
+    let input = SpawnAgentInput {
+        role: "explorer".to_string(),
+        message: "Find the auth module".to_string(),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: SpawnAgentInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.role, "explorer");
+    assert_eq!(back.message, "Find the auth module");
+}
+
+#[test]
+fn agent_record_roundtrips() {
+    use codex_temporal::types::{AgentRecord, AgentLifecycle};
+
+    let record = AgentRecord {
+        agent_id: "session/explorer-1".to_string(),
+        workflow_id: "session/explorer-1".to_string(),
+        role: "explorer".to_string(),
+        status: AgentLifecycle::Completed,
+    };
+
+    let json = serde_json::to_string(&record).unwrap();
+    let back: AgentRecord = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.agent_id, "session/explorer-1");
+    assert_eq!(back.role, "explorer");
+    assert_eq!(back.status, AgentLifecycle::Completed);
+}
+
+#[test]
+fn agent_summary_roundtrips() {
+    use codex_temporal::types::{AgentSummary, AgentLifecycle};
+
+    let summary = AgentSummary {
+        agent_id: "session/main".to_string(),
+        role: "default".to_string(),
+        status: AgentLifecycle::Running,
+        iterations: 5,
+        token_usage: None,
+    };
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let back: AgentSummary = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.agent_id, "session/main");
+    assert_eq!(back.iterations, 5);
+    assert_eq!(back.status, AgentLifecycle::Running);
+}
+
+#[test]
+fn resolve_role_config_input_roundtrips() {
+    use codex_temporal::types::ResolveRoleConfigInput;
+
+    let input = ResolveRoleConfigInput {
+        config_toml: "model = \"gpt-4o\"".to_string(),
+        cwd: "/home/user/project".to_string(),
+        role_name: "explorer".to_string(),
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: ResolveRoleConfigInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.role_name, "explorer");
+    assert_eq!(back.cwd, "/home/user/project");
+}
+
+#[test]
+fn resolve_role_config_output_roundtrips() {
+    use codex_temporal::types::ResolveRoleConfigOutput;
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    let output = ResolveRoleConfigOutput {
+        config_toml: "model = \"gpt-5\"".to_string(),
+        model: Some("gpt-5".to_string()),
+        instructions: Some("Be an explorer.".to_string()),
+        reasoning_effort: Some(ReasoningEffort::Medium),
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: ResolveRoleConfigOutput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.model.as_deref(), Some("gpt-5"));
+    assert_eq!(back.reasoning_effort, Some(ReasoningEffort::Medium));
+}
+
+#[test]
+fn agent_lifecycle_serde() {
+    use codex_temporal::types::AgentLifecycle;
+
+    for status in [AgentLifecycle::Running, AgentLifecycle::Completed, AgentLifecycle::Failed] {
+        let json = serde_json::to_string(&status).unwrap();
+        let back: AgentLifecycle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+    }
+}
+
+#[test]
+fn session_workflow_output_roundtrips() {
+    use codex_temporal::types::{SessionWorkflowOutput, AgentSummary, AgentLifecycle};
+
+    let output = SessionWorkflowOutput {
+        agents: vec![
+            AgentSummary {
+                agent_id: "session/main".to_string(),
+                role: "default".to_string(),
+                status: AgentLifecycle::Completed,
+                iterations: 10,
+                token_usage: None,
+            },
+            AgentSummary {
+                agent_id: "session/explorer-1".to_string(),
+                role: "explorer".to_string(),
+                status: AgentLifecycle::Completed,
+                iterations: 3,
+                token_usage: None,
+            },
+        ],
+    };
+
+    let json = serde_json::to_string(&output).unwrap();
+    let back: SessionWorkflowOutput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.agents.len(), 2);
+    assert_eq!(back.agents[0].agent_id, "session/main");
+    assert_eq!(back.agents[1].role, "explorer");
+}
+
+#[test]
+fn backward_compat_type_aliases_work() {
+    // Verify the type aliases compile and are equivalent.
+    let _input: CodexWorkflowInput = CodexWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "test".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
+    };
+
+    let _output: CodexWorkflowOutput = CodexWorkflowOutput {
+        last_agent_message: None,
+        iterations: 0,
+        token_usage: None,
+    };
+}
+
+#[test]
+fn codex_workflow_input_converts_to_session_workflow_input() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let agent_input = CodexWorkflowInput {
+        user_message: "hello".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "be helpful".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: Some("dev note".to_string()),
+        model_provider: None,
+        continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
+    };
+
+    let session_input: SessionWorkflowInput = agent_input.into();
+
+    assert_eq!(session_input.user_message, "hello");
+    assert_eq!(session_input.model, "gpt-4o");
+    assert_eq!(
+        session_input.developer_instructions.as_deref(),
+        Some("dev note")
+    );
+    assert!(session_input.continued_state.is_none());
 }

@@ -14,7 +14,8 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 use codex_temporal::activities::CodexActivities;
 use codex_temporal::harness::CodexHarness;
-use codex_temporal::workflow::CodexWorkflow;
+use codex_temporal::session_workflow::SessionWorkflow;
+use codex_temporal::workflow::AgentWorkflow;
 
 const TASK_QUEUE: &str = "codex-temporal";
 
@@ -25,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Detect that and delegate immediately.
     // TODO: consider creating a slimmed-down binary for just the patch tool.
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|a| a.as_str()) == Some(codex_core::CODEX_APPLY_PATCH_ARG1) {
+    if args.get(1).map(|a| a.as_str()) == Some(codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1) {
         codex_apply_patch::main(); // diverges (-> !)
     }
 
@@ -73,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the worker with both workflow and activity registrations.
     let worker_options = WorkerOptions::new(TASK_QUEUE)
         .task_types(WorkerTaskTypes::all())
-        .register_workflow::<CodexWorkflow>()
+        .register_workflow::<SessionWorkflow>()
+        .register_workflow::<AgentWorkflow>()
         .register_workflow::<CodexHarness>()
         .register_activities(CodexActivities::new())
         .build();
