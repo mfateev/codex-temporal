@@ -547,6 +547,7 @@ fn continue_as_new_state_roundtrips_through_json() {
             total_tokens: 125,
         }),
         mcp_tools: std::collections::HashMap::new(),
+        approval_policy_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -582,6 +583,7 @@ fn workflow_input_with_continued_state_roundtrips() {
             cumulative_iterations: 10,
             cumulative_token_usage: None,
             mcp_tools: std::collections::HashMap::new(),
+            approval_policy_override: None,
         }),
     };
 
@@ -1658,6 +1660,7 @@ fn continue_as_new_state_with_mcp_tools() {
         cumulative_iterations: 2,
         cumulative_token_usage: None,
         mcp_tools: mcp_tools.clone(),
+        approval_policy_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1680,6 +1683,42 @@ fn continue_as_new_state_mcp_tools_default_when_missing() {
 
     let state: ContinueAsNewState = serde_json::from_str(json).unwrap();
     assert!(state.mcp_tools.is_empty());
+}
+
+#[test]
+fn continue_as_new_state_with_approval_policy_roundtrips() {
+    use codex_temporal::types::ContinueAsNewState;
+    use codex_protocol::protocol::AskForApproval;
+
+    let state = ContinueAsNewState {
+        rollout_items: vec![],
+        pending_user_turns: vec![],
+        cumulative_turn_count: 1,
+        cumulative_iterations: 2,
+        cumulative_token_usage: None,
+        mcp_tools: std::collections::HashMap::new(),
+        approval_policy_override: Some(AskForApproval::Never),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: ContinueAsNewState = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.approval_policy_override, Some(AskForApproval::Never));
+}
+
+#[test]
+fn continue_as_new_state_approval_policy_default_when_missing() {
+    use codex_temporal::types::ContinueAsNewState;
+
+    // JSON without approval_policy_override field — should default to None.
+    let json = r#"{
+        "rollout_items": [],
+        "pending_user_turns": [],
+        "cumulative_turn_count": 0,
+        "cumulative_iterations": 0
+    }"#;
+
+    let state: ContinueAsNewState = serde_json::from_str(json).unwrap();
+    assert!(state.approval_policy_override.is_none());
 }
 
 #[tokio::test]

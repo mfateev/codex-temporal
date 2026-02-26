@@ -28,8 +28,8 @@ use codex_core::{
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
 use codex_protocol::protocol::{
-    ContextCompactedEvent, Event, EventMsg, Op, ReviewDecision, TurnCompleteEvent,
-    TurnStartedEvent,
+    AskForApproval, ContextCompactedEvent, Event, EventMsg, Op, ReviewDecision,
+    TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
 };
 use codex_protocol::user_input::UserInput;
 use codex_protocol::ThreadId;
@@ -72,6 +72,12 @@ pub struct CodexWorkflow {
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
     compact_requested: bool,
+    /// Overridden approval policy (from `Op::OverrideTurnContext`).
+    /// `None` means use `input.approval_policy`.
+    approval_policy_override: Option<AskForApproval>,
+    /// Set by `Op::Interrupt`; checked between loop iterations and during
+    /// approval waits.
+    pub(crate) interrupt_requested: bool,
 }
 
 /// Extract the text message from user input items.
@@ -154,6 +160,7 @@ fn do_continue_as_new(
     turn_counter: u32,
     token_usage: Option<codex_protocol::protocol::TokenUsage>,
     mcp_tools: HashMap<String, serde_json::Value>,
+    approval_policy_override: Option<AskForApproval>,
 ) -> WorkflowResult<CodexWorkflowOutput> {
     let state = ContinueAsNewState {
         rollout_items: storage.items(),
@@ -162,6 +169,7 @@ fn do_continue_as_new(
         cumulative_iterations: total_iterations,
         cumulative_token_usage: token_usage,
         mcp_tools,
+        approval_policy_override,
     };
 
     let mut can_input = input.clone();
@@ -191,6 +199,8 @@ impl CodexWorkflow {
                 pending_approval: None,
                 shutdown_requested: false,
                 compact_requested: false,
+                approval_policy_override: state.approval_policy_override,
+                interrupt_requested: false,
                 input,
             };
         }
@@ -220,7 +230,15 @@ impl CodexWorkflow {
             pending_approval: None,
             shutdown_requested: false,
             compact_requested: false,
+            approval_policy_override: None,
+            interrupt_requested: false,
         }
+    }
+
+    /// Return the effective approval policy, preferring the override.
+    pub fn effective_approval_policy(&self) -> AskForApproval {
+        self.approval_policy_override
+            .unwrap_or(self.input.approval_policy)
     }
 
     // ----- signals -----
@@ -265,6 +283,16 @@ impl CodexWorkflow {
             }
             Op::Compact => {
                 self.compact_requested = true;
+            }
+            Op::OverrideTurnContext {
+                approval_policy, ..
+            } => {
+                if let Some(policy) = approval_policy {
+                    self.approval_policy_override = Some(policy);
+                }
+            }
+            Op::Interrupt => {
+                self.interrupt_requested = true;
             }
             _ => {
                 // Unknown/unhandled Op — ignore.
@@ -511,6 +539,8 @@ impl CodexWorkflow {
 
                         let pending = ctx.state(|s| s.user_turns.clone());
                         let turn_count = ctx.state(|s| s.turn_counter);
+                        let policy_override =
+                            ctx.state(|s| s.approval_policy_override);
                         break Some(do_continue_as_new(
                             &input,
                             &storage,
@@ -519,6 +549,7 @@ impl CodexWorkflow {
                             turn_count,
                             events.latest_token_usage(),
                             mcp_tools.clone(),
+                            policy_override,
                         ));
                     }
 
@@ -587,26 +618,45 @@ impl CodexWorkflow {
                         conversation_id.to_string(),
                         input.model_provider.clone(),
                     );
-                    let handler = TemporalToolHandler::new(
-                        ctx.clone(),
-                        events.clone(),
-                        turn_id.clone(),
-                        input.approval_policy,
-                        input.model.clone(),
-                        config.cwd.to_string_lossy().to_string(),
-                        Some(config_output.config_toml.clone()),
-                        mcp_tool_names.clone(),
-                    );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
                     let cancellation_token = CancellationToken::new();
                     let mut iterations = 0u32;
+                    let mut turn_aborted = false;
+
+                    // Reset interrupt flag at the start of each turn.
+                    ctx.state_mut(|s| s.interrupt_requested = false);
 
                     loop {
+                        // Check for interrupt at iteration boundary.
+                        let interrupted = ctx.state(|s| s.interrupt_requested);
+                        if interrupted {
+                            tracing::info!("interrupt requested, aborting turn");
+                            turn_aborted = true;
+                            ctx.state_mut(|s| s.interrupt_requested = false);
+                            break;
+                        }
+
                         if iterations >= MAX_ITERATIONS {
                             tracing::warn!("max iterations reached ({MAX_ITERATIONS}), stopping turn");
                             break;
                         }
+
+                        // Create handler inside the loop so it picks up the
+                        // effective approval policy (which may change mid-turn
+                        // via OverrideTurnContext signals).
+                        let effective_policy =
+                            ctx.state(|s| s.effective_approval_policy());
+                        let handler = TemporalToolHandler::new(
+                            ctx.clone(),
+                            events.clone(),
+                            turn_id.clone(),
+                            effective_policy,
+                            input.model.clone(),
+                            config.cwd.to_string_lossy().to_string(),
+                            Some(config_output.config_toml.clone()),
+                            mcp_tool_names.clone(),
+                        );
 
                         // Rebuild prompt from accumulated session history,
                         // prepending ephemeral context items (AGENTS.md +
@@ -675,20 +725,33 @@ impl CodexWorkflow {
                         }
                     }
 
-                    // Emit TurnComplete
-                    events.emit_event_sync(Event {
-                        id: turn_id.clone(),
-                        msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                            turn_id,
-                            last_agent_message: last_agent_message.clone(),
-                        }),
-                    });
+                    if turn_aborted {
+                        // Emit TurnAborted event.
+                        events.emit_event_sync(Event {
+                            id: turn_id.clone(),
+                            msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                                turn_id: Some(turn_id),
+                                reason: TurnAbortReason::Interrupted,
+                            }),
+                        });
+                    } else {
+                        // Emit TurnComplete
+                        events.emit_event_sync(Event {
+                            id: turn_id.clone(),
+                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                                turn_id,
+                                last_agent_message: last_agent_message.clone(),
+                            }),
+                        });
+                    }
 
                     // Check if server suggests continue-as-new (history too large).
                     if ctx.continue_as_new_suggested() {
                         tracing::info!("server suggested continue-as-new, triggering CAN");
                         let pending = ctx.state(|s| s.user_turns.clone());
                         let turn_count = ctx.state(|s| s.turn_counter);
+                        let policy_override =
+                            ctx.state(|s| s.approval_policy_override);
                         break Some(do_continue_as_new(
                             &input,
                             &storage,
@@ -697,6 +760,7 @@ impl CodexWorkflow {
                             turn_count,
                             events.latest_token_usage(),
                             mcp_tools.clone(),
+                            policy_override,
                         ));
                     }
 

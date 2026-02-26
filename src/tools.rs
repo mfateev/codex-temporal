@@ -187,15 +187,27 @@ impl ToolCallHandler for TemporalToolHandler {
                 };
                 events.emit_event_sync(approval_event);
 
-                // 3. Wait for approval decision
+                // 3. Wait for approval decision or interrupt
                 ctx.wait_condition(|s| {
                     s.pending_approval
                         .as_ref()
                         .map_or(true, |p| p.decision.is_some())
+                        || s.interrupt_requested
                 })
                 .await;
 
-                // 4. Check decision
+                // 4. Check for interrupt first — return a denied-style
+                // response rather than Err(TurnAborted) to avoid panicking
+                // codex-core's in-flight tool future drain. The workflow
+                // loop will catch `interrupt_requested` at the iteration
+                // boundary and emit TurnAborted.
+                let interrupted = ctx.state(|s| s.interrupt_requested);
+                if interrupted {
+                    ctx.state_mut(|s| s.pending_approval = None);
+                    return Ok(denied_response(call_id));
+                }
+
+                // 5. Check decision
                 let approved = ctx.state_mut(|s| {
                     let decision = s
                         .pending_approval

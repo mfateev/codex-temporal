@@ -1491,6 +1491,184 @@ args = ["{}"]
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+/// Test: `Op::OverrideTurnContext` changes approval policy mid-workflow.
+///
+/// Start with `OnRequest` policy → first turn (model only, no tool use) →
+/// send `OverrideTurnContext { approval_policy: Some(Never) }` →
+/// second turn with tool use → verify no `ExecApprovalRequest`, just
+/// `TurnComplete` with tool output.
+async fn policy_amendment_mid_workflow(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Turn 1: model-only (no tool use expected).
+    session
+        .submit(user_turn_op("Say hello in one word."))
+        .await
+        .expect("submit failed");
+
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for TurnComplete on turn 1");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(&event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    // Override approval policy to Never (no approval required).
+    session
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await
+        .expect("OverrideTurnContext submit failed");
+
+    // Turn 2: ask the model to run a tool.
+    session
+        .submit(user_turn_op(
+            "Use shell to run 'echo policy_amended_ok' and tell me the output.",
+        ))
+        .await
+        .expect("submit failed for turn 2");
+
+    // We should NOT see ExecApprovalRequest. We should get TurnComplete.
+    let mut saw_approval_request = false;
+    let timeout2 = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout2 {
+            panic!("timed out waiting for TurnComplete on turn 2");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ExecApprovalRequest(_) => {
+                saw_approval_request = true;
+                // This shouldn't happen — but don't panic, auto-approve and
+                // fail at the end so we get a clean test failure.
+                eprintln!("  WARNING: got ExecApprovalRequest despite Never policy");
+                // Still approve to avoid blocking.
+                if let EventMsg::ExecApprovalRequest(req) = &event.msg {
+                    session
+                        .submit(Op::ExecApproval {
+                            id: req.call_id.clone(),
+                            turn_id: None,
+                            decision: ReviewDecision::Approved,
+                        })
+                        .await
+                        .ok();
+                }
+            }
+            EventMsg::TurnComplete(tc) => {
+                assert!(
+                    tc.last_agent_message.is_some(),
+                    "expected non-empty agent message"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !saw_approval_request,
+        "policy was overridden to Never, but ExecApprovalRequest was still emitted"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+/// Test: `Op::Interrupt` cancels the current in-progress turn.
+///
+/// Submit a tool-using turn → wait for `TurnStarted` → send `Op::Interrupt` →
+/// verify `TurnAborted(Interrupted)` event. Accept `TurnComplete` as valid
+/// if the model finishes before interrupt arrives (inherent race).
+async fn interrupt_cancels_turn(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    session
+        .submit(user_turn_op(
+            "Use shell to run 'echo interrupt_test' and tell me the output.",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Wait for TurnStarted, then immediately send interrupt.
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for TurnStarted");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(&event.msg, EventMsg::TurnStarted(_)) {
+            break;
+        }
+    }
+
+    // Send interrupt.
+    session
+        .submit(Op::Interrupt)
+        .await
+        .expect("interrupt submit failed");
+
+    // Wait for TurnAborted or TurnComplete (race condition is valid).
+    let mut saw_turn_aborted = false;
+    let mut saw_turn_complete = false;
+    let timeout2 = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout2 {
+            panic!("timed out waiting for TurnAborted or TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::TurnAborted(aborted) => {
+                assert_eq!(
+                    aborted.reason,
+                    codex_protocol::protocol::TurnAbortReason::Interrupted,
+                    "expected Interrupted reason"
+                );
+                saw_turn_aborted = true;
+                break;
+            }
+            EventMsg::TurnComplete(_) => {
+                // Model finished before interrupt arrived — this is a valid
+                // race condition outcome.
+                eprintln!("  note: model completed before interrupt took effect (race)");
+                saw_turn_complete = true;
+                break;
+            }
+            EventMsg::ExecApprovalRequest(req) => {
+                // The interrupt should cancel the approval wait, but if it
+                // arrives before, auto-approve to avoid deadlock.
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .ok();
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_turn_aborted || saw_turn_complete,
+        "expected TurnAborted or TurnComplete"
+    );
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -1684,6 +1862,12 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: mcp_tool_call_e2e ---");
     mcp_tool_call_e2e(&client).await;
+
+    eprintln!("--- test: policy_amendment_mid_workflow ---");
+    policy_amendment_mid_workflow(&client).await;
+
+    eprintln!("--- test: interrupt_cancels_turn ---");
+    interrupt_cancels_turn(&client).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.
