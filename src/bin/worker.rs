@@ -29,6 +29,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         codex_apply_patch::main(); // diverges (-> !)
     }
 
+    if std::env::var("OPENAI_API_KEY").map_or(true, |v| v.is_empty()) {
+        eprintln!(
+            "Error: OPENAI_API_KEY environment variable is not set.\n\n\
+             The worker needs an OpenAI API key to make model calls.\n\
+             Get one at https://platform.openai.com/api-keys\n\n\
+             Usage: OPENAI_API_KEY=\"sk-...\" cargo run --bin codex-temporal-worker"
+        );
+        std::process::exit(1);
+    }
+
     // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
