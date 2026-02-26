@@ -1391,17 +1391,8 @@ async fn command_safety_auto_approves_safe_commands(client: &Client) {
 }
 
 async fn mcp_tool_call_e2e(client: &Client) {
-    // The bash MCP echo server script requires jq for JSON parsing.
-    if std::process::Command::new("jq")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("  skipping mcp_tool_call_e2e: jq not installed");
-        return;
-    }
-
     // Write a bash stdio MCP echo server to a temp file.
+    // Uses pure bash regex (BASH_REMATCH) instead of jq for JSON parsing.
     let tmp_dir = std::env::temp_dir().join(format!("codex-mcp-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
 
@@ -1409,11 +1400,21 @@ async fn mcp_tool_call_e2e(client: &Client) {
     std::fs::write(
         &script_path,
         r#"#!/usr/bin/env bash
-# Minimal MCP stdio echo server for testing.
+# Minimal MCP stdio echo server for testing — no external dependencies.
 while IFS= read -r line; do
     [ -z "$line" ] && continue
-    method=$(echo "$line" | jq -r '.method // empty')
-    id=$(echo "$line" | jq '.id')
+    # Extract "method" value (string).
+    if [[ "$line" =~ \"method\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+        method="${BASH_REMATCH[1]}"
+    else
+        method=""
+    fi
+    # Extract "id" value (number).
+    if [[ "$line" =~ \"id\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
+        id="${BASH_REMATCH[1]}"
+    else
+        id=""
+    fi
     case "$method" in
         initialize)
             echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"echo-test\",\"version\":\"0.1.0\"}}}"
@@ -1424,11 +1425,15 @@ while IFS= read -r line; do
             echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echoes the message back\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\",\"description\":\"Message to echo\"}},\"required\":[\"message\"]}}]}}"
             ;;
         tools/call)
-            msg=$(echo "$line" | jq -r '.params.arguments.message // "no message"')
+            if [[ "$line" =~ \"message\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+                msg="${BASH_REMATCH[1]}"
+            else
+                msg="no message"
+            fi
             echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"echo: $msg\"}]}}"
             ;;
         *)
-            if [ "$id" != "null" ] && [ -n "$id" ]; then
+            if [ -n "$id" ]; then
                 echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
             fi
             ;;
