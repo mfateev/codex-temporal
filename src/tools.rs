@@ -19,7 +19,9 @@ use codex_core::error::CodexErr;
 use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
 use codex_protocol::models::{FunctionCallOutputPayload, ResponseInputItem};
-use codex_protocol::protocol::{AskForApproval, Event, EventMsg, ExecApprovalRequestEvent};
+use codex_protocol::protocol::{
+    AskForApproval, ApplyPatchApprovalRequestEvent, Event, EventMsg, ExecApprovalRequestEvent,
+};
 use codex_protocol::request_user_input::{RequestUserInputArgs, RequestUserInputEvent};
 use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
 use codex_shell_command::is_safe_command::is_known_safe_command;
@@ -28,7 +30,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::activities::CodexActivities;
 use crate::sink::BufferEventSink;
-use crate::types::{McpToolCallInput, PendingApproval, PendingUserInput, ToolExecInput};
+use crate::types::{
+    McpToolCallInput, PendingApproval, PendingPatchApproval, PendingUserInput, ToolExecInput,
+};
 use crate::workflow::AgentWorkflow;
 
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
@@ -202,6 +206,93 @@ impl ToolCallHandler for TemporalToolHandler {
                     call_id,
                     output: FunctionCallOutputPayload::from_text(output),
                 });
+            }
+
+            // apply_patch — use the dedicated ApplyPatchApprovalRequest event
+            // instead of the generic ExecApprovalRequest so the client can
+            // display file-level changes.
+            if tool_name == "apply_patch" {
+                // Extract the patch text from the arguments JSON.
+                let patch_text: String = serde_json::from_str::<serde_json::Value>(&arguments)
+                    .ok()
+                    .and_then(|v| v.get("patch")?.as_str().map(String::from))
+                    .unwrap_or_else(|| arguments.clone());
+
+                // Set pending state.
+                ctx.state_mut(|s| {
+                    s.pending_patch_approval = Some(PendingPatchApproval {
+                        call_id: call_id.clone(),
+                        decision: None,
+                    });
+                });
+
+                // Emit ApplyPatchApprovalRequest event.
+                events.emit_event_sync(Event {
+                    id: turn_id.clone(),
+                    msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+                        call_id: call_id.clone(),
+                        turn_id: turn_id.clone(),
+                        changes: std::collections::HashMap::new(),
+                        reason: Some(patch_text),
+                        grant_root: None,
+                    }),
+                });
+
+                // Wait for decision or interrupt.
+                ctx.wait_condition(|s| {
+                    s.pending_patch_approval
+                        .as_ref()
+                        .map_or(true, |p| p.decision.is_some())
+                        || s.interrupt_requested
+                })
+                .await;
+
+                // Handle interrupt.
+                let interrupted = ctx.state(|s| s.interrupt_requested);
+                if interrupted {
+                    ctx.state_mut(|s| s.pending_patch_approval = None);
+                    return Ok(denied_response(call_id));
+                }
+
+                // Check decision.
+                let approved = ctx.state_mut(|s| {
+                    let decision = s
+                        .pending_patch_approval
+                        .as_ref()
+                        .and_then(|p| p.decision)
+                        .unwrap_or(false);
+                    s.pending_patch_approval = None;
+                    decision
+                });
+
+                if !approved {
+                    return Ok(denied_response(call_id));
+                }
+
+                // Approved — fall through to execute via activity.
+                let input = ToolExecInput {
+                    tool_name,
+                    call_id: call_id.clone(),
+                    arguments,
+                    model,
+                    cwd,
+                    config_toml,
+                };
+
+                let opts = ActivityOptions {
+                    start_to_close_timeout: Some(Duration::from_secs(600)),
+                    heartbeat_timeout: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                };
+
+                let output = ctx
+                    .start_activity(CodexActivities::tool_exec, input, opts)
+                    .await
+                    .map_err(|e| {
+                        CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
+                    })?;
+
+                return Ok(output.into_response_input_item());
             }
 
             // Determine whether this call needs user approval based on a

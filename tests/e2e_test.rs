@@ -1787,6 +1787,104 @@ async fn request_user_input_flow(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: apply_patch tool calls use ApplyPatchApprovalRequest instead of
+/// ExecApprovalRequest.
+///
+/// 1. Submit a prompt asking the model to use `apply_patch`.
+/// 2. Wait for `ApplyPatchApprovalRequest` event.
+/// 3. Approve via `Op::PatchApproval`.
+/// 4. Wait for `TurnComplete`.
+async fn patch_approval_flow(client: &Client) {
+    let session = new_session(client, "gpt-4o");
+
+    session
+        .submit(user_turn_op(
+            "Use the apply_patch tool to create a new file /tmp/codex-patch-test.txt with content 'hello patch'. \
+             The patch argument should be a unified diff that creates this file. \
+             Do not use any other tool.",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Wait for ApplyPatchApprovalRequest event (NOT ExecApprovalRequest).
+    let call_id;
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for ApplyPatchApprovalRequest");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ApplyPatchApprovalRequest(req) => {
+                call_id = req.call_id.clone();
+                // Verify the event has a reason (patch text).
+                assert!(
+                    req.reason.is_some(),
+                    "expected reason (patch text) in ApplyPatchApprovalRequest"
+                );
+                break;
+            }
+            EventMsg::ExecApprovalRequest(req) => {
+                // If an ExecApprovalRequest arrives for something other than
+                // apply_patch, auto-approve it and keep waiting.
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("approval failed");
+            }
+            _ => {}
+        }
+    }
+
+    // Approve via PatchApproval.
+    session
+        .submit(Op::PatchApproval {
+            id: call_id,
+            decision: ReviewDecision::Approved,
+        })
+        .await
+        .expect("patch approval submit failed");
+
+    // Wait for TurnComplete (auto-approve any further requests).
+    let timeout2 = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout2 {
+            panic!("timed out waiting for TurnComplete after patch approval");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::TurnComplete(_) => break,
+            EventMsg::ApplyPatchApprovalRequest(req) => {
+                session
+                    .submit(Op::PatchApproval {
+                        id: req.call_id.clone(),
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("subsequent patch approval failed");
+            }
+            EventMsg::ExecApprovalRequest(req) => {
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("subsequent approval failed");
+            }
+            _ => {}
+        }
+    }
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Session workflow (multi-agent) tests
 // ---------------------------------------------------------------------------
@@ -2142,6 +2240,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: request_user_input_flow ---");
     request_user_input_flow(&client).await;
+
+    eprintln!("--- test: patch_approval_flow ---");
+    patch_approval_flow(&client).await;
 
     eprintln!("--- test: session_spawns_main_agent ---");
     session_spawns_main_agent(&client).await;

@@ -51,7 +51,8 @@ use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
-    McpDiscoverOutput, PendingApproval, PendingUserInput, ProjectContextOutput, UserTurnInput,
+    McpDiscoverOutput, PendingApproval, PendingPatchApproval, PendingUserInput,
+    ProjectContextOutput, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -70,6 +71,9 @@ pub struct AgentWorkflow {
     /// Pending `request_user_input` tool call (set by tool handler, resolved
     /// by `Op::UserInputAnswer` signal).
     pub(crate) pending_user_input: Option<PendingUserInput>,
+    /// Pending `apply_patch` approval (set by tool handler, resolved by
+    /// `Op::PatchApproval` signal).
+    pub(crate) pending_patch_approval: Option<PendingPatchApproval>,
     /// When true the workflow will exit after the current turn completes.
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
@@ -200,6 +204,7 @@ impl AgentWorkflow {
                 events: Arc::new(BufferEventSink::new()),
                 pending_approval: None,
                 pending_user_input: None,
+                pending_patch_approval: None,
                 shutdown_requested: false,
                 compact_requested: false,
                 approval_policy_override: state.approval_policy_override,
@@ -232,6 +237,7 @@ impl AgentWorkflow {
             turn_counter,
             pending_approval: None,
             pending_user_input: None,
+            pending_patch_approval: None,
             shutdown_requested: false,
             compact_requested: false,
             approval_policy_override: None,
@@ -294,6 +300,19 @@ impl AgentWorkflow {
             }
             Op::Compact => {
                 self.compact_requested = true;
+            }
+            Op::PatchApproval { id, decision, .. } => {
+                if let Some(ref mut pa) = self.pending_patch_approval {
+                    if pa.call_id == id {
+                        let approved = matches!(
+                            decision,
+                            ReviewDecision::Approved
+                                | ReviewDecision::ApprovedForSession
+                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                        );
+                        pa.decision = Some(approved);
+                    }
+                }
             }
             Op::OverrideTurnContext {
                 approval_policy, ..
