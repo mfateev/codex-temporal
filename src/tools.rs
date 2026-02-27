@@ -20,6 +20,8 @@ use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
 use codex_protocol::models::{FunctionCallOutputPayload, ResponseInputItem};
 use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::protocol::{
     AskForApproval, ApplyPatchApprovalRequestEvent, Event, EventMsg, ExecApprovalRequestEvent,
 };
@@ -32,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::activities::CodexActivities;
 use crate::sink::BufferEventSink;
 use crate::types::{
-    McpToolCallInput, PendingApproval, PendingElicitation, PendingPatchApproval, PendingUserInput,
-    ToolExecInput,
+    McpToolCallInput, PendingApproval, PendingDynamicTool, PendingElicitation,
+    PendingPatchApproval, PendingUserInput, ToolExecInput,
 };
 use crate::workflow::AgentWorkflow;
 
@@ -59,6 +61,8 @@ pub struct TemporalToolHandler {
     /// Set of qualified MCP tool names (e.g. "mcp__echo__echo").
     /// Tool calls matching these names bypass approval and route to MCP.
     mcp_tool_names: HashSet<String>,
+    /// Set of dynamic tool names (client-defined tools handled via signal/wait).
+    dynamic_tool_names: HashSet<String>,
 }
 
 impl TemporalToolHandler {
@@ -71,6 +75,7 @@ impl TemporalToolHandler {
         cwd: String,
         config_toml: Option<String>,
         mcp_tool_names: HashSet<String>,
+        dynamic_tool_names: HashSet<String>,
     ) -> Self {
         Self {
             ctx,
@@ -81,6 +86,7 @@ impl TemporalToolHandler {
             cwd,
             config_toml,
             mcp_tool_names,
+            dynamic_tool_names,
         }
     }
 }
@@ -109,6 +115,7 @@ impl ToolCallHandler for TemporalToolHandler {
         let cwd = self.cwd.clone();
         let config_toml = self.config_toml.clone();
         let is_mcp_tool = self.mcp_tool_names.contains(&tool_name);
+        let is_dynamic_tool = self.dynamic_tool_names.contains(&tool_name);
 
         // Parse command from arguments for the approval request event.
         let command: Vec<String> = serde_json::from_str(&arguments)
@@ -249,6 +256,85 @@ impl ToolCallHandler for TemporalToolHandler {
                     call_id,
                     output: FunctionCallOutputPayload::from_text(output),
                 });
+            }
+
+            // Dynamic tools — intercept and handle via signal/wait.
+            if is_dynamic_tool {
+                // Parse arguments as JSON value.
+                let args_value: serde_json::Value =
+                    serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null);
+
+                // Set pending state.
+                ctx.state_mut(|s| {
+                    s.pending_dynamic_tool = Some(PendingDynamicTool {
+                        call_id: call_id.clone(),
+                        response: None,
+                    });
+                });
+
+                // Emit DynamicToolCallRequest event.
+                events.emit_event_sync(Event {
+                    id: turn_id.clone(),
+                    msg: EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
+                        call_id: call_id.clone(),
+                        turn_id: turn_id.clone(),
+                        tool: tool_name,
+                        arguments: args_value,
+                    }),
+                });
+
+                // Wait for response or interrupt.
+                ctx.wait_condition(|s| {
+                    s.pending_dynamic_tool
+                        .as_ref()
+                        .map_or(true, |p| p.response.is_some())
+                        || s.interrupt_requested
+                })
+                .await;
+
+                // Handle interrupt.
+                let interrupted = ctx.state(|s| s.interrupt_requested);
+                if interrupted {
+                    ctx.state_mut(|s| s.pending_dynamic_tool = None);
+                    return Ok(denied_response(call_id));
+                }
+
+                // Extract response.
+                let response = ctx.state_mut(|s| {
+                    let resp = s
+                        .pending_dynamic_tool
+                        .as_ref()
+                        .and_then(|p| p.response.clone());
+                    s.pending_dynamic_tool = None;
+                    resp
+                });
+
+                // Convert DynamicToolResponse to FunctionCallOutput.
+                if let Some(resp) = response {
+                    let text = resp
+                        .content_items
+                        .iter()
+                        .filter_map(|item| {
+                            use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+                            match item {
+                                DynamicToolCallOutputContentItem::InputText { text } => {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(ResponseInputItem::FunctionCallOutput {
+                        call_id,
+                        output: FunctionCallOutputPayload {
+                            body: FunctionCallOutputBody::Text(text),
+                            success: Some(resp.success),
+                        },
+                    });
+                }
+
+                return Ok(denied_response(call_id));
             }
 
             // apply_patch — use the dedicated ApplyPatchApprovalRequest event

@@ -83,6 +83,7 @@ fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -353,6 +354,7 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -380,6 +382,7 @@ fn new_session_with_effort(
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -457,6 +460,7 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     TemporalAgentSession::new(client.clone(), workflow_id, base_input)
 }
@@ -797,6 +801,7 @@ async fn session_resume(client: &Client) {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let resumed = TemporalAgentSession::resume(client.clone(), session_id.clone(), base_input);
 
@@ -1056,6 +1061,7 @@ shell_tool = true
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -1149,6 +1155,7 @@ sandbox_mode = "read-only"
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -2052,6 +2059,114 @@ async fn patch_approval_flow(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: dynamic tools — client-defined tools handled via signal/wait.
+///
+/// 1. Create session with a dynamic tool spec (`get_weather` with `location` param).
+/// 2. Prompt model to use it.
+/// 3. Wait for `DynamicToolCallRequest` event.
+/// 4. Respond with `DynamicToolResponse` containing weather info.
+/// 5. Assert TurnComplete.
+async fn dynamic_tool_flow(client: &Client) {
+    use codex_protocol::dynamic_tools::{
+        DynamicToolCallOutputContentItem, DynamicToolResponse, DynamicToolSpec,
+    };
+
+    let workflow_id = format!("e2e-dynamic-{}", uuid::Uuid::new_v4());
+    let base_input = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful assistant. Be concise.".to_string(),
+        approval_policy: AskForApproval::Never,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: vec![DynamicToolSpec {
+            name: "get_weather".to_string(),
+            description: "Get the current weather for a location".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name"
+                    }
+                },
+                "required": ["location"]
+            }),
+        }],
+    };
+    let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
+
+    session
+        .submit(user_turn_op_with_model(
+            "Use the get_weather tool to check the weather in Paris and tell me the result.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Wait for DynamicToolCallRequest.
+    let call_id;
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for DynamicToolCallRequest");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::DynamicToolCallRequest(req) => {
+                call_id = req.call_id.clone();
+                assert_eq!(req.tool, "get_weather", "expected get_weather tool");
+                break;
+            }
+            EventMsg::ExecApprovalRequest(req) => {
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("approval failed");
+            }
+            _ => {}
+        }
+    }
+
+    // Respond with DynamicToolResponse.
+    session
+        .submit(Op::DynamicToolResponse {
+            id: call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "Sunny, 72°F in Paris".to_string(),
+                }],
+                success: true,
+            },
+        })
+        .await
+        .expect("dynamic tool response failed");
+
+    // Wait for TurnComplete.
+    let msg = wait_for_turn_complete(&session).await;
+    assert!(msg.is_some(), "expected agent message");
+    let response = msg.unwrap().to_lowercase();
+    assert!(
+        response.contains("sunny") || response.contains("72") || response.contains("paris"),
+        "expected weather info in response, got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Session workflow (multi-agent) tests
 // ---------------------------------------------------------------------------
@@ -2416,6 +2531,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: patch_approval_flow ---");
     patch_approval_flow(&client).await;
+
+    eprintln!("--- test: dynamic_tool_flow ---");
+    dynamic_tool_flow(&client).await;
 
     eprintln!("--- test: session_spawns_main_agent ---");
     session_spawns_main_agent(&client).await;

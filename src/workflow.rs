@@ -52,8 +52,8 @@ use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
-    McpDiscoverOutput, PendingApproval, PendingElicitation, PendingPatchApproval, PendingUserInput,
-    ProjectContextOutput, UserTurnInput,
+    McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
+    PendingPatchApproval, PendingUserInput, ProjectContextOutput, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -78,6 +78,9 @@ pub struct AgentWorkflow {
     /// Pending MCP elicitation (set by tool handler, resolved by
     /// `Op::ResolveElicitation` signal).
     pub(crate) pending_elicitation: Option<PendingElicitation>,
+    /// Pending dynamic tool call (set by tool handler, resolved by
+    /// `Op::DynamicToolResponse` signal).
+    pub(crate) pending_dynamic_tool: Option<PendingDynamicTool>,
     /// When true the workflow will exit after the current turn completes.
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
@@ -227,6 +230,7 @@ impl AgentWorkflow {
                 pending_user_input: None,
                 pending_patch_approval: None,
                 pending_elicitation: None,
+                pending_dynamic_tool: None,
                 shutdown_requested: false,
                 compact_requested: false,
                 approval_policy_override: state.approval_policy_override,
@@ -265,6 +269,7 @@ impl AgentWorkflow {
             pending_user_input: None,
             pending_patch_approval: None,
             pending_elicitation: None,
+            pending_dynamic_tool: None,
             shutdown_requested: false,
             compact_requested: false,
             approval_policy_override: None,
@@ -367,6 +372,13 @@ impl AgentWorkflow {
                 }
                 if let Some(p) = personality {
                     self.personality_override = Some(p);
+                }
+            }
+            Op::DynamicToolResponse { id, response } => {
+                if let Some(ref mut pdt) = self.pending_dynamic_tool {
+                    if pdt.call_id == id {
+                        pdt.response = Some(response);
+                    }
                 }
             }
             Op::ResolveElicitation {
@@ -599,7 +611,14 @@ impl AgentWorkflow {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
-        let builder = build_specs(&tools_config, rmcp_tools, None, &[]);
+        // Collect dynamic tool names for the tool handler to intercept.
+        let dynamic_tool_names: HashSet<String> = input
+            .dynamic_tools
+            .iter()
+            .map(|dt| dt.name.clone())
+            .collect();
+
+        let builder = build_specs(&tools_config, rmcp_tools, None, &input.dynamic_tools);
         let (configured_specs, _registry) = builder.build();
         let tools: Vec<ToolSpec> = configured_specs.into_iter().map(|cs| cs.spec).collect();
         let base_instructions = BaseInstructions {
@@ -808,6 +827,7 @@ impl AgentWorkflow {
                             config.cwd.to_string_lossy().to_string(),
                             Some(config_output.config_toml.clone()),
                             mcp_tool_names.clone(),
+                            dynamic_tool_names.clone(),
                         );
 
                         // Rebuild prompt from accumulated session history,

@@ -160,6 +160,7 @@ fn workflow_input_roundtrips_through_json() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -401,6 +402,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -425,6 +427,7 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -462,6 +465,7 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -493,6 +497,7 @@ fn workflow_input_reasoning_effort_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -597,6 +602,7 @@ fn workflow_input_with_continued_state_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1246,6 +1252,7 @@ fn workflow_input_developer_instructions_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1294,6 +1301,7 @@ fn workflow_input_model_provider_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1930,6 +1938,7 @@ fn agent_workflow_input_with_new_fields_roundtrips() {
             m.insert("mcp__echo__echo".to_string(), serde_json::json!({"name": "echo"}));
             m
         },
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -2127,6 +2136,7 @@ fn backward_compat_type_aliases_work() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let _output: CodexWorkflowOutput = CodexWorkflowOutput {
@@ -2156,6 +2166,7 @@ fn codex_workflow_input_converts_to_session_workflow_input() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let session_input: SessionWorkflowInput = agent_input.into();

@@ -287,6 +287,15 @@ pub struct PendingPatchApproval {
     pub decision: Option<bool>,
 }
 
+/// Pending dynamic tool call state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingDynamicTool {
+    /// The call_id for the dynamic tool call.
+    pub call_id: String,
+    /// Set when the client responds via `Op::DynamicToolResponse`.
+    pub response: Option<codex_protocol::dynamic_tools::DynamicToolResponse>,
+}
+
 /// Pending MCP elicitation state tracked inside the workflow.
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
@@ -401,6 +410,9 @@ pub struct AgentWorkflowInput {
     /// Pre-discovered MCP tools from SessionWorkflow.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
+    /// Client-defined dynamic tools (handled via signal/wait).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
 }
 
 fn default_role() -> String {
