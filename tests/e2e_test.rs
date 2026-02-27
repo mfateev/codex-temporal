@@ -10,7 +10,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use codex_core::AgentSession;
-use codex_protocol::config_types::{ReasoningSummary, WebSearchMode};
+use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
     AskForApproval, EventMsg, Op, ReviewDecision, SandboxPolicy,
@@ -1787,6 +1787,61 @@ async fn request_user_input_flow(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: `Op::OverrideTurnContext` with model/effort/summary/personality fields.
+///
+/// 1. Start with a model-only turn.
+/// 2. Send `OverrideTurnContext { personality: Some(Friendly) }`.
+/// 3. Submit second turn — verify the override doesn't break anything
+///    and the model responds successfully.
+async fn override_turn_context_flow(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Turn 1: baseline turn.
+    session
+        .submit(user_turn_op_with_model(
+            "Say hello in one word.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 1 failed");
+
+    let msg1 = wait_for_turn_complete(&session).await;
+    assert!(msg1.is_some(), "expected agent message from turn 1");
+
+    // Override personality to Friendly for subsequent turns.
+    session
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: None,
+            personality: Some(Personality::Friendly),
+        })
+        .await
+        .expect("OverrideTurnContext submit failed");
+
+    // Turn 2: the personality override should be active.
+    session
+        .submit(user_turn_op_with_model(
+            "Say goodbye in one sentence.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 2 failed");
+
+    let msg2 = wait_for_turn_complete(&session).await;
+    assert!(
+        msg2.is_some(),
+        "expected agent message from turn 2 with personality override"
+    );
+
+    drain_shutdown(&session).await;
+}
+
 /// Test: apply_patch tool calls use ApplyPatchApprovalRequest instead of
 /// ExecApprovalRequest.
 ///
@@ -2240,6 +2295,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: request_user_input_flow ---");
     request_user_input_flow(&client).await;
+
+    eprintln!("--- test: override_turn_context_flow ---");
+    override_turn_context_flow(&client).await;
 
     eprintln!("--- test: patch_approval_flow ---");
     patch_approval_flow(&client).await;

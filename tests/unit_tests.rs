@@ -548,6 +548,10 @@ fn continue_as_new_state_roundtrips_through_json() {
         }),
         mcp_tools: std::collections::HashMap::new(),
         approval_policy_override: None,
+        model_override: None,
+        effort_override: None,
+        summary_override: None,
+        personality_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -584,6 +588,10 @@ fn workflow_input_with_continued_state_roundtrips() {
             cumulative_token_usage: None,
             mcp_tools: std::collections::HashMap::new(),
             approval_policy_override: None,
+            model_override: None,
+            effort_override: None,
+            summary_override: None,
+            personality_override: None,
         }),
         role: "default".to_string(),
         config_toml: None,
@@ -1682,6 +1690,10 @@ fn continue_as_new_state_with_mcp_tools() {
         cumulative_token_usage: None,
         mcp_tools: mcp_tools.clone(),
         approval_policy_override: None,
+        model_override: None,
+        effort_override: None,
+        summary_override: None,
+        personality_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1719,6 +1731,10 @@ fn continue_as_new_state_with_approval_policy_roundtrips() {
         cumulative_token_usage: None,
         mcp_tools: std::collections::HashMap::new(),
         approval_policy_override: Some(AskForApproval::Never),
+        model_override: None,
+        effort_override: None,
+        summary_override: None,
+        personality_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();

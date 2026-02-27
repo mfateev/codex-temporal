@@ -593,4 +593,16 @@ pub struct ContinueAsNewState {
     /// Overridden approval policy (from `Op::OverrideTurnContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy_override: Option<AskForApproval>,
+    /// Overridden model slug (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Overridden reasoning effort (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_override: Option<Option<ReasoningEffort>>,
+    /// Overridden reasoning summary (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_override: Option<ReasoningSummary>,
+    /// Overridden personality (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_override: Option<Personality>,
 }
