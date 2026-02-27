@@ -1603,6 +1603,7 @@ fn mcp_tool_call_output_serde_roundtrip_ok() {
         result: Ok(serde_json::json!({
             "content": [{"type": "text", "text": "hello back"}],
         })),
+        elicitation: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -1618,6 +1619,7 @@ fn mcp_tool_call_output_serde_roundtrip_err() {
     let output = McpToolCallOutput {
         call_id: "call-789".to_string(),
         result: Err("tool not found".to_string()),
+        elicitation: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -1637,6 +1639,7 @@ fn mcp_tool_call_output_into_response_item_ok() {
         result: Ok(serde_json::json!({
             "content": [{"type": "text", "text": "result text"}],
         })),
+        elicitation: None,
     };
 
     let item = output.into_response_input_item();
@@ -1659,6 +1662,7 @@ fn mcp_tool_call_output_into_response_item_err() {
     let output = McpToolCallOutput {
         call_id: "call-err".to_string(),
         result: Err("server crashed".to_string()),
+        elicitation: None,
     };
 
     let item = output.into_response_input_item();

@@ -192,6 +192,21 @@ pub struct McpToolCallOutput {
     pub call_id: String,
     /// Serialized `codex_protocol::mcp::CallToolResult`, or error string.
     pub result: Result<serde_json::Value, String>,
+    /// If the MCP server requested elicitation during this call, the
+    /// details are captured here for the workflow to handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<CapturedElicitation>,
+}
+
+/// Elicitation details captured from an MCP server during a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedElicitation {
+    /// Name of the MCP server.
+    pub server_name: String,
+    /// Request ID from the MCP protocol.
+    pub request_id: codex_protocol::mcp::RequestId,
+    /// Human-readable elicitation message.
+    pub message: String,
 }
 
 impl McpToolCallOutput {
@@ -270,6 +285,17 @@ pub struct PendingPatchApproval {
     pub call_id: String,
     /// Set to `Some(true)` or `Some(false)` when the client responds.
     pub decision: Option<bool>,
+}
+
+/// Pending MCP elicitation state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingElicitation {
+    /// Name of the MCP server that issued the request.
+    pub server_name: String,
+    /// Request identifier from the MCP server.
+    pub request_id: codex_protocol::mcp::RequestId,
+    /// Set when the client responds via `Op::ResolveElicitation`.
+    pub response: Option<codex_protocol::approvals::ElicitationAction>,
 }
 
 // ---------------------------------------------------------------------------

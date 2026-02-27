@@ -19,6 +19,7 @@ use codex_core::error::CodexErr;
 use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
 use codex_protocol::models::{FunctionCallOutputPayload, ResponseInputItem};
+use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::protocol::{
     AskForApproval, ApplyPatchApprovalRequestEvent, Event, EventMsg, ExecApprovalRequestEvent,
 };
@@ -31,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 use crate::activities::CodexActivities;
 use crate::sink::BufferEventSink;
 use crate::types::{
-    McpToolCallInput, PendingApproval, PendingPatchApproval, PendingUserInput, ToolExecInput,
+    McpToolCallInput, PendingApproval, PendingElicitation, PendingPatchApproval, PendingUserInput,
+    ToolExecInput,
 };
 use crate::workflow::AgentWorkflow;
 
@@ -124,7 +126,7 @@ impl ToolCallHandler for TemporalToolHandler {
             // MCP tools bypass the approval flow — the user explicitly
             // configured these servers, so they are trusted.
             if is_mcp_tool {
-                let input = McpToolCallInput {
+                let mcp_input = McpToolCallInput {
                     qualified_name: tool_name,
                     call_id: call_id.clone(),
                     arguments,
@@ -136,12 +138,53 @@ impl ToolCallHandler for TemporalToolHandler {
                     ..Default::default()
                 };
 
-                let output = ctx
-                    .start_activity(CodexActivities::mcp_tool_call, input, opts)
+                let mut output = ctx
+                    .start_activity(CodexActivities::mcp_tool_call, mcp_input, opts)
                     .await
                     .map_err(|e| {
                         CodexErr::Fatal(format!("mcp_tool_call activity failed: {e}"))
                     })?;
+
+                // Check if the MCP server requested elicitation during this call.
+                if let Some(elicitation) = output.elicitation.take() {
+                    // Set pending state.
+                    ctx.state_mut(|s| {
+                        s.pending_elicitation = Some(PendingElicitation {
+                            server_name: elicitation.server_name.clone(),
+                            request_id: elicitation.request_id.clone(),
+                            response: None,
+                        });
+                    });
+
+                    // Emit ElicitationRequest event.
+                    events.emit_event_sync(Event {
+                        id: turn_id.clone(),
+                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                            server_name: elicitation.server_name,
+                            id: elicitation.request_id,
+                            message: elicitation.message,
+                        }),
+                    });
+
+                    // Wait for resolution or interrupt.
+                    ctx.wait_condition(|s| {
+                        s.pending_elicitation
+                            .as_ref()
+                            .map_or(true, |p| p.response.is_some())
+                            || s.interrupt_requested
+                    })
+                    .await;
+
+                    // Handle interrupt.
+                    let interrupted = ctx.state(|s| s.interrupt_requested);
+                    if interrupted {
+                        ctx.state_mut(|s| s.pending_elicitation = None);
+                        return Ok(denied_response(call_id));
+                    }
+
+                    // Clear pending state.
+                    ctx.state_mut(|s| s.pending_elicitation = None);
+                }
 
                 return Ok(output.into_response_input_item());
             }

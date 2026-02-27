@@ -52,7 +52,7 @@ use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
-    McpDiscoverOutput, PendingApproval, PendingPatchApproval, PendingUserInput,
+    McpDiscoverOutput, PendingApproval, PendingElicitation, PendingPatchApproval, PendingUserInput,
     ProjectContextOutput, UserTurnInput,
 };
 
@@ -75,6 +75,9 @@ pub struct AgentWorkflow {
     /// Pending `apply_patch` approval (set by tool handler, resolved by
     /// `Op::PatchApproval` signal).
     pub(crate) pending_patch_approval: Option<PendingPatchApproval>,
+    /// Pending MCP elicitation (set by tool handler, resolved by
+    /// `Op::ResolveElicitation` signal).
+    pub(crate) pending_elicitation: Option<PendingElicitation>,
     /// When true the workflow will exit after the current turn completes.
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
@@ -223,6 +226,7 @@ impl AgentWorkflow {
                 pending_approval: None,
                 pending_user_input: None,
                 pending_patch_approval: None,
+                pending_elicitation: None,
                 shutdown_requested: false,
                 compact_requested: false,
                 approval_policy_override: state.approval_policy_override,
@@ -260,6 +264,7 @@ impl AgentWorkflow {
             pending_approval: None,
             pending_user_input: None,
             pending_patch_approval: None,
+            pending_elicitation: None,
             shutdown_requested: false,
             compact_requested: false,
             approval_policy_override: None,
@@ -362,6 +367,17 @@ impl AgentWorkflow {
                 }
                 if let Some(p) = personality {
                     self.personality_override = Some(p);
+                }
+            }
+            Op::ResolveElicitation {
+                server_name,
+                request_id,
+                decision,
+            } => {
+                if let Some(ref mut pe) = self.pending_elicitation {
+                    if pe.server_name == server_name && pe.request_id == request_id {
+                        pe.response = Some(decision);
+                    }
                 }
             }
             Op::Interrupt => {
