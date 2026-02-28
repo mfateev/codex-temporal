@@ -126,3 +126,5 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 - Realtime conversation (39d), memory system (34), skills (28, 29), JS REPL (9), worker sandbox (13), real auth (15), code review (39)
 
 **Note on agent definitions:** The codex protocol does not support inline agent definitions (passing model/instructions/tools at spawn time). Agents are configured exclusively through the role system — built-in roles (`default`, `explorer`, `worker`, `awaiter`) or user-defined roles in `config.toml` with role config files.
+
+**Note on agent roles:** Built-in and user-defined roles have identical capabilities — both are `AgentRoleConfig { description, config_file }` resolved via `apply_role_to_config()`. User-defined roles take lookup priority and can override built-in roles by name. Current built-in roles have minimal config: `explorer.toml` is empty (0 bytes), `worker` has no config file, `awaiter` is commented out. The role system is purely a config-layering mechanism with no privileged code paths for built-in roles.
