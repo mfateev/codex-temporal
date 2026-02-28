@@ -2,9 +2,9 @@
 
 ## Current State
 
-Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistry dispatch (shell, apply_patch, read_file, list_dir, grep_files, view_image, web search, request_user_input), tool approval gating with three-tier command safety and policy modes, full TUI reuse with interactive session picker, deterministic entropy, OpenAI Responses API calls via codex ModelClient with stable conversation_id, prompt caching, token usage tracking, reasoning effort/summary/personality, config.toml loading via activity, real sandbox policy from config, project context injection (AGENTS.md + git info), MCP server support (stdio/HTTP), continue-as-new, session resume via CodexHarness registry, event polling with watermarks.
+Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistry dispatch (shell, apply_patch, read_file, list_dir, grep_files, view_image, web search, request_user_input), tool approval gating with three-tier command safety and policy modes, full TUI reuse with interactive session picker, deterministic entropy, OpenAI Responses API calls via codex ModelClient with stable conversation_id, prompt caching, token usage tracking, reasoning effort/summary/personality, config.toml loading via activity, real sandbox policy from config, project context injection (AGENTS.md + git info), MCP server support (stdio/HTTP) with elicitation capture, continue-as-new, session resume via CodexHarness registry, event polling with watermarks, patch approval flow, OverrideTurnContext completion (model/effort/summary/personality), dynamic tools via signal/wait.
 
-85 unit tests, 20 e2e tests, 4 TUI e2e tests.
+85+ unit tests, 24 e2e tests, 4 TUI e2e tests.
 
 ---
 
@@ -29,10 +29,10 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 
 11. ~~**Policy modes**~~ — ✅ `Never`/`OnRequest`/`OnFailure`/`UnlessTrusted` in workflow; `CODEX_APPROVAL_POLICY` env var
 12. ~~**Policy amendment signals**~~ — ✅ `Op::OverrideTurnContext` updates `approval_policy_override` mid-workflow; persists across CAN; `effective_approval_policy()` helper; tool handler re-reads policy each iteration
-12b. **`OverrideTurnContext` completion** — apply remaining fields from `Op::OverrideTurnContext`: `model`, `cwd`, `sandbox_policy`, `effort`, `summary`, `collaboration_mode`, `personality` (currently only `approval_policy` is handled)
+12b. ~~**`OverrideTurnContext` completion**~~ — ✅ `model`, `effort`, `summary`, `personality` overrides handled; persistent overrides applied as fallbacks (per-turn takes priority); all carried across CAN; `cwd`, `sandbox_policy`, `collaboration_mode` remain unhandled (not relevant to temporal harness)
 13. **Worker sandbox** — bubblewrap/container isolation for tool activities
 14. ~~**Command safety analysis**~~ — ✅ codex-core three-tier classification: safe (auto-approve), dangerous (always prompt), unknown (defer to policy); 8 unit tests
-14b. **Patch approval flow** — intercept `apply_patch` tool calls with signal/wait pattern (same as exec approval); emit `ApplyPatchApprovalRequest` event, accept `Op::PatchApproval` signal; currently patches auto-execute at activity level
+14b. ~~**Patch approval flow**~~ — ✅ `apply_patch` tool calls intercepted with signal/wait pattern; emits `ApplyPatchApprovalRequestEvent` with patch text in `reason`; accepts `Op::PatchApproval` signal; `PendingPatchApproval` state type
 
 ## Phase 4: Configuration & Auth
 
@@ -62,7 +62,7 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 
 26. ~~**MCP connections**~~ — ✅ `HarnessMcpManager` manages persistent connections (stdio + streamable HTTP via `RmcpClient`); `discover_mcp_tools` activity at workflow start
 27. ~~**MCP tool execution**~~ — ✅ `mcp_tool_call` activity routes `mcp__server__tool` prefixed calls to appropriate server; bypasses shell approval; schemas carry through continue-as-new
-27b. **MCP elicitation** — handle `Op::ResolveElicitation` signal for MCP servers that issue elicitation requests; emit `ElicitationRequest` event; same signal/wait pattern as exec approval
+27b. ~~**MCP elicitation**~~ — ✅ `HarnessMcpManager` captures elicitation via `capturing_elicitation()` callback; surfaced in `McpToolCallOutput.elicitation`; workflow emits `ElicitationRequest` event; handles `Op::ResolveElicitation` signal; `PendingElicitation` state type
 27c. **MCP resource access** — handle `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource` tools via MCP connections in activity; handle `Op::ListMcpTools` / `Op::RefreshMcpServers` signals
 28. **Skills loading** — discover `SKILL.md` on worker, inject into system prompt; handle `Op::ListSkills` signal; emit `ListSkillsResponse` event
 29. **Remote skills** — MCP-based installation; handle `Op::ListRemoteSkills` and `Op::DownloadRemoteSkill` signals; emit `ListRemoteSkillsResponse`/`RemoteSkillDownloaded` events
@@ -82,7 +82,7 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 37. **Apps/connectors** — discovery through MCP gateway activities
 38. ~~**Interrupt**~~ — ✅ `Op::Interrupt` sets flag checked at iteration boundaries and during approval waits; emits `TurnAborted(Interrupted)` event; returns denied-style response from tool handler to avoid codex-core drain panic
 39. **Code review** — handle `Op::Review` signal; emit `EnteredReviewMode`/`ExitedReviewMode` events; trigger specialized model call on git diff
-39b. **Dynamic tools** — handle `Op::DynamicToolResponse` signal for client-defined tools; intercept dynamic tool calls with signal/wait pattern; emit `DynamicToolCallRequest` event; currently broken end-to-end
+39b. ~~**Dynamic tools**~~ — ✅ `dynamic_tools: Vec<DynamicToolSpec>` on `AgentWorkflowInput`; passed to `build_specs()`; `TemporalToolHandler` intercepts matching calls, emits `DynamicToolCallRequest`, handles `Op::DynamicToolResponse` signal; `PendingDynamicTool` state type; note: codex protocol does not support inline agent definitions — agents are configured via the role system only
 39c. **Custom prompts** — handle `Op::ListCustomPrompts` signal; emit `ListCustomPromptsResponse` event
 39d. **Realtime conversation** — handle `Op::RealtimeConversationStart`/`Audio`/`Text`/`Close` signals; emit corresponding events; requires WebSocket or audio streaming support
 39e. **Shell command execution** — handle `Op::RunUserShellCommand` for client-requested shell commands outside the model loop
@@ -108,22 +108,21 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 | ~~4~~ | ~~5 — Session persistence~~ | ✅ Done (resume, picker, harness); fork/new/export remaining |
 | ~~5~~ | ~~8 — Git/project context~~ | ✅ Done (git info, AGENTS.md); ghost commits, /diff remaining |
 | ~~6~~ | ~~4 — Config/auth~~ | ✅ Partial (config.toml done); real auth/models/credentials remaining |
-| ~~7~~ | ~~7 — MCP/skills~~ | ✅ Partial (MCP done); elicitation, resources, skills remaining |
-| 8 | 3b/2b — Patch approval, OverrideTurnContext | Low-hanging fruit — same signal/wait pattern already proven |
+| ~~7~~ | ~~7 — MCP/skills~~ | ✅ Partial (MCP + elicitation done); resources, skills remaining |
+| ~~8~~ | ~~3b/9b — Patch approval, OverrideTurnContext, dynamic tools~~ | ✅ Done (all 4 signal/wait items) |
 | 9 | 6 — Multi-agent | Power feature; requires child workflow architecture |
-| 10 | 9 — Advanced | Dynamic tools, memory, code review, realtime |
+| 10 | 9 — Advanced | Memory, code review, realtime |
 | 11 | 10 — Hardening | Before any real deployment |
 
 ## Summary
 
-**Completed:** 30 of 60 items (50%)
-**Remaining:** 30 items across phases 1–10
-
-**High priority (same signal/wait pattern, low effort):**
-- Patch approval flow (14b), MCP elicitation (27b), dynamic tools (39b), OverrideTurnContext completion (12b)
+**Completed:** 34 of 60 items (57%)
+**Remaining:** 26 items across phases 1–10
 
 **Medium priority (new infrastructure needed):**
 - Multi-agent child workflows (23, 23b), MCP resources (27c), history access (22b), undo/rollback (22c), config reload (17b)
 
 **Lower priority (large scope or niche):**
 - Realtime conversation (39d), memory system (34), skills (28, 29), JS REPL (9), worker sandbox (13), real auth (15), code review (39)
+
+**Note on agent definitions:** The codex protocol does not support inline agent definitions (passing model/instructions/tools at spawn time). Agents are configured exclusively through the role system — built-in roles (`default`, `explorer`, `worker`, `awaiter`) or user-defined roles in `config.toml` with role config files.
