@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -12,6 +13,9 @@ use codex_core::config::types::{McpServerConfig, McpServerTransportConfig};
 use codex_core::mcp::split_qualified_tool_name;
 use codex_rmcp_client::{OAuthCredentialsStoreMode, RmcpClient, SendElicitation};
 use rmcp::model::{InitializeRequestParams, Tool};
+use tokio::sync::Mutex;
+
+use crate::types::CapturedElicitation;
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -19,6 +23,8 @@ const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Manages persistent MCP server connections for the worker.
 pub struct HarnessMcpManager {
     clients: HashMap<String, ManagedMcpServer>,
+    /// Captured elicitation from the most recent tool call (if any).
+    captured_elicitation: Arc<Mutex<Option<CapturedElicitation>>>,
 }
 
 struct ManagedMcpServer {
@@ -28,10 +34,44 @@ struct ManagedMcpServer {
     tool_timeout: Option<Duration>,
 }
 
-/// No-op elicitation callback (harness runs headless, no UI for elicitations).
-fn no_op_elicitation() -> SendElicitation {
-    Box::new(|_id, _params| {
-        Box::pin(async { Err(anyhow!("elicitation not supported in temporal harness")) })
+/// Elicitation callback that captures the request details and declines.
+///
+/// Instead of erroring (which would fail the MCP handshake), we capture the
+/// elicitation parameters and return `Decline` so the server can proceed.
+/// The captured details are surfaced to the workflow for proper handling.
+fn capturing_elicitation(
+    server_name: String,
+    captured: Arc<Mutex<Option<CapturedElicitation>>>,
+) -> SendElicitation {
+    Box::new(move |id, params| {
+        let captured = captured.clone();
+        let server_name = server_name.clone();
+        Box::pin(async move {
+            // Extract the message from the elicitation params.
+            let message = format!("{params:?}");
+
+            // Convert rmcp RequestId to protocol RequestId.
+            let request_id = match id {
+                rmcp::model::NumberOrString::String(ref s) => {
+                    codex_protocol::mcp::RequestId::String(s.to_string())
+                }
+                rmcp::model::NumberOrString::Number(n) => {
+                    codex_protocol::mcp::RequestId::Integer(n)
+                }
+            };
+
+            // Capture the elicitation details.
+            *captured.lock().await = Some(CapturedElicitation {
+                server_name,
+                request_id,
+                message,
+            });
+
+            // Return an error so the MCP server knows elicitation failed.
+            // The tool call will fail, and the activity will surface the
+            // captured elicitation in its output.
+            Err(anyhow!("elicitation captured for workflow handling"))
+        })
     })
 }
 
@@ -40,7 +80,13 @@ impl HarnessMcpManager {
     pub fn new() -> Self {
         Self {
             clients: HashMap::new(),
+            captured_elicitation: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Take the captured elicitation (if any) from the most recent operation.
+    pub async fn take_captured_elicitation(&self) -> Option<CapturedElicitation> {
+        self.captured_elicitation.lock().await.take()
     }
 
     /// Connect to all enabled MCP servers and discover their tools.
@@ -147,8 +193,12 @@ impl HarnessMcpManager {
 
         // Initialize the MCP handshake.
         let init_params = InitializeRequestParams::default();
+        let elicitation_cb = capturing_elicitation(
+            server_name.to_string(),
+            Arc::clone(&self.captured_elicitation),
+        );
         client
-            .initialize(init_params, startup_timeout, no_op_elicitation())
+            .initialize(init_params, startup_timeout, elicitation_cb)
             .await
             .map_err(|e| anyhow!("MCP server '{}' initialize failed: {}", server_name, e))?;
 

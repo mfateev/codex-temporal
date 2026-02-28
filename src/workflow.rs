@@ -24,8 +24,9 @@ use codex_core::{
     TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams, build_specs,
     try_run_sampling_request,
 };
-use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
     AskForApproval, ContextCompactedEvent, Event, EventMsg, Op, ReviewDecision,
     TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
@@ -51,7 +52,8 @@ use crate::tools::TemporalToolHandler;
 use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
-    McpDiscoverOutput, PendingApproval, PendingUserInput, ProjectContextOutput, UserTurnInput,
+    McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
+    PendingPatchApproval, PendingUserInput, ProjectContextOutput, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -70,6 +72,15 @@ pub struct AgentWorkflow {
     /// Pending `request_user_input` tool call (set by tool handler, resolved
     /// by `Op::UserInputAnswer` signal).
     pub(crate) pending_user_input: Option<PendingUserInput>,
+    /// Pending `apply_patch` approval (set by tool handler, resolved by
+    /// `Op::PatchApproval` signal).
+    pub(crate) pending_patch_approval: Option<PendingPatchApproval>,
+    /// Pending MCP elicitation (set by tool handler, resolved by
+    /// `Op::ResolveElicitation` signal).
+    pub(crate) pending_elicitation: Option<PendingElicitation>,
+    /// Pending dynamic tool call (set by tool handler, resolved by
+    /// `Op::DynamicToolResponse` signal).
+    pub(crate) pending_dynamic_tool: Option<PendingDynamicTool>,
     /// When true the workflow will exit after the current turn completes.
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
@@ -77,6 +88,15 @@ pub struct AgentWorkflow {
     /// Overridden approval policy (from `Op::OverrideTurnContext`).
     /// `None` means use `input.approval_policy`.
     approval_policy_override: Option<AskForApproval>,
+    /// Overridden model slug (from `Op::OverrideTurnContext`).
+    model_override: Option<String>,
+    /// Overridden reasoning effort (from `Op::OverrideTurnContext`).
+    /// `Some(Some(e))` = set effort, `Some(None)` = clear effort, `None` = unchanged.
+    effort_override: Option<Option<ReasoningEffort>>,
+    /// Overridden reasoning summary (from `Op::OverrideTurnContext`).
+    summary_override: Option<ReasoningSummary>,
+    /// Overridden personality (from `Op::OverrideTurnContext`).
+    personality_override: Option<Personality>,
     /// Set by `Op::Interrupt`; checked between loop iterations and during
     /// approval waits.
     pub(crate) interrupt_requested: bool,
@@ -163,6 +183,10 @@ fn do_continue_as_new(
     token_usage: Option<codex_protocol::protocol::TokenUsage>,
     mcp_tools: HashMap<String, serde_json::Value>,
     approval_policy_override: Option<AskForApproval>,
+    model_override: Option<String>,
+    effort_override: Option<Option<ReasoningEffort>>,
+    summary_override: Option<ReasoningSummary>,
+    personality_override: Option<Personality>,
 ) -> WorkflowResult<AgentWorkflowOutput> {
     let state = ContinueAsNewState {
         rollout_items: storage.items(),
@@ -172,6 +196,10 @@ fn do_continue_as_new(
         cumulative_token_usage: token_usage,
         mcp_tools,
         approval_policy_override,
+        model_override,
+        effort_override,
+        summary_override,
+        personality_override,
     };
 
     let mut can_input = input.clone();
@@ -200,9 +228,16 @@ impl AgentWorkflow {
                 events: Arc::new(BufferEventSink::new()),
                 pending_approval: None,
                 pending_user_input: None,
+                pending_patch_approval: None,
+                pending_elicitation: None,
+                pending_dynamic_tool: None,
                 shutdown_requested: false,
                 compact_requested: false,
                 approval_policy_override: state.approval_policy_override,
+                model_override: state.model_override.clone(),
+                effort_override: state.effort_override,
+                summary_override: state.summary_override,
+                personality_override: state.personality_override,
                 interrupt_requested: false,
                 input,
             };
@@ -232,9 +267,16 @@ impl AgentWorkflow {
             turn_counter,
             pending_approval: None,
             pending_user_input: None,
+            pending_patch_approval: None,
+            pending_elicitation: None,
+            pending_dynamic_tool: None,
             shutdown_requested: false,
             compact_requested: false,
             approval_policy_override: None,
+            model_override: None,
+            effort_override: None,
+            summary_override: None,
+            personality_override: None,
             interrupt_requested: false,
         }
     }
@@ -295,11 +337,59 @@ impl AgentWorkflow {
             Op::Compact => {
                 self.compact_requested = true;
             }
+            Op::PatchApproval { id, decision, .. } => {
+                if let Some(ref mut pa) = self.pending_patch_approval {
+                    if pa.call_id == id {
+                        let approved = matches!(
+                            decision,
+                            ReviewDecision::Approved
+                                | ReviewDecision::ApprovedForSession
+                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                        );
+                        pa.decision = Some(approved);
+                    }
+                }
+            }
             Op::OverrideTurnContext {
-                approval_policy, ..
+                approval_policy,
+                model,
+                effort,
+                summary,
+                personality,
+                ..
             } => {
                 if let Some(policy) = approval_policy {
                     self.approval_policy_override = Some(policy);
+                }
+                if let Some(m) = model {
+                    self.model_override = Some(m);
+                }
+                if let Some(e) = effort {
+                    self.effort_override = Some(e);
+                }
+                if let Some(s) = summary {
+                    self.summary_override = Some(s);
+                }
+                if let Some(p) = personality {
+                    self.personality_override = Some(p);
+                }
+            }
+            Op::DynamicToolResponse { id, response } => {
+                if let Some(ref mut pdt) = self.pending_dynamic_tool {
+                    if pdt.call_id == id {
+                        pdt.response = Some(response);
+                    }
+                }
+            }
+            Op::ResolveElicitation {
+                server_name,
+                request_id,
+                decision,
+            } => {
+                if let Some(ref mut pe) = self.pending_elicitation {
+                    if pe.server_name == server_name && pe.request_id == request_id {
+                        pe.response = Some(decision);
+                    }
                 }
             }
             Op::Interrupt => {
@@ -521,7 +611,14 @@ impl AgentWorkflow {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
-        let builder = build_specs(&tools_config, rmcp_tools, None, &[]);
+        // Collect dynamic tool names for the tool handler to intercept.
+        let dynamic_tool_names: HashSet<String> = input
+            .dynamic_tools
+            .iter()
+            .map(|dt| dt.name.clone())
+            .collect();
+
+        let builder = build_specs(&tools_config, rmcp_tools, None, &input.dynamic_tools);
         let (configured_specs, _registry) = builder.build();
         let tools: Vec<ToolSpec> = configured_specs.into_iter().map(|cs| cs.spec).collect();
         let base_instructions = BaseInstructions {
@@ -565,8 +662,21 @@ impl AgentWorkflow {
 
                         let pending = ctx.state(|s| s.user_turns.clone());
                         let turn_count = ctx.state(|s| s.turn_counter);
-                        let policy_override =
-                            ctx.state(|s| s.approval_policy_override);
+                        let (
+                            policy_override,
+                            can_model_override,
+                            can_effort_override,
+                            can_summary_override,
+                            can_personality_override,
+                        ) = ctx.state(|s| {
+                            (
+                                s.approval_policy_override,
+                                s.model_override.clone(),
+                                s.effort_override,
+                                s.summary_override,
+                                s.personality_override,
+                            )
+                        });
                         break Some(do_continue_as_new(
                             &input,
                             &storage,
@@ -576,6 +686,10 @@ impl AgentWorkflow {
                             events.latest_token_usage(),
                             mcp_tools.clone(),
                             policy_override,
+                            can_model_override,
+                            can_effort_override,
+                            can_summary_override,
+                            can_personality_override,
                         ));
                     }
 
@@ -614,18 +728,45 @@ impl AgentWorkflow {
                         phase: None,
                     };
 
-                    // Per-turn config: apply overrides from UserTurnInput if
-                    // they differ from workflow-level defaults.
+                    // Read persistent overrides from workflow state.
+                    let (
+                        persistent_effort,
+                        persistent_summary,
+                        persistent_personality,
+                        persistent_model,
+                    ) = ctx.state(|s| {
+                        (
+                            s.effort_override,
+                            s.summary_override,
+                            s.personality_override,
+                            s.model_override.clone(),
+                        )
+                    });
+
+                    // Per-turn config: per-turn overrides from UserTurnInput take
+                    // priority; persistent overrides (from OverrideTurnContext) are
+                    // used as fallback.
                     let turn_config = {
                         let mut c = (*config).clone();
+                        // Per-turn overrides take priority.
                         if turn.effort.is_some() {
                             c.model_reasoning_effort = turn.effort;
+                        } else if let Some(e) = persistent_effort {
+                            c.model_reasoning_effort = e;
                         }
                         if turn.summary != ReasoningSummary::default() {
                             c.model_reasoning_summary = Some(turn.summary);
+                        } else if let Some(s) = persistent_summary {
+                            c.model_reasoning_summary = Some(s);
                         }
                         if turn.personality.is_some() {
                             c.personality = turn.personality;
+                        } else if let Some(p) = persistent_personality {
+                            c.personality = Some(p);
+                        }
+                        // Model override: update config model field.
+                        if let Some(ref m) = persistent_model {
+                            c.model = Some(m.clone());
                         }
                         Arc::new(c)
                     };
@@ -673,15 +814,20 @@ impl AgentWorkflow {
                         // via OverrideTurnContext signals).
                         let effective_policy =
                             ctx.state(|s| s.effective_approval_policy());
+                        let effective_model = persistent_model
+                            .as_deref()
+                            .unwrap_or(&input.model)
+                            .to_string();
                         let handler = TemporalToolHandler::new(
                             ctx.clone(),
                             events.clone(),
                             turn_id.clone(),
                             effective_policy,
-                            input.model.clone(),
+                            effective_model,
                             config.cwd.to_string_lossy().to_string(),
                             Some(config_output.config_toml.clone()),
                             mcp_tool_names.clone(),
+                            dynamic_tool_names.clone(),
                         );
 
                         // Rebuild prompt from accumulated session history,
@@ -776,8 +922,21 @@ impl AgentWorkflow {
                         tracing::info!("server suggested continue-as-new, triggering CAN");
                         let pending = ctx.state(|s| s.user_turns.clone());
                         let turn_count = ctx.state(|s| s.turn_counter);
-                        let policy_override =
-                            ctx.state(|s| s.approval_policy_override);
+                        let (
+                            policy_override,
+                            can_model_override,
+                            can_effort_override,
+                            can_summary_override,
+                            can_personality_override,
+                        ) = ctx.state(|s| {
+                            (
+                                s.approval_policy_override,
+                                s.model_override.clone(),
+                                s.effort_override,
+                                s.summary_override,
+                                s.personality_override,
+                            )
+                        });
                         break Some(do_continue_as_new(
                             &input,
                             &storage,
@@ -787,6 +946,10 @@ impl AgentWorkflow {
                             events.latest_token_usage(),
                             mcp_tools.clone(),
                             policy_override,
+                            can_model_override,
+                            can_effort_override,
+                            can_summary_override,
+                            can_personality_override,
                         ));
                     }
 

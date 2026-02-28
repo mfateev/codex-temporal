@@ -319,12 +319,16 @@ impl CodexActivities {
                     return Ok(McpToolCallOutput {
                         call_id: input.call_id,
                         result: Err(format!("invalid JSON arguments: {e}")),
+                        elicitation: None,
                     });
                 }
             }
         };
 
         let manager = self.mcp_manager.lock().await;
+        // Clear any previously captured elicitation.
+        manager.take_captured_elicitation().await;
+
         let result = match manager
             .call_tool(&input.qualified_name, arguments)
             .await
@@ -336,9 +340,13 @@ impl CodexActivities {
             Err(e) => Err(format!("{e}")),
         };
 
+        // Check if an elicitation was captured during this call.
+        let elicitation = manager.take_captured_elicitation().await;
+
         Ok(McpToolCallOutput {
             call_id: input.call_id,
             result,
+            elicitation,
         })
     }
 

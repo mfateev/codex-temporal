@@ -192,6 +192,21 @@ pub struct McpToolCallOutput {
     pub call_id: String,
     /// Serialized `codex_protocol::mcp::CallToolResult`, or error string.
     pub result: Result<serde_json::Value, String>,
+    /// If the MCP server requested elicitation during this call, the
+    /// details are captured here for the workflow to handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<CapturedElicitation>,
+}
+
+/// Elicitation details captured from an MCP server during a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedElicitation {
+    /// Name of the MCP server.
+    pub server_name: String,
+    /// Request ID from the MCP protocol.
+    pub request_id: codex_protocol::mcp::RequestId,
+    /// Human-readable elicitation message.
+    pub message: String,
 }
 
 impl McpToolCallOutput {
@@ -261,6 +276,35 @@ pub struct PendingUserInput {
     pub call_id: String,
     /// Set to `Some(...)` when the client responds via `Op::UserInputAnswer`.
     pub response: Option<codex_protocol::request_user_input::RequestUserInputResponse>,
+}
+
+/// Pending `apply_patch` approval state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingPatchApproval {
+    /// The call_id awaiting approval.
+    pub call_id: String,
+    /// Set to `Some(true)` or `Some(false)` when the client responds.
+    pub decision: Option<bool>,
+}
+
+/// Pending dynamic tool call state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingDynamicTool {
+    /// The call_id for the dynamic tool call.
+    pub call_id: String,
+    /// Set when the client responds via `Op::DynamicToolResponse`.
+    pub response: Option<codex_protocol::dynamic_tools::DynamicToolResponse>,
+}
+
+/// Pending MCP elicitation state tracked inside the workflow.
+#[derive(Debug, Clone)]
+pub struct PendingElicitation {
+    /// Name of the MCP server that issued the request.
+    pub server_name: String,
+    /// Request identifier from the MCP server.
+    pub request_id: codex_protocol::mcp::RequestId,
+    /// Set when the client responds via `Op::ResolveElicitation`.
+    pub response: Option<codex_protocol::approvals::ElicitationAction>,
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +410,9 @@ pub struct AgentWorkflowInput {
     /// Pre-discovered MCP tools from SessionWorkflow.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
+    /// Client-defined dynamic tools (handled via signal/wait).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
 }
 
 fn default_role() -> String {
@@ -584,4 +631,16 @@ pub struct ContinueAsNewState {
     /// Overridden approval policy (from `Op::OverrideTurnContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy_override: Option<AskForApproval>,
+    /// Overridden model slug (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Overridden reasoning effort (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_override: Option<Option<ReasoningEffort>>,
+    /// Overridden reasoning summary (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_override: Option<ReasoningSummary>,
+    /// Overridden personality (from `Op::OverrideTurnContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_override: Option<Personality>,
 }

@@ -219,6 +219,7 @@ impl SessionWorkflow {
             config_toml: Some(config_toml.clone()),
             project_context: Some(project_context.clone()),
             mcp_tools: mcp_tools.clone(),
+            dynamic_tools: Vec::new(),
         };
 
         let child = ctx.child_workflow(ChildWorkflowOptions {
@@ -354,6 +355,7 @@ impl SessionWorkflow {
                     config_toml: Some(resolved_config_toml),
                     project_context: Some(project_context.clone()),
                     mcp_tools: mcp_tools.clone(),
+                    dynamic_tools: Vec::new(),
                 };
 
                 let child = ctx.child_workflow(ChildWorkflowOptions {

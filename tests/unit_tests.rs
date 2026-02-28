@@ -160,6 +160,7 @@ fn workflow_input_roundtrips_through_json() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -401,6 +402,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -425,6 +427,7 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -462,6 +465,7 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -493,6 +497,7 @@ fn workflow_input_reasoning_effort_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
     let json = serde_json::to_string(&input).unwrap();
     let back: CodexWorkflowInput = serde_json::from_str(&json).unwrap();
@@ -548,6 +553,10 @@ fn continue_as_new_state_roundtrips_through_json() {
         }),
         mcp_tools: std::collections::HashMap::new(),
         approval_policy_override: None,
+        model_override: None,
+        effort_override: None,
+        summary_override: None,
+        personality_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -584,11 +593,16 @@ fn workflow_input_with_continued_state_roundtrips() {
             cumulative_token_usage: None,
             mcp_tools: std::collections::HashMap::new(),
             approval_policy_override: None,
+            model_override: None,
+            effort_override: None,
+            summary_override: None,
+            personality_override: None,
         }),
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1238,6 +1252,7 @@ fn workflow_input_developer_instructions_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1286,6 +1301,7 @@ fn workflow_input_model_provider_roundtrips() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1595,6 +1611,7 @@ fn mcp_tool_call_output_serde_roundtrip_ok() {
         result: Ok(serde_json::json!({
             "content": [{"type": "text", "text": "hello back"}],
         })),
+        elicitation: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -1610,6 +1627,7 @@ fn mcp_tool_call_output_serde_roundtrip_err() {
     let output = McpToolCallOutput {
         call_id: "call-789".to_string(),
         result: Err("tool not found".to_string()),
+        elicitation: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -1629,6 +1647,7 @@ fn mcp_tool_call_output_into_response_item_ok() {
         result: Ok(serde_json::json!({
             "content": [{"type": "text", "text": "result text"}],
         })),
+        elicitation: None,
     };
 
     let item = output.into_response_input_item();
@@ -1651,6 +1670,7 @@ fn mcp_tool_call_output_into_response_item_err() {
     let output = McpToolCallOutput {
         call_id: "call-err".to_string(),
         result: Err("server crashed".to_string()),
+        elicitation: None,
     };
 
     let item = output.into_response_input_item();
@@ -1682,6 +1702,10 @@ fn continue_as_new_state_with_mcp_tools() {
         cumulative_token_usage: None,
         mcp_tools: mcp_tools.clone(),
         approval_policy_override: None,
+        model_override: None,
+        effort_override: None,
+        summary_override: None,
+        personality_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1719,6 +1743,10 @@ fn continue_as_new_state_with_approval_policy_roundtrips() {
         cumulative_token_usage: None,
         mcp_tools: std::collections::HashMap::new(),
         approval_policy_override: Some(AskForApproval::Never),
+        model_override: None,
+        effort_override: None,
+        summary_override: None,
+        personality_override: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1910,6 +1938,7 @@ fn agent_workflow_input_with_new_fields_roundtrips() {
             m.insert("mcp__echo__echo".to_string(), serde_json::json!({"name": "echo"}));
             m
         },
+        dynamic_tools: Vec::new(),
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -2107,6 +2136,7 @@ fn backward_compat_type_aliases_work() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let _output: CodexWorkflowOutput = CodexWorkflowOutput {
@@ -2136,6 +2166,7 @@ fn codex_workflow_input_converts_to_session_workflow_input() {
         config_toml: None,
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
     };
 
     let session_input: SessionWorkflowInput = agent_input.into();
