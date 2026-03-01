@@ -5,15 +5,16 @@
 //! extracted into [`SessionWorkflowInput`] fields that flow through
 //! Temporal's serialization boundary.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use codex_core::config::{Config, ConfigBuilder, ConfigOverrides, ConfigToml};
+use codex_core::config::{Config, ConfigBuilder, ConfigOverrides, ConfigToml, find_codex_home};
 use codex_core::ModelProviderInfo;
 use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 
-use crate::types::SessionWorkflowInput;
+use crate::types::{CrewMode, CrewType, SessionWorkflowInput};
 
 /// Holds the result of loading config.toml: a template
 /// [`SessionWorkflowInput`] and the resolved model provider info.
@@ -146,6 +147,124 @@ pub fn apply_env_overrides(input: &mut SessionWorkflowInput) {
             _ => input.personality,
         };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Crew type discovery & loading
+// ---------------------------------------------------------------------------
+
+/// Return the path to the crews directory: `{CODEX_HOME}/crews/`.
+fn crews_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = find_codex_home()?;
+    Ok(home.join("crews"))
+}
+
+/// Discover all crew types by scanning `{CODEX_HOME}/crews/*.toml`.
+///
+/// Returns an empty vec (not an error) if the crews directory does not exist.
+pub fn discover_crew_types() -> Result<Vec<CrewType>, Box<dyn std::error::Error>> {
+    let dir = crews_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut crews = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            let content = std::fs::read_to_string(&path)?;
+            let crew: CrewType = toml::from_str(&content).map_err(|e| {
+                format!("failed to parse {}: {e}", path.display())
+            })?;
+            crews.push(crew);
+        }
+    }
+
+    // Sort by name for stable ordering.
+    crews.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(crews)
+}
+
+/// Load a single crew type by name from `{CODEX_HOME}/crews/{name}.toml`.
+pub fn load_crew_type(name: &str) -> Result<CrewType, Box<dyn std::error::Error>> {
+    let dir = crews_dir()?;
+    let path = dir.join(format!("{name}.toml"));
+    if !path.exists() {
+        return Err(format!("crew type '{}' not found at {}", name, path.display()).into());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    let crew: CrewType = toml::from_str(&content)
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+    Ok(crew)
+}
+
+/// Apply a crew type definition to a [`SessionWorkflowInput`].
+///
+/// 1. Validates all required inputs are provided (errors on missing).
+/// 2. Interpolates `{placeholder}` in `initial_prompt` and agent `instructions`.
+/// 3. Applies crew's `approval_policy` override to `base`.
+/// 4. Applies main agent's `model` override to `base`.
+/// 5. Applies main agent's `instructions` to `base`.
+/// 6. Sets `base.user_message` from interpolated `initial_prompt` (autonomous mode).
+pub fn apply_crew_type(
+    crew: &CrewType,
+    inputs: &BTreeMap<String, String>,
+    base: &mut SessionWorkflowInput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // --- validate required inputs ---
+    for (name, spec) in &crew.inputs {
+        if spec.required && !inputs.contains_key(name) && spec.default.is_none() {
+            return Err(format!(
+                "missing required input '{}' for crew '{}'",
+                name, crew.name
+            )
+            .into());
+        }
+    }
+
+    // Build the interpolation map: user inputs + defaults.
+    let mut vars = BTreeMap::new();
+    for (name, spec) in &crew.inputs {
+        if let Some(val) = inputs.get(name) {
+            vars.insert(name.clone(), val.clone());
+        } else if let Some(ref default) = spec.default {
+            vars.insert(name.clone(), default.clone());
+        }
+    }
+
+    // --- apply crew approval policy ---
+    if let Some(policy) = crew.approval_policy {
+        base.approval_policy = policy;
+    }
+
+    // --- apply main agent overrides ---
+    if let Some(main_agent_def) = crew.agents.get(&crew.main_agent) {
+        if let Some(ref model) = main_agent_def.model {
+            base.model = model.clone();
+        }
+        if let Some(ref instructions) = main_agent_def.instructions {
+            base.instructions = interpolate(instructions, &vars);
+        }
+    }
+
+    // --- set user_message from initial_prompt (autonomous mode) ---
+    if crew.mode == CrewMode::Autonomous {
+        if let Some(ref prompt) = crew.initial_prompt {
+            base.user_message = interpolate(prompt, &vars);
+        }
+    }
+
+    Ok(())
+}
+
+/// Interpolate `{key}` placeholders in a template string.
+fn interpolate(template: &str, vars: &BTreeMap<String, String>) -> String {
+    let mut result = template.to_string();
+    for (key, value) in vars {
+        result = result.replace(&format!("{{{key}}}"), value);
+    }
+    result
 }
 
 /// Reconstruct a [`Config`] from a TOML string previously produced by

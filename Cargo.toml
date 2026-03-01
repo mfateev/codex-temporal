@@ -55,6 +55,7 @@ tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev 
 temporalio-sdk-core = { git = "https://github.com/mfateev/sdk-core.git", branch = "task/rust-harness", features = ["ephemeral-server"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 ratatui = { version = "0.29", features = ["unstable-widget-ref"] }
+tempfile = "3"
 
 [[bin]]
 name = "codex-temporal-worker"

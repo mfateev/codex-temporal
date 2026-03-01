@@ -3,7 +3,7 @@
 //! These types are sent across the Temporal activity boundary, so they must
 //! implement `Serialize` + `Deserialize`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
@@ -308,6 +308,82 @@ pub struct PendingElicitation {
 }
 
 // ---------------------------------------------------------------------------
+// Crew type definitions
+// ---------------------------------------------------------------------------
+
+/// Mode for a crew type — interactive or autonomous.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CrewMode {
+    #[default]
+    Interactive,
+    Autonomous,
+}
+
+/// A crew type definition — reusable template for starting sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrewType {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub mode: CrewMode,
+    /// Initial prompt template (autonomous mode). `{input}` placeholders.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+    /// Required/optional inputs with descriptions and defaults.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, CrewInputSpec>,
+    /// Which agent is the entry point.
+    #[serde(default = "default_main_agent")]
+    pub main_agent: String,
+    /// Agent definitions — inline config or role reference.
+    #[serde(default)]
+    pub agents: BTreeMap<String, CrewAgentDef>,
+    /// Session-level approval policy override.
+    #[serde(default)]
+    pub approval_policy: Option<AskForApproval>,
+}
+
+fn default_main_agent() -> String {
+    "default".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Specification for a crew input parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrewInputSpec {
+    pub description: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// Agent definition within a crew type.
+///
+/// Either fully inline (model + instructions) or a reference to an existing
+/// role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrewAgentDef {
+    /// Reference to an existing role (from config.toml or built-in).
+    /// If set, role config is used as base; inline fields override.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Model override for this agent.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Instructions template for this agent (`{input}` placeholders).
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Human-readable description (shown in spawn_agent tool spec).
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Harness types (session registry)
 // ---------------------------------------------------------------------------
 
@@ -324,6 +400,9 @@ pub struct SessionEntry {
     pub created_at_millis: u64,
     /// Current session status.
     pub status: SessionStatus,
+    /// Crew type name, if this session was started from a crew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew_type: Option<String>,
 }
 
 /// Status of a tracked session.

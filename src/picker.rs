@@ -89,6 +89,7 @@ mod tests {
                 model: "gpt-4o".to_string(),
                 created_at_millis: 1_700_000_000_000,
                 status: SessionStatus::Running,
+                crew_type: None,
             },
             SessionEntry {
                 session_id: "sess-2".to_string(),
@@ -96,6 +97,7 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 created_at_millis: 1_700_000_060_000,
                 status: SessionStatus::Running,
+                crew_type: None,
             },
         ];
         let page = sessions_to_threads_page(entries);
