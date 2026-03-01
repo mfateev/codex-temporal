@@ -1,5 +1,6 @@
 //! Unit and integration tests for the codex-temporal harness.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use codex_temporal::entropy::TemporalRandomSource;
@@ -1880,6 +1881,7 @@ fn session_workflow_input_roundtrips_through_json() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -1979,6 +1981,7 @@ fn session_continue_as_new_state_roundtrips() {
             git_info: None,
         },
         mcp_tools: std::collections::HashMap::new(),
+        crew_agents: BTreeMap::new(),
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -2360,6 +2363,7 @@ fn apply_crew_type_interpolates_placeholders() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2416,6 +2420,7 @@ fn apply_crew_type_rejects_missing_required_input() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2464,6 +2469,7 @@ fn apply_crew_type_uses_input_defaults() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2542,4 +2548,276 @@ impl Drop for EnvGuard {
             None => unsafe { std::env::remove_var(&self.key) },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Crew subagent scoping tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_workflow_input_crew_agents_roundtrip() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let mut crew_agents = BTreeMap::new();
+    crew_agents.insert(
+        "helper".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: Some("gpt-4o-mini".to_string()),
+            instructions: Some("Help with tasks.".to_string()),
+            description: Some("A helpful assistant".to_string()),
+        },
+    );
+    crew_agents.insert(
+        "reviewer".to_string(),
+        CrewAgentDef {
+            role: Some("explorer".to_string()),
+            model: None,
+            instructions: None,
+            description: Some("Reviews code changes".to_string()),
+        },
+    );
+
+    let input = SessionWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "Be helpful.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents: crew_agents.clone(),
+        continued_state: None,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: SessionWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.crew_agents.len(), 2);
+    assert!(back.crew_agents.contains_key("helper"));
+    assert!(back.crew_agents.contains_key("reviewer"));
+
+    let helper = &back.crew_agents["helper"];
+    assert_eq!(helper.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(helper.instructions.as_deref(), Some("Help with tasks."));
+    assert!(helper.role.is_none());
+
+    let reviewer = &back.crew_agents["reviewer"];
+    assert_eq!(reviewer.role.as_deref(), Some("explorer"));
+    assert!(reviewer.model.is_none());
+}
+
+#[test]
+fn session_workflow_input_crew_agents_default_when_missing() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    // JSON without crew_agents field — should default to empty.
+    let json = r#"{
+        "user_message": "hello",
+        "model": "gpt-4o",
+        "instructions": "test"
+    }"#;
+
+    let input: SessionWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(
+        input.crew_agents.is_empty(),
+        "crew_agents should default to empty"
+    );
+}
+
+#[test]
+fn apply_crew_type_populates_crew_agents() {
+    use codex_temporal::config_loader::apply_crew_type;
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let crew = CrewType {
+        name: "test".to_string(),
+        description: "test crew".to_string(),
+        mode: CrewMode::Autonomous,
+        initial_prompt: Some("Work on {task}".to_string()),
+        inputs: {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "task".to_string(),
+                CrewInputSpec {
+                    description: "The task".to_string(),
+                    required: true,
+                    default: None,
+                },
+            );
+            m
+        },
+        main_agent: "coordinator".to_string(),
+        agents: {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "coordinator".to_string(),
+                CrewAgentDef {
+                    role: None,
+                    model: Some("gpt-4o".to_string()),
+                    instructions: Some("Coordinate {task}".to_string()),
+                    description: Some("Main coordinator".to_string()),
+                },
+            );
+            m.insert(
+                "helper".to_string(),
+                CrewAgentDef {
+                    role: None,
+                    model: Some("gpt-4o-mini".to_string()),
+                    instructions: Some("Help with {task}".to_string()),
+                    description: Some("Helper agent".to_string()),
+                },
+            );
+            m.insert(
+                "fixer".to_string(),
+                CrewAgentDef {
+                    role: Some("explorer".to_string()),
+                    model: None,
+                    instructions: None,
+                    description: Some("Fixes bugs".to_string()),
+                },
+            );
+            m
+        },
+        approval_policy: None,
+    };
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("task".to_string(), "bug-fixing".to_string());
+
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "default-model".to_string(),
+        instructions: "default".to_string(),
+        approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents: BTreeMap::new(),
+        continued_state: None,
+    };
+
+    apply_crew_type(&crew, &inputs, &mut base).unwrap();
+
+    // Main agent (coordinator) should NOT be in crew_agents.
+    assert!(
+        !base.crew_agents.contains_key("coordinator"),
+        "main agent should not be in crew_agents"
+    );
+
+    // Non-main agents should be in crew_agents.
+    assert_eq!(base.crew_agents.len(), 2);
+    assert!(base.crew_agents.contains_key("helper"));
+    assert!(base.crew_agents.contains_key("fixer"));
+
+    // Helper should have interpolated instructions.
+    let helper = &base.crew_agents["helper"];
+    assert_eq!(helper.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(
+        helper.instructions.as_deref(),
+        Some("Help with bug-fixing")
+    );
+    assert!(helper.role.is_none());
+
+    // Fixer should have role reference but no interpolation (no instructions template).
+    let fixer = &base.crew_agents["fixer"];
+    assert_eq!(fixer.role.as_deref(), Some("explorer"));
+    assert!(fixer.instructions.is_none());
+    assert_eq!(fixer.description.as_deref(), Some("Fixes bugs"));
+}
+
+#[test]
+fn inject_crew_roles_into_toml_adds_roles() {
+    use codex_temporal::config_loader::inject_crew_roles_into_toml;
+
+    let base_toml = r#"
+model = "gpt-4o"
+"#;
+
+    let mut crew_agents = BTreeMap::new();
+    crew_agents.insert(
+        "helper".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: Some("gpt-4o-mini".to_string()),
+            instructions: Some("Help out".to_string()),
+            description: Some("A helper agent".to_string()),
+        },
+    );
+    crew_agents.insert(
+        "reviewer".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: None,
+            instructions: None,
+            description: None,
+        },
+    );
+
+    let result = inject_crew_roles_into_toml(base_toml, &crew_agents).unwrap();
+
+    // Parse result and verify [agents] entries exist.
+    let doc: toml::Value = toml::from_str(&result).unwrap();
+    let agents = doc.get("agents").and_then(|v| v.as_table()).unwrap();
+
+    assert!(agents.contains_key("helper"), "helper should be in agents table");
+    assert!(agents.contains_key("reviewer"), "reviewer should be in agents table");
+
+    // Helper should have description.
+    let helper = agents.get("helper").and_then(|v| v.as_table()).unwrap();
+    assert_eq!(
+        helper.get("description").and_then(|v| v.as_str()),
+        Some("A helper agent")
+    );
+
+    // Reviewer has no description — table exists but may be empty.
+    assert!(agents.contains_key("reviewer"));
+}
+
+#[test]
+fn session_continue_as_new_state_crew_agents_roundtrip() {
+    use codex_temporal::types::{AgentLifecycle, AgentRecord, SessionContinueAsNewState};
+
+    let mut crew_agents = BTreeMap::new();
+    crew_agents.insert(
+        "worker".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: Some("gpt-4o-mini".to_string()),
+            instructions: Some("Do work.".to_string()),
+            description: Some("Worker agent".to_string()),
+        },
+    );
+
+    let state = SessionContinueAsNewState {
+        agents: vec![AgentRecord {
+            agent_id: "session/main".to_string(),
+            workflow_id: "session/main".to_string(),
+            role: "default".to_string(),
+            status: AgentLifecycle::Running,
+        }],
+        config_toml: "model = \"gpt-4o\"".to_string(),
+        project_context: ProjectContextOutput {
+            cwd: "/tmp".to_string(),
+            user_instructions: None,
+            git_info: None,
+        },
+        mcp_tools: std::collections::HashMap::new(),
+        crew_agents: crew_agents.clone(),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: SessionContinueAsNewState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.crew_agents.len(), 1);
+    assert!(back.crew_agents.contains_key("worker"));
+    let worker = &back.crew_agents["worker"];
+    assert_eq!(worker.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(worker.instructions.as_deref(), Some("Do work."));
 }

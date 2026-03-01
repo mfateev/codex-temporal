@@ -553,6 +553,10 @@ pub struct SessionWorkflowInput {
     /// Model provider info from config.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<ModelProviderInfo>,
+    /// Crew agent definitions (non-main agents from a crew type).
+    /// Keyed by agent name (e.g. "helper", "fixer").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crew_agents: BTreeMap<String, CrewAgentDef>,
     /// State carried over from a previous continue-as-new execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_state: Option<SessionContinueAsNewState>,
@@ -571,6 +575,7 @@ impl From<AgentWorkflowInput> for SessionWorkflowInput {
             personality: input.personality,
             developer_instructions: input.developer_instructions,
             model_provider: input.model_provider,
+            crew_agents: BTreeMap::new(),
             continued_state: None,
         }
     }
@@ -619,6 +624,9 @@ pub struct SessionContinueAsNewState {
     /// Cached MCP tools.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
+    /// Crew agent definitions carried across CAN.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crew_agents: BTreeMap<String, CrewAgentDef>,
 }
 
 /// Record of a child agent workflow tracked by `SessionWorkflow`.

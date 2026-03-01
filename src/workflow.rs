@@ -585,7 +585,8 @@ impl AgentWorkflow {
             features: &config.features,
             web_search_mode: input.web_search_mode,
             session_source: codex_protocol::protocol::SessionSource::Exec,
-        });
+        })
+        .with_agent_roles(config.agent_roles.clone());
 
         // Convert serialized MCP tools back to rmcp::model::Tool for build_specs.
         let rmcp_tools: Option<HashMap<String, rmcp::model::Tool>> = if mcp_tools.is_empty() {
