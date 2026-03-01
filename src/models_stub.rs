@@ -28,6 +28,7 @@ impl FixedModelsProvider {
                 is_default: true,
                 upgrade: None,
                 show_in_picker: true,
+                availability_nux: None,
                 supported_in_api: true,
                 input_modalities: vec![],
             },

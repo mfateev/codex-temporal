@@ -6,9 +6,10 @@ use codex_temporal::entropy::TemporalRandomSource;
 use codex_temporal::sink::BufferEventSink;
 use codex_temporal::storage::InMemoryStorage;
 use codex_temporal::types::{
-    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, HarnessInput,
-    HarnessState, ModelCallOutput, PendingApproval, ProjectContextOutput, SessionEntry,
-    SessionStatus, ToolExecOutput, UserTurnInput,
+    ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, CrewAgentDef,
+    CrewInputSpec, CrewMode, CrewType, HarnessInput, HarnessState, ModelCallOutput,
+    PendingApproval, ProjectContextOutput, SessionEntry, SessionStatus, ToolExecOutput,
+    UserTurnInput,
 };
 
 use codex_core::entropy::RandomSource;
@@ -919,7 +920,11 @@ async fn dispatch_with_experimental_tools(
                 }
                 codex_protocol::models::ResponseInputItem::CustomToolCallOutput {
                     output, ..
-                } => (output.clone(), 0),
+                } => {
+                    let text = output.body.to_text().unwrap_or_default();
+                    let success = output.success.unwrap_or(true);
+                    (text, if success { 0 } else { 1 })
+                }
                 other => (format!("{other:?}"), 0),
             }
         }
@@ -994,6 +999,7 @@ fn session_entry_roundtrips_through_json() {
         model: "gpt-4o".to_string(),
         created_at_millis: 1_700_000_000_000,
         status: SessionStatus::Running,
+        crew_type: None,
     };
 
     let json = serde_json::to_string(&entry).unwrap();
@@ -1019,6 +1025,7 @@ fn session_entry_status_variants_roundtrip() {
             model: "gpt-4o-mini".to_string(),
             created_at_millis: 0,
             status,
+            crew_type: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: SessionEntry = serde_json::from_str(&json).unwrap();
@@ -1036,6 +1043,7 @@ fn harness_state_roundtrips() {
                 model: "gpt-4o".to_string(),
                 created_at_millis: 100,
                 status: SessionStatus::Running,
+                crew_type: None,
             },
             SessionEntry {
                 session_id: "s2".to_string(),
@@ -1043,6 +1051,7 @@ fn harness_state_roundtrips() {
                 model: "gpt-4o-mini".to_string(),
                 created_at_millis: 200,
                 status: SessionStatus::Completed,
+                crew_type: None,
             },
         ],
     };
@@ -2178,4 +2187,359 @@ fn codex_workflow_input_converts_to_session_workflow_input() {
         Some("dev note")
     );
     assert!(session_input.continued_state.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Crew type tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crew_type_serde_roundtrip() {
+    let toml_str = r#"
+name = "git-bug-fixer"
+description = "Watches a git repo for new issues and fixes bugs"
+mode = "autonomous"
+initial_prompt = "Monitor {repo_url} for new issues on branch {branch} and fix them."
+main_agent = "coordinator"
+
+[inputs.repo_url]
+description = "Git repository URL to watch"
+required = true
+
+[inputs.branch]
+description = "Branch to work on"
+default = "main"
+
+[agents.coordinator]
+model = "gpt-4o"
+instructions = "You are a bug-fixing coordinator for {repo_url} on branch {branch}."
+description = "Coordinates bug fixing work across the repo"
+
+[agents.fixer]
+role = "explorer"
+description = "Investigates and fixes individual bugs"
+"#;
+
+    let crew: CrewType = toml::from_str(toml_str).expect("parse crew TOML");
+    assert_eq!(crew.name, "git-bug-fixer");
+    assert_eq!(crew.mode, CrewMode::Autonomous);
+    assert_eq!(crew.main_agent, "coordinator");
+    assert_eq!(crew.inputs.len(), 2);
+    assert_eq!(crew.agents.len(), 2);
+
+    // Verify coordinator agent.
+    let coord = &crew.agents["coordinator"];
+    assert_eq!(coord.model.as_deref(), Some("gpt-4o"));
+    assert!(coord.instructions.as_ref().unwrap().contains("{repo_url}"));
+
+    // Verify fixer agent.
+    let fixer = &crew.agents["fixer"];
+    assert_eq!(fixer.role.as_deref(), Some("explorer"));
+    assert!(fixer.model.is_none());
+
+    // JSON roundtrip.
+    let json = serde_json::to_string(&crew).unwrap();
+    let back: CrewType = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.name, "git-bug-fixer");
+    assert_eq!(back.agents.len(), 2);
+}
+
+#[test]
+fn crew_type_minimal() {
+    let toml_str = r#"
+name = "minimal"
+description = "A minimal crew with no agents or inputs"
+"#;
+
+    let crew: CrewType = toml::from_str(toml_str).expect("parse minimal crew TOML");
+    assert_eq!(crew.name, "minimal");
+    assert_eq!(crew.description, "A minimal crew with no agents or inputs");
+    assert_eq!(crew.mode, CrewMode::Interactive);
+    assert!(crew.initial_prompt.is_none());
+    assert!(crew.inputs.is_empty());
+    assert_eq!(crew.main_agent, "default");
+    assert!(crew.agents.is_empty());
+    assert!(crew.approval_policy.is_none());
+}
+
+#[test]
+fn crew_input_spec_defaults() {
+    // `required` defaults to true when not specified.
+    let toml_str = r#"
+description = "Some input"
+"#;
+    let spec: CrewInputSpec = toml::from_str(toml_str).unwrap();
+    assert!(spec.required);
+    assert!(spec.default.is_none());
+
+    // Explicit optional with default value.
+    let toml_str2 = r#"
+description = "Some optional input"
+required = false
+default = "hello"
+"#;
+    let spec2: CrewInputSpec = toml::from_str(toml_str2).unwrap();
+    assert!(!spec2.required);
+    assert_eq!(spec2.default.as_deref(), Some("hello"));
+}
+
+#[test]
+fn crew_agent_def_inline_vs_role() {
+    // Inline agent: model + instructions.
+    let toml_str = r#"
+model = "gpt-4o"
+instructions = "Be helpful."
+description = "A helpful agent"
+"#;
+    let def: CrewAgentDef = toml::from_str(toml_str).unwrap();
+    assert!(def.role.is_none());
+    assert_eq!(def.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(def.instructions.as_deref(), Some("Be helpful."));
+
+    // Role reference.
+    let toml_str2 = r#"
+role = "explorer"
+description = "Explores the code"
+"#;
+    let def2: CrewAgentDef = toml::from_str(toml_str2).unwrap();
+    assert_eq!(def2.role.as_deref(), Some("explorer"));
+    assert!(def2.model.is_none());
+    assert!(def2.instructions.is_none());
+}
+
+#[test]
+fn apply_crew_type_interpolates_placeholders() {
+    use std::collections::BTreeMap;
+    use codex_temporal::config_loader::apply_crew_type;
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let crew = CrewType {
+        name: "test-crew".to_string(),
+        description: "test".to_string(),
+        mode: CrewMode::Autonomous,
+        initial_prompt: Some("Monitor {repo_url} on {branch}".to_string()),
+        inputs: {
+            let mut m = BTreeMap::new();
+            m.insert("repo_url".to_string(), CrewInputSpec {
+                description: "repo".to_string(),
+                required: true,
+                default: None,
+            });
+            m.insert("branch".to_string(), CrewInputSpec {
+                description: "branch".to_string(),
+                required: false,
+                default: Some("main".to_string()),
+            });
+            m
+        },
+        main_agent: "coordinator".to_string(),
+        agents: {
+            let mut m = BTreeMap::new();
+            m.insert("coordinator".to_string(), CrewAgentDef {
+                role: None,
+                model: Some("gpt-4o-mini".to_string()),
+                instructions: Some("Fix bugs on {repo_url} branch {branch}".to_string()),
+                description: Some("Coordinates".to_string()),
+            });
+            m
+        },
+        approval_policy: None,
+    };
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("repo_url".to_string(), "https://github.com/test/repo".to_string());
+
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: "default instructions".to_string(),
+        approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+
+    apply_crew_type(&crew, &inputs, &mut base).unwrap();
+
+    // Model overridden from main agent.
+    assert_eq!(base.model, "gpt-4o-mini");
+    // Instructions interpolated.
+    assert_eq!(
+        base.instructions,
+        "Fix bugs on https://github.com/test/repo branch main"
+    );
+    // User message set from initial_prompt (autonomous mode).
+    assert_eq!(
+        base.user_message,
+        "Monitor https://github.com/test/repo on main"
+    );
+}
+
+#[test]
+fn apply_crew_type_rejects_missing_required_input() {
+    use std::collections::BTreeMap;
+    use codex_temporal::config_loader::apply_crew_type;
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let crew = CrewType {
+        name: "test".to_string(),
+        description: "test".to_string(),
+        mode: CrewMode::Autonomous,
+        initial_prompt: Some("{repo_url}".to_string()),
+        inputs: {
+            let mut m = BTreeMap::new();
+            m.insert("repo_url".to_string(), CrewInputSpec {
+                description: "repo".to_string(),
+                required: true,
+                default: None,
+            });
+            m
+        },
+        main_agent: "default".to_string(),
+        agents: BTreeMap::new(),
+        approval_policy: None,
+    };
+
+    let empty_inputs = BTreeMap::new();
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: String::new(),
+        approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+
+    let err = apply_crew_type(&crew, &empty_inputs, &mut base);
+    assert!(err.is_err());
+    assert!(
+        err.unwrap_err().to_string().contains("missing required input"),
+        "should mention missing required input"
+    );
+}
+
+#[test]
+fn apply_crew_type_uses_input_defaults() {
+    use std::collections::BTreeMap;
+    use codex_temporal::config_loader::apply_crew_type;
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let crew = CrewType {
+        name: "test".to_string(),
+        description: "test".to_string(),
+        mode: CrewMode::Autonomous,
+        initial_prompt: Some("branch: {branch}".to_string()),
+        inputs: {
+            let mut m = BTreeMap::new();
+            m.insert("branch".to_string(), CrewInputSpec {
+                description: "branch".to_string(),
+                required: false,
+                default: Some("develop".to_string()),
+            });
+            m
+        },
+        main_agent: "default".to_string(),
+        agents: BTreeMap::new(),
+        approval_policy: None,
+    };
+
+    let empty_inputs = BTreeMap::new();
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: String::new(),
+        approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+
+    apply_crew_type(&crew, &empty_inputs, &mut base).unwrap();
+
+    // Default value "develop" should be used.
+    assert_eq!(base.user_message, "branch: develop");
+}
+
+#[test]
+fn discover_crew_types_reads_directory() {
+    use codex_temporal::config_loader::discover_crew_types;
+
+    // Set CODEX_HOME to a temp directory with a crews/ subdirectory.
+    let tmp = tempfile::tempdir().unwrap();
+    let crews_dir = tmp.path().join("crews");
+    std::fs::create_dir_all(&crews_dir).unwrap();
+
+    // Write two crew TOML files.
+    std::fs::write(
+        crews_dir.join("alpha.toml"),
+        r#"
+name = "alpha"
+description = "Alpha crew"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        crews_dir.join("beta.toml"),
+        r#"
+name = "beta"
+description = "Beta crew"
+mode = "autonomous"
+initial_prompt = "Do beta things."
+"#,
+    )
+    .unwrap();
+
+    // Write a non-TOML file (should be ignored).
+    std::fs::write(crews_dir.join("readme.txt"), "ignore me").unwrap();
+
+    // Temporarily override CODEX_HOME.
+    let _guard = EnvGuard::set("CODEX_HOME", tmp.path().to_str().unwrap());
+
+    let crews = discover_crew_types().unwrap();
+    assert_eq!(crews.len(), 2);
+    assert_eq!(crews[0].name, "alpha");
+    assert_eq!(crews[1].name, "beta");
+    assert_eq!(crews[1].mode, CrewMode::Autonomous);
+}
+
+/// RAII guard that sets an env var for the duration of its lifetime
+/// and restores the previous value on drop.
+struct EnvGuard {
+    key: String,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: test code — no concurrent env access.
+        unsafe { std::env::set_var(key, value) };
+        Self {
+            key: key.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            // SAFETY: test code — no concurrent env access.
+            Some(v) => unsafe { std::env::set_var(&self.key, v) },
+            None => unsafe { std::env::remove_var(&self.key) },
+        }
+    }
 }

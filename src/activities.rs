@@ -551,7 +551,9 @@ fn extract_tool_output(
             (text, if success { 0 } else { 1 })
         }
         ResponseInputItem::CustomToolCallOutput { output, .. } => {
-            (output.clone(), 0)
+            let text = output.body.to_text().unwrap_or_default();
+            let success = output.success.unwrap_or(true);
+            (text, if success { 0 } else { 1 })
         }
         other => {
             (format!("{other:?}"), 0)

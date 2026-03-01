@@ -57,7 +57,7 @@ fn user_turn_op(text: &str) -> Op {
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         model: "gpt-4o".to_string(),
         effort: None,
-        summary: ReasoningSummary::Auto,
+        summary: Some(ReasoningSummary::Auto),
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
@@ -228,7 +228,7 @@ fn user_turn_op_with_model(text: &str, model: &str) -> Op {
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         model: model.to_string(),
         effort: None,
-        summary: ReasoningSummary::Auto,
+        summary: Some(ReasoningSummary::Auto),
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
@@ -740,6 +740,7 @@ async fn session_resume(client: &Client) {
         model: "gpt-4o-mini".to_string(),
         created_at_millis: now_millis,
         status: SessionStatus::Running,
+        crew_type: None,
     };
     let harness_handle = client.get_workflow_handle::<CodexHarnessRun>(&harness_id);
     harness_handle
@@ -1267,6 +1268,7 @@ async fn session_picker_conversion(client: &Client) {
         model: "gpt-4o".to_string(),
         created_at_millis: now_millis,
         status: SessionStatus::Running,
+        crew_type: None,
     };
     let entry2 = SessionEntry {
         session_id: session_id_2.clone(),
@@ -1274,6 +1276,7 @@ async fn session_picker_conversion(client: &Client) {
         model: "gpt-4o-mini".to_string(),
         created_at_millis: now_millis + 1000,
         status: SessionStatus::Running,
+        crew_type: None,
     };
 
     harness_handle
@@ -1374,7 +1377,7 @@ async fn command_safety_auto_approves_safe_commands(client: &Client) {
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         model: "gpt-4o-mini".to_string(),
         effort: None,
-        summary: ReasoningSummary::Auto,
+        summary: Some(ReasoningSummary::Auto),
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
@@ -2315,6 +2318,96 @@ async fn session_spawn_additional_agent(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test that a crew type TOML can be loaded, applied, and used to start a
+/// session that completes successfully.
+///
+/// 1. Write crew TOML to CODEX_HOME/crews/.
+/// 2. Load via load_crew_type().
+/// 3. Apply via apply_crew_type() with test inputs.
+/// 4. Start SessionWorkflow with the configured input.
+/// 5. Wait for TurnComplete (initial prompt triggers model response).
+async fn crew_type_session_flow(client: &Client, codex_home: &std::path::Path) {
+    use codex_temporal::config_loader::{apply_crew_type, load_crew_type};
+    use codex_temporal::types::SessionWorkflowInput;
+
+    // Write a crew TOML to the CODEX_HOME/crews/ directory.
+    let crews_dir = codex_home.join("crews");
+    std::fs::create_dir_all(&crews_dir).expect("failed to create crews dir");
+    std::fs::write(
+        crews_dir.join("test-crew.toml"),
+        r#"
+name = "test-crew"
+description = "Test crew for e2e"
+mode = "autonomous"
+initial_prompt = "Say the word '{magic_word}' and nothing else."
+main_agent = "main"
+
+[inputs.magic_word]
+description = "The word to say"
+required = true
+
+[agents.main]
+model = "gpt-4o-mini"
+instructions = "You are a concise assistant. When asked to say a word, reply with only that word."
+description = "Main agent"
+"#,
+    )
+    .expect("failed to write crew TOML");
+
+    // Load the crew type.
+    let crew = load_crew_type("test-crew").expect("failed to load crew type");
+    assert_eq!(crew.name, "test-crew");
+
+    // Build base input and apply crew type.
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: "default".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+    };
+
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert("magic_word".to_string(), "pineapple".to_string());
+    apply_crew_type(&crew, &inputs, &mut base).expect("apply_crew_type failed");
+
+    // Verify the crew type was applied.
+    assert_eq!(base.model, "gpt-4o-mini", "model should be overridden by crew");
+    assert!(
+        base.user_message.contains("pineapple"),
+        "user_message should contain interpolated magic_word"
+    );
+
+    // Start a session with the crew-configured input.
+    let workflow_id = format!("e2e-crew-{}", uuid::Uuid::new_v4());
+    let session = TemporalAgentSession::new(client.clone(), workflow_id, base);
+
+    // The autonomous mode sets user_message, so we submit a UserTurn to
+    // trigger the workflow. The session's initial user_message flows through
+    // SessionWorkflow → AgentWorkflow.
+    session
+        .submit(user_turn_op("Say the word 'pineapple' and nothing else."))
+        .await
+        .expect("submit failed");
+
+    let msg = wait_for_turn_complete(&session).await;
+    assert!(msg.is_some(), "expected agent message from crew session");
+
+    let response = msg.unwrap().to_lowercase();
+    assert!(
+        response.contains("pineapple"),
+        "expected 'pineapple' in response, got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -2536,6 +2629,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: session_spawn_additional_agent ---");
     session_spawn_additional_agent(&client).await;
+
+    eprintln!("--- test: crew_type_session_flow ---");
+    crew_type_session_flow(&client, &default_codex_home).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.
