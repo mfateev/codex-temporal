@@ -317,7 +317,12 @@ impl codex_core::AgentSession for TemporalAgentSession {
             if !started {
                 let message = Self::extract_message(items);
                 return self
-                    .start_workflow(message, effort, summary, personality)
+                    .start_workflow(
+                        message,
+                        effort,
+                        summary.unwrap_or_default(),
+                        personality,
+                    )
                     .await;
             }
         }

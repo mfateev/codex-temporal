@@ -307,7 +307,7 @@ impl AgentWorkflow {
                     turn_id,
                     message,
                     effort,
-                    summary,
+                    summary: summary.unwrap_or_default(),
                     personality,
                 });
             }
