@@ -21,7 +21,6 @@ use codex_core::config::Config;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::AuthManager;
-use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -29,15 +28,16 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::ThreadId;
 
+use codex_temporal::config_loader;
 use codex_temporal::harness::{CodexHarness, CodexHarnessRun};
 use codex_temporal::session::TemporalAgentSession;
 use codex_temporal::types::{
-    HarnessInput, SessionEntry, SessionStatus, SessionWorkflowInput,
+    HarnessInput, SessionEntry, SessionStatus,
 };
 
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions,
-    WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowIdConflictPolicy;
 use temporalio_common::telemetry::TelemetryOptions;
@@ -79,6 +79,20 @@ async fn register_with_harness(
         )
         .await?;
     Ok(())
+}
+
+/// Query the harness to check if the worker has API credentials.
+async fn query_credentials_available(client: &Client) -> Result<bool, Box<dyn std::error::Error>> {
+    let harness_id = harness_workflow_id();
+    let handle = client.get_workflow_handle::<CodexHarnessRun>(&harness_id);
+    let available: bool = handle
+        .query(
+            CodexHarness::credentials_available,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await?;
+    Ok(available)
 }
 
 /// Parse --resume flag from args.
@@ -143,16 +157,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_url = std::env::var("TEMPORAL_ADDRESS")
         .unwrap_or_else(|_| "http://localhost:7233".to_string());
-    let model = std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-    let approval_policy = match std::env::var("CODEX_APPROVAL_POLICY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "never" => AskForApproval::Never,
-        "untrusted" => AskForApproval::UnlessTrusted,
-        "on-failure" => AskForApproval::OnFailure,
-        _ => AskForApproval::OnRequest,
-    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // --- Connect to Temporal ---
@@ -167,61 +171,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::connect(connection_options).await?;
     let client = Client::new(connection, ClientOptions::new("default").build())?;
 
-    // --- Parse env-based config ---
-    let web_search_mode = match std::env::var("CODEX_WEB_SEARCH")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "live" => Some(codex_protocol::config_types::WebSearchMode::Live),
-        "cached" => Some(codex_protocol::config_types::WebSearchMode::Cached),
-        _ => None,
-    };
+    // --- Load config.toml and apply env-var overrides ---
+    let harness_config = config_loader::load_harness_config().await?;
+    let mut base_input = harness_config.base_input;
+    config_loader::apply_env_overrides(&mut base_input);
+    let mut provider = harness_config.model_provider;
 
-    let reasoning_effort = match std::env::var("CODEX_EFFORT")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        _ => None,
-    };
-
-    let reasoning_summary = match std::env::var("CODEX_REASONING_SUMMARY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "concise" => ReasoningSummary::Concise,
-        "detailed" => ReasoningSummary::Detailed,
-        _ => ReasoningSummary::Auto,
-    };
-
-    let personality = match std::env::var("CODEX_PERSONALITY")
-        .unwrap_or_default()
-        .as_str()
-    {
-        "friendly" => Some(Personality::Friendly),
-        "pragmatic" => Some(Personality::Pragmatic),
-        _ => None,
-    };
-
-    let base_input = SessionWorkflowInput {
-        user_message: String::new(),
-        model: model.clone(),
-        instructions: "You are a helpful coding assistant.".to_string(),
-        approval_policy,
-        web_search_mode,
-        reasoning_effort,
-        reasoning_summary,
-        personality,
-        developer_instructions: None,
-        model_provider: None,
-        crew_agents: Default::default(),
-        continued_state: None,
-    };
+    let model = base_input.model.clone();
+    let approval_policy = base_input.approval_policy;
+    let reasoning_effort = base_input.reasoning_effort;
 
     // --- Ensure harness is running ---
     ensure_harness(&client).await?;
+
+    // --- Token forwarding ---
+    // WARNING: Token forwarding embeds the API key in Temporal workflow history.
+    // This is acceptable for development but not recommended for production.
+    // In production, configure credentials on the worker directly or use a
+    // secrets manager (e.g. HashiCorp Vault).
+    let needs_token = !query_credentials_available(&client).await.unwrap_or(true);
+    if needs_token {
+        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+            provider.experimental_bearer_token = Some(api_key);
+            provider.env_key = None; // Worker won't have this env var
+        }
+    }
+    base_input.model_provider = Some(provider);
 
     // --- Build Config ---
     let codex_home = std::env::var("HOME")

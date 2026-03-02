@@ -395,6 +395,27 @@ impl CodexActivities {
         })
     }
 
+    /// Check if the worker has API credentials available.
+    ///
+    /// Returns `true` if `OPENAI_API_KEY` or `OPENAI_BEARER_TOKEN` is set
+    /// and non-empty in the worker's environment.
+    #[activity]
+    pub async fn check_credentials(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        _input: (),
+    ) -> Result<bool, ActivityError> {
+        let has_env_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some();
+        let has_bearer = std::env::var("OPENAI_BEARER_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some();
+        Ok(has_env_key || has_bearer)
+    }
+
     /// Resolve role-specific config by applying a role overlay on top of the
     /// base config.
     ///

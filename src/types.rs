@@ -426,6 +426,9 @@ pub struct HarnessInput {
 pub struct HarnessState {
     /// Known sessions tracked by the harness.
     pub sessions: Vec<SessionEntry>,
+    /// Whether the worker has API credentials available (checked once at startup).
+    #[serde(default)]
+    pub credentials_available: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

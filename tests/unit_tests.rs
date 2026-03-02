@@ -1055,6 +1055,7 @@ fn harness_state_roundtrips() {
                 crew_type: None,
             },
         ],
+        credentials_available: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1072,6 +1073,28 @@ fn harness_input_defaults_when_empty() {
     assert!(
         input.continued_state.is_none(),
         "continued_state should default to None"
+    );
+}
+
+#[test]
+fn harness_state_credentials_available_roundtrips() {
+    let state = HarnessState {
+        sessions: vec![],
+        credentials_available: Some(true),
+    };
+    let json = serde_json::to_string(&state).unwrap();
+    let back: HarnessState = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.credentials_available, Some(true));
+}
+
+#[test]
+fn harness_state_credentials_available_defaults_to_none() {
+    // JSON without credentials_available should deserialize to None (backward compat).
+    let json = r#"{"sessions":[]}"#;
+    let back: HarnessState = serde_json::from_str(json).unwrap();
+    assert!(
+        back.credentials_available.is_none(),
+        "credentials_available should default to None when absent"
     );
 }
 
