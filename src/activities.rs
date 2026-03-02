@@ -508,7 +508,7 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
 
     // Construct minimal Session + TurnContext for the dispatch.
     let conversation_id = ThreadId::new();
-    let event_sink: Arc<dyn EventSink> = Arc::new(BufferEventSink::new());
+    let event_sink: Arc<dyn EventSink> = Arc::new(BufferEventSink::new(4096, 0));
     let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
 
     let session = Session::new_minimal(

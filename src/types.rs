@@ -9,7 +9,7 @@ use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
-use codex_protocol::protocol::{AskForApproval, GitInfo, RolloutItem, TokenUsage};
+use codex_protocol::protocol::{AskForApproval, Event, GitInfo, RolloutItem, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -733,4 +733,10 @@ pub struct ContinueAsNewState {
     /// Overridden personality (from `Op::OverrideTurnContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personality_override: Option<Personality>,
+    /// Monotonic offset of evicted events from the rolling event buffer.
+    #[serde(default)]
+    pub event_offset: usize,
+    /// Snapshot of buffered events carried across CAN.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_snapshot: Vec<Event>,
 }

@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config_loader::config_from_toml;
 use crate::entropy::TemporalRandomSource;
-use crate::sink::BufferEventSink;
+use crate::sink::{BufferEventSink, DEFAULT_EVENT_BUFFER_CAPACITY};
 use crate::storage::InMemoryStorage;
 use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
@@ -177,6 +177,7 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
 fn do_continue_as_new(
     input: &AgentWorkflowInput,
     storage: &InMemoryStorage,
+    events: &BufferEventSink,
     pending_turns: Vec<UserTurnInput>,
     total_iterations: u32,
     turn_counter: u32,
@@ -188,6 +189,7 @@ fn do_continue_as_new(
     summary_override: Option<ReasoningSummary>,
     personality_override: Option<Personality>,
 ) -> WorkflowResult<AgentWorkflowOutput> {
+    let (event_offset, event_snapshot) = events.snapshot();
     let state = ContinueAsNewState {
         rollout_items: storage.items(),
         pending_user_turns: pending_turns,
@@ -200,6 +202,8 @@ fn do_continue_as_new(
         effort_override,
         summary_override,
         personality_override,
+        event_offset,
+        event_snapshot,
     };
 
     let mut can_input = input.clone();
@@ -225,7 +229,11 @@ impl AgentWorkflow {
             return Self {
                 user_turns: state.pending_user_turns.clone(),
                 turn_counter: state.cumulative_turn_count,
-                events: Arc::new(BufferEventSink::new()),
+                events: Arc::new(BufferEventSink::from_snapshot(
+                    state.event_offset,
+                    state.event_snapshot.clone(),
+                    DEFAULT_EVENT_BUFFER_CAPACITY,
+                )),
                 pending_approval: None,
                 pending_user_input: None,
                 pending_patch_approval: None,
@@ -262,7 +270,7 @@ impl AgentWorkflow {
 
         Self {
             input,
-            events: Arc::new(BufferEventSink::new()),
+            events: Arc::new(BufferEventSink::new(DEFAULT_EVENT_BUFFER_CAPACITY, 0)),
             user_turns: initial_turns,
             turn_counter,
             pending_approval: None,
@@ -681,6 +689,7 @@ impl AgentWorkflow {
                         break Some(do_continue_as_new(
                             &input,
                             &storage,
+                            &events,
                             pending,
                             total_iterations,
                             turn_count,
@@ -941,6 +950,7 @@ impl AgentWorkflow {
                         break Some(do_continue_as_new(
                             &input,
                             &storage,
+                            &events,
                             pending,
                             total_iterations,
                             turn_count,
@@ -981,10 +991,14 @@ impl AgentWorkflow {
         })
     }
 
-    /// Legacy query — returns debug-formatted events (kept for backward compat).
+    /// Legacy query — returns JSON-serialized events (kept for backward compat).
+    ///
+    /// Uses `events_since(0)` instead of the old `drain()` to avoid
+    /// conflicting with the rolling buffer semantics.
     #[query]
     pub fn get_events(&self, _ctx: &WorkflowContextView) -> Vec<String> {
-        self.events.drain().iter().map(|e| format!("{e:?}")).collect()
+        let (events, _watermark) = self.events.events_since(0);
+        events
     }
 }
 

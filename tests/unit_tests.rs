@@ -56,7 +56,7 @@ fn temporal_random_f64_in_range() {
 
 #[tokio::test]
 async fn buffer_event_sink_collects_and_drains() {
-    let sink = BufferEventSink::new();
+    let sink = BufferEventSink::new(4096, 0);
     assert!(sink.is_empty());
 
     // Use a real event type that we can construct.
@@ -77,6 +77,10 @@ async fn buffer_event_sink_collects_and_drains() {
     let drained = sink.drain();
     assert_eq!(drained.len(), 2);
     assert!(sink.is_empty(), "drain should clear the buffer");
+
+    // After drain, offset should have advanced — watermark reflects drained count.
+    let (_events, watermark) = sink.events_since(0);
+    assert_eq!(watermark, 2, "offset should advance after drain");
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +206,7 @@ async fn session_new_minimal_creates_usable_session() {
         .expect("config");
     let config = Arc::new(config);
 
-    let event_sink: Arc<dyn EventSink> = Arc::new(BufferEventSink::new());
+    let event_sink: Arc<dyn EventSink> = Arc::new(BufferEventSink::new(4096, 0));
     let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
 
     let session = codex_core::Session::new_minimal(
@@ -303,7 +307,7 @@ fn pending_approval_decision_lifecycle() {
 
 #[tokio::test]
 async fn buffer_event_sink_events_since_returns_subset() {
-    let sink = BufferEventSink::new();
+    let sink = BufferEventSink::new(4096, 0);
 
     use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
 
@@ -351,7 +355,7 @@ async fn buffer_event_sink_events_since_returns_subset() {
 
 #[tokio::test]
 async fn buffer_event_sink_emit_event_sync_works() {
-    let sink = BufferEventSink::new();
+    let sink = BufferEventSink::new(4096, 0);
 
     use codex_protocol::protocol::{Event, EventMsg};
 
@@ -365,6 +369,147 @@ async fn buffer_event_sink_emit_event_sync_works() {
     let (events, watermark) = sink.events_since(0);
     assert_eq!(events.len(), 1);
     assert_eq!(watermark, 1);
+}
+
+#[tokio::test]
+async fn buffer_event_sink_rolling_window_evicts_oldest() {
+    let capacity = 10;
+    let sink = BufferEventSink::new(capacity, 0);
+
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    // Push capacity + 5 events.
+    let total = capacity + 5;
+    for i in 0..total {
+        let event = Event {
+            id: format!("ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink.emit_event(event).await;
+    }
+
+    // Buffer should contain exactly `capacity` events.
+    assert_eq!(sink.len(), capacity);
+
+    // events_since(0) returns only the window (client is behind).
+    let (events, watermark) = sink.events_since(0);
+    assert_eq!(events.len(), capacity);
+    assert_eq!(watermark, total);
+
+    // The first event in the buffer should be ev-5 (0..4 were evicted).
+    let first: Event = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(first.id, "ev-5");
+
+    // events_since with the correct watermark returns empty.
+    let (events, watermark2) = sink.events_since(watermark);
+    assert!(events.is_empty());
+    assert_eq!(watermark2, watermark);
+}
+
+#[tokio::test]
+async fn buffer_event_sink_snapshot_and_restore() {
+    let sink = BufferEventSink::new(100, 0);
+
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    for i in 0..5 {
+        let event = Event {
+            id: format!("ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink.emit_event(event).await;
+    }
+
+    // Snapshot.
+    let (offset, snapshot) = sink.snapshot();
+    assert_eq!(offset, 0);
+    assert_eq!(snapshot.len(), 5);
+
+    // Restore into a new sink.
+    let restored = BufferEventSink::from_snapshot(offset, snapshot, 100);
+    assert_eq!(restored.len(), 5);
+
+    // events_since should return the same results.
+    let (orig_events, orig_wm) = sink.events_since(0);
+    let (rest_events, rest_wm) = restored.events_since(0);
+    assert_eq!(orig_events, rest_events);
+    assert_eq!(orig_wm, rest_wm);
+
+    // events_since(3) on restored should return last 2 events.
+    let (events, watermark) = restored.events_since(3);
+    assert_eq!(events.len(), 2);
+    assert_eq!(watermark, 5);
+}
+
+#[tokio::test]
+async fn buffer_event_sink_offset_continuity_across_can() {
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    // Simulate first CAN run: push 20 events into a capacity-10 buffer.
+    let sink1 = BufferEventSink::new(10, 0);
+    for i in 0..20 {
+        let event = Event {
+            id: format!("run1-ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink1.emit_event(event).await;
+    }
+
+    // Client polled and has watermark=20.
+    let (_events, client_watermark) = sink1.events_since(0);
+    assert_eq!(client_watermark, 20);
+
+    // Snapshot for CAN.
+    let (offset, snapshot) = sink1.snapshot();
+    assert_eq!(offset, 10); // 10 events were evicted
+
+    // Restore in new run.
+    let sink2 = BufferEventSink::from_snapshot(offset, snapshot, 10);
+
+    // Push 5 more events in the new run.
+    for i in 0..5 {
+        let event = Event {
+            id: format!("run2-ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{}", 20 + i),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink2.emit_event(event).await;
+    }
+
+    // Client polls with old watermark=20 — should get the 5 new events.
+    let (events, new_watermark) = sink2.events_since(20);
+    assert_eq!(events.len(), 5);
+    assert_eq!(new_watermark, 25); // monotonically increasing
+
+    // Verify watermark is monotonic.
+    assert!(new_watermark > client_watermark);
+
+    // Client polls with new watermark — should get empty.
+    let (events, wm) = sink2.events_since(new_watermark);
+    assert!(events.is_empty());
+    assert_eq!(wm, 25);
+
+    // Client that fell far behind (watermark=5) gets whatever is in the buffer.
+    let (events, wm) = sink2.events_since(5);
+    // Buffer has 10 old + 5 new = 15, but capacity is 10, so 5 were evicted.
+    // Buffer contains events from offset=15..25 (10 events).
+    assert_eq!(events.len(), 10);
+    assert_eq!(wm, 25);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +704,8 @@ fn continue_as_new_state_roundtrips_through_json() {
         effort_override: None,
         summary_override: None,
         personality_override: None,
+        event_offset: 0,
+        event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -599,6 +746,8 @@ fn workflow_input_with_continued_state_roundtrips() {
             effort_override: None,
             summary_override: None,
             personality_override: None,
+            event_offset: 0,
+            event_snapshot: vec![],
         }),
         role: "default".to_string(),
         config_toml: None,
@@ -880,7 +1029,7 @@ async fn dispatch_with_experimental_tools(
     let (_specs, registry) = builder.build();
 
     let conversation_id = ThreadId::new();
-    let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new());
+    let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new(4096, 0));
     let storage: Arc<dyn codex_core::StorageBackend> = Arc::new(InMemoryStorage::new());
 
     let session = Session::new_minimal(
@@ -1739,6 +1888,8 @@ fn continue_as_new_state_with_mcp_tools() {
         effort_override: None,
         summary_override: None,
         personality_override: None,
+        event_offset: 0,
+        event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1780,6 +1931,8 @@ fn continue_as_new_state_with_approval_policy_roundtrips() {
         effort_override: None,
         summary_override: None,
         personality_override: None,
+        event_offset: 0,
+        event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
