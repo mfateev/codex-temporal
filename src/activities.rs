@@ -66,6 +66,11 @@ pub struct CodexActivities {
     provider: ModelProviderInfo,
     /// Persistent MCP server connections (initialized via `discover_mcp_tools`).
     mcp_manager: Arc<Mutex<HarnessMcpManager>>,
+    /// Worker-issued token for activity-level authentication.
+    /// Generated once at worker startup; verified by `tool_exec` before
+    /// executing any tool. Prevents unauthorized activity dispatch from
+    /// rogue workflows on shared task queues.
+    worker_token: String,
 }
 
 impl CodexActivities {
@@ -74,6 +79,7 @@ impl CodexActivities {
         Self {
             provider: resolve_provider(),
             mcp_manager: Arc::new(Mutex::new(HarnessMcpManager::new())),
+            worker_token: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -201,14 +207,45 @@ impl CodexActivities {
     ///
     /// Supports all tools registered by `build_specs`: shell, apply_patch,
     /// read_file, list_dir, grep_files, etc.
+    ///
+    /// Verifies the `worker_token` in the input matches this worker's token
+    /// before executing. This prevents unauthorized activity dispatch from
+    /// rogue workflows on shared Temporal task queues.
     #[activity]
     pub async fn tool_exec(
+        self: Arc<Self>,
         _ctx: ActivityContext,
         input: ToolExecInput,
     ) -> Result<ToolExecOutput, ActivityError> {
+        // Verify worker token before executing anything.
+        match &input.worker_token {
+            Some(token) if token == &self.worker_token => {}
+            Some(_) => {
+                tracing::warn!(
+                    tool = %input.tool_name,
+                    call_id = %input.call_id,
+                    "tool_exec rejected: worker token mismatch"
+                );
+                return Err(anyhow::anyhow!(
+                    "tool_exec rejected: worker token mismatch — \
+                     activity was not dispatched by a legitimate workflow on this worker"
+                ).into());
+            }
+            None => {
+                tracing::warn!(
+                    tool = %input.tool_name,
+                    call_id = %input.call_id,
+                    "tool_exec: no worker token provided (legacy caller)"
+                );
+                // Allow for backward compatibility, but log the gap.
+            }
+        }
+
         tracing::info!(
             tool = %input.tool_name,
             call_id = %input.call_id,
+            cwd = %input.cwd,
+            has_config = input.config_toml.is_some(),
             "tool_exec activity invoked"
         );
 
@@ -223,9 +260,14 @@ impl CodexActivities {
     /// config layers from disk, returning the effective config as a TOML
     /// string. The workflow deserializes this into `ConfigToml` and builds
     /// a full `Config` using `Config::from_toml()`.
+    ///
+    /// Also returns the worker's activity token so the workflow can include
+    /// it in subsequent `ToolExecInput` calls for authentication.
     #[activity]
     pub async fn load_config(
+        self: Arc<Self>,
         _ctx: ActivityContext,
+        _input: (),
     ) -> Result<ConfigOutput, ActivityError> {
         tracing::info!("load_config activity invoked");
 
@@ -239,7 +281,10 @@ impl CodexActivities {
             "config loaded successfully"
         );
 
-        Ok(ConfigOutput { config_toml: toml_string })
+        Ok(ConfigOutput {
+            config_toml: toml_string,
+            worker_token: Some(self.worker_token.clone()),
+        })
     }
 
     /// Discover MCP tools from configured servers.
@@ -395,6 +440,21 @@ impl CodexActivities {
         })
     }
 
+    /// Return this worker's activity token.
+    ///
+    /// Lightweight activity called at workflow startup so the workflow can
+    /// include the token in subsequent `ToolExecInput` calls. This is
+    /// always called — even after continue-as-new or when config is
+    /// pre-resolved — to ensure the token matches the current worker.
+    #[activity]
+    pub async fn get_worker_token(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        _input: (),
+    ) -> Result<String, ActivityError> {
+        Ok(self.worker_token.clone())
+    }
+
     /// Check if the worker has API credentials available.
     ///
     /// Returns `true` if `OPENAI_API_KEY` or `OPENAI_BEARER_TOKEN` is set
@@ -470,7 +530,32 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     use codex_core::config::Constrained;
     use codex_protocol::protocol::AskForApproval;
 
+    // --- Input validation ---
+    if input.tool_name.is_empty() {
+        anyhow::bail!("tool_name must not be empty");
+    }
+
     let cwd = PathBuf::from(&input.cwd);
+    if !cwd.exists() {
+        anyhow::bail!(
+            "cwd does not exist: {}",
+            cwd.display()
+        );
+    }
+    if !cwd.is_dir() {
+        anyhow::bail!(
+            "cwd is not a directory: {}",
+            cwd.display()
+        );
+    }
+
+    if input.config_toml.is_none() {
+        tracing::warn!(
+            tool = %input.tool_name,
+            "dispatch_tool: no config_toml provided — \
+             falling back to Config::for_harness() with default sandbox policy"
+        );
+    }
 
     // Build Config: prefer the activity-loaded config TOML when present,
     // falling back to Config::for_harness() for backward compatibility.

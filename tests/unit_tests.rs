@@ -882,6 +882,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
     }
 }
 
@@ -941,6 +942,7 @@ async fn dispatch_shell_with_cwd() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -974,6 +976,7 @@ sandbox_mode = "read-only"
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(toml_str.to_string()),
+        worker_token: None,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -983,6 +986,77 @@ sandbox_mode = "read-only"
         output.exit_code, 0,
         "write command should fail under read-only sandbox, got output: {}",
         output.output,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Input validation tests for dispatch_tool
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dispatch_tool_rejects_empty_tool_name() {
+    let input = ToolExecInput {
+        tool_name: "".to_string(),
+        call_id: "test-empty".to_string(),
+        arguments: "{}".to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
+    };
+
+    let result = dispatch_tool(input).await;
+    assert!(result.is_err(), "empty tool_name should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("tool_name must not be empty"),
+        "error should mention tool_name: {err}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_tool_rejects_nonexistent_cwd() {
+    let input = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "test-bad-cwd".to_string(),
+        arguments: r#"{"command":["echo","hi"]}"#.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/nonexistent/path/that/does/not/exist".to_string(),
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
+    };
+
+    let result = dispatch_tool(input).await;
+    assert!(result.is_err(), "nonexistent cwd should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cwd does not exist"),
+        "error should mention cwd: {err}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_tool_rejects_cwd_that_is_file() {
+    // Create a temporary file to use as a non-directory cwd.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file_path = tmp.path().to_string_lossy().to_string();
+
+    let input = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "test-file-cwd".to_string(),
+        arguments: r#"{"command":["echo","hi"]}"#.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: file_path,
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
+    };
+
+    let result = dispatch_tool(input).await;
+    assert!(result.is_err(), "file as cwd should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cwd is not a directory"),
+        "error should mention not a directory: {err}"
     );
 }
 
@@ -1600,15 +1674,22 @@ fn model_call_input_provider_defaults_to_none() {
 fn config_output_roundtrips() {
     let original = ConfigOutput {
         config_toml: "model = \"gpt-4o\"\napproval_policy = \"on-request\"\n".to_string(),
+        worker_token: Some("test-token-123".to_string()),
     };
     let json = serde_json::to_string(&original).unwrap();
     let back: ConfigOutput = serde_json::from_str(&json).unwrap();
     assert_eq!(back.config_toml, original.config_toml);
+    assert_eq!(back.worker_token, original.worker_token);
+
+    // Backward compat: old JSON without worker_token should default to None.
+    let old_json = r#"{"config_toml":"model = \"gpt-4o\"\n"}"#;
+    let back_old: ConfigOutput = serde_json::from_str(old_json).unwrap();
+    assert!(back_old.worker_token.is_none(), "missing worker_token should default to None");
 }
 
 #[test]
 fn tool_exec_input_config_toml_roundtrip() {
-    // With config_toml present.
+    // With config_toml and worker_token present.
     let input_with = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c1".to_string(),
@@ -1616,16 +1697,22 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
+        worker_token: Some("tok-abc".to_string()),
     };
     let json_with = serde_json::to_string(&input_with).unwrap();
     assert!(
         json_with.contains("config_toml"),
         "config_toml should be serialized when Some"
     );
+    assert!(
+        json_with.contains("worker_token"),
+        "worker_token should be serialized when Some"
+    );
     let back_with: ToolExecInput = serde_json::from_str(&json_with).unwrap();
     assert_eq!(back_with.config_toml, input_with.config_toml);
+    assert_eq!(back_with.worker_token, input_with.worker_token);
 
-    // With config_toml absent (backward compat).
+    // With config_toml and worker_token absent (backward compat).
     let input_none = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c2".to_string(),
@@ -1633,19 +1720,28 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: None,
+        worker_token: None,
     };
     let json_none = serde_json::to_string(&input_none).unwrap();
     assert!(
         !json_none.contains("config_toml"),
         "config_toml:None should be skipped in serialization"
     );
+    assert!(
+        !json_none.contains("worker_token"),
+        "worker_token:None should be skipped in serialization"
+    );
 
-    // Deserializing old-format JSON without config_toml should default to None.
+    // Deserializing old-format JSON without config_toml/worker_token should default to None.
     let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
     let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
     assert!(
         back_old.config_toml.is_none(),
         "missing config_toml should default to None"
+    );
+    assert!(
+        back_old.worker_token.is_none(),
+        "missing worker_token should default to None"
     );
 }
 
