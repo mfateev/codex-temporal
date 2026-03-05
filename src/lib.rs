@@ -7,12 +7,10 @@
 //! using Temporal's workflow engine.
 
 pub mod activities;
-pub mod auth_stub;
 pub mod config_loader;
 pub mod entropy;
 pub mod harness;
 pub mod mcp;
-pub mod models_stub;
 pub mod picker;
 pub mod session;
 pub mod session_workflow;

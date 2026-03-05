@@ -191,6 +191,7 @@ impl TemporalAgentSession {
             personality: personality.or(self.base_input.personality),
             developer_instructions: self.base_input.developer_instructions.clone(),
             model_provider: self.base_input.model_provider.clone(),
+            crew_agents: self.base_input.crew_agents.clone(),
             continued_state: None,
         };
 

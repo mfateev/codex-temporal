@@ -2190,6 +2190,7 @@ async fn session_spawns_main_agent(client: &Client) {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
@@ -2254,6 +2255,7 @@ async fn session_spawn_additional_agent(client: &Client) {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
     };
     let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
@@ -2370,6 +2372,7 @@ description = "Main agent"
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2403,6 +2406,150 @@ description = "Main agent"
     assert!(
         response.contains("pineapple"),
         "expected 'pineapple' in response, got: {response}"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+/// Test that crew sub-agents can be spawned via `spawn_agent` signal.
+///
+/// 1. Write crew TOML with `coordinator` (main) + `helper` agents.
+/// 2. Load, apply crew type, verify `crew_agents` contains "helper".
+/// 3. Start SessionWorkflow, submit user turn.
+/// 4. Signal `spawn_agent` with role "helper".
+/// 5. Query `list_agents` — verify 2 agents (main + helper).
+async fn crew_subagent_spawn_flow(client: &Client, codex_home: &std::path::Path) {
+    use codex_temporal::config_loader::{apply_crew_type, load_crew_type};
+    use codex_temporal::session_workflow::{SessionWorkflow, SessionWorkflowRun};
+    use codex_temporal::types::{AgentRecord, SessionWorkflowInput, SpawnAgentInput};
+
+    // Write a crew TOML with coordinator (main) + helper.
+    let crews_dir = codex_home.join("crews");
+    std::fs::create_dir_all(&crews_dir).expect("failed to create crews dir");
+    std::fs::write(
+        crews_dir.join("subagent-test.toml"),
+        r#"
+name = "subagent-test"
+description = "Test crew with sub-agent"
+mode = "interactive"
+main_agent = "coordinator"
+
+[agents.coordinator]
+model = "gpt-4o-mini"
+instructions = "You coordinate tasks. Be concise."
+description = "Main coordinator agent"
+
+[agents.helper]
+model = "gpt-4o-mini"
+instructions = "You are a helper. Be concise."
+description = "Helper agent for sub-tasks"
+"#,
+    )
+    .expect("failed to write crew TOML");
+
+    // Load and apply crew type.
+    let crew = load_crew_type("subagent-test").expect("failed to load crew type");
+    assert_eq!(crew.name, "subagent-test");
+    assert_eq!(crew.agents.len(), 2);
+
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o".to_string(),
+        instructions: "default".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents: std::collections::BTreeMap::new(),
+        continued_state: None,
+    };
+
+    let inputs = std::collections::BTreeMap::new();
+    apply_crew_type(&crew, &inputs, &mut base).expect("apply_crew_type failed");
+
+    // Verify crew_agents populated with helper (not coordinator).
+    assert_eq!(base.crew_agents.len(), 1, "should have 1 crew sub-agent");
+    assert!(
+        base.crew_agents.contains_key("helper"),
+        "helper should be in crew_agents"
+    );
+    assert!(
+        !base.crew_agents.contains_key("coordinator"),
+        "coordinator (main) should not be in crew_agents"
+    );
+
+    // Model should be overridden by coordinator's model.
+    assert_eq!(base.model, "gpt-4o-mini");
+
+    // Start a session with the crew-configured input.
+    let session_id = format!("e2e-crew-subagent-{}", uuid::Uuid::new_v4());
+    let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base);
+
+    // Submit initial turn.
+    session
+        .submit(user_turn_op("Say hello."))
+        .await
+        .expect("submit failed");
+
+    // Wait for TurnComplete.
+    let timeout_at = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout_at {
+            panic!("timed out waiting for first TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    // Spawn helper sub-agent via signal.
+    session
+        .spawn_agent(SpawnAgentInput {
+            role: "helper".to_string(),
+            message: "Say the word 'banana' and nothing else.".to_string(),
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    // Give the SessionWorkflow time to process the spawn.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Query list_agents on the SessionWorkflow.
+    let handle = client.get_workflow_handle::<SessionWorkflowRun>(&session_id);
+    let agents_json: String = handle
+        .query(
+            SessionWorkflow::list_agents,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await
+        .expect("list_agents query failed");
+
+    let agents: Vec<AgentRecord> = serde_json::from_str(&agents_json).unwrap_or_default();
+
+    assert!(
+        agents.len() >= 2,
+        "expected at least 2 agents (main + helper), got {}: {:?}",
+        agents.len(),
+        agents
+    );
+
+    // Verify the main agent is present.
+    assert!(
+        agents.iter().any(|a| a.agent_id.ends_with("/main")),
+        "expected main agent in list: {:?}",
+        agents
+    );
+
+    // Verify the helper agent was spawned (role matches).
+    assert!(
+        agents.iter().any(|a| a.role == "helper"),
+        "expected helper agent in list: {:?}",
+        agents
     );
 
     drain_shutdown(&session).await;
@@ -2632,6 +2779,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: crew_type_session_flow ---");
     crew_type_session_flow(&client, &default_codex_home).await;
+
+    eprintln!("--- test: crew_subagent_spawn_flow ---");
+    crew_subagent_spawn_flow(&client, &default_codex_home).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.

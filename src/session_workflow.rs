@@ -7,7 +7,7 @@
 //! - Enforces `max_agents` limit
 //! - Supports graceful shutdown and continue-as-new
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_macros::{workflow, workflow_methods};
@@ -19,9 +19,9 @@ use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflow
 use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
 
 use crate::activities::CodexActivities;
-use crate::config_loader::config_from_toml;
+use crate::config_loader::{config_from_toml, inject_crew_roles_into_toml};
 use crate::types::{
-    AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, ConfigOutput,
+    AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, ConfigOutput, CrewAgentDef,
     McpDiscoverInput, McpDiscoverOutput, ProjectContextOutput, ResolveRoleConfigInput,
     SessionContinueAsNewState, SessionWorkflowInput, SessionWorkflowOutput, SpawnAgentInput,
 };
@@ -44,6 +44,8 @@ pub struct SessionWorkflow {
     agent_counter: u32,
     max_agents: usize,
     shutdown_requested: bool,
+    /// Crew agent definitions for non-main agents (from crew type).
+    crew_agents: BTreeMap<String, CrewAgentDef>,
 }
 
 #[workflow_methods]
@@ -54,6 +56,7 @@ impl SessionWorkflow {
 
         // If restoring from continue-as-new, use the carried-over state.
         if let Some(ref state) = input.continued_state {
+            let crew_agents = state.crew_agents.clone();
             return Self {
                 session_id,
                 agents: state.agents.clone(),
@@ -64,10 +67,12 @@ impl SessionWorkflow {
                 agent_counter: state.agents.len() as u32,
                 max_agents: DEFAULT_MAX_AGENTS,
                 shutdown_requested: false,
+                crew_agents,
                 input,
             };
         }
 
+        let crew_agents = input.crew_agents.clone();
         Self {
             session_id,
             input,
@@ -79,6 +84,7 @@ impl SessionWorkflow {
             agent_counter: 0,
             max_agents: DEFAULT_MAX_AGENTS,
             shutdown_requested: false,
+            crew_agents,
         }
     }
 
@@ -188,6 +194,19 @@ impl SessionWorkflow {
             s.mcp_tools = mcp_tools.clone();
         });
 
+        // Inject crew agent definitions into the config TOML so they appear
+        // as `[agents.<name>]` entries in `config.agent_roles`, making them
+        // visible in the `spawn_agent` tool description.
+        let crew_agents = ctx.state(|s| s.crew_agents.clone());
+        let config_toml = if crew_agents.is_empty() {
+            config_toml
+        } else {
+            inject_crew_roles_into_toml(&config_toml, &crew_agents).unwrap_or_else(|e| {
+                tracing::warn!("failed to inject crew roles into TOML: {e}");
+                config_toml
+            })
+        };
+
         // Parse max_agents from config.
         if let Ok(config) = config_from_toml(
             &config_toml,
@@ -294,9 +313,71 @@ impl SessionWorkflow {
                 let agent_role = spawn_input.role.clone();
                 let agent_id = format!("{session_id}/{}-{}", agent_role, agent_num);
 
-                // Resolve role config if not "default".
+                // Look up crew agent definition (if any).
+                let crew_def = ctx.state(|s| s.crew_agents.get(&agent_role).cloned());
+
+                // Resolve role config: crew-aware resolution.
                 let (resolved_config_toml, resolved_model, resolved_instructions) =
-                    if agent_role != "default" {
+                    if let Some(ref crew_agent) = crew_def {
+                        // Crew agent: check if it references a base role.
+                        if let Some(ref base_role) = crew_agent.role {
+                            // Has a base role — resolve it, then override with crew values.
+                            let resolve_input = ResolveRoleConfigInput {
+                                config_toml: config_toml.clone(),
+                                cwd: project_context.cwd.clone(),
+                                role_name: base_role.clone(),
+                            };
+                            match ctx
+                                .start_activity(
+                                    CodexActivities::resolve_role_config,
+                                    resolve_input,
+                                    ActivityOptions {
+                                        schedule_to_close_timeout: Some(
+                                            std::time::Duration::from_secs(30),
+                                        ),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(resolved) => {
+                                    // Crew model/instructions override resolved role values.
+                                    let model = crew_agent
+                                        .model
+                                        .clone()
+                                        .or(resolved.model)
+                                        .unwrap_or_else(|| input.model.clone());
+                                    let instructions = crew_agent
+                                        .instructions
+                                        .clone()
+                                        .or(resolved.instructions)
+                                        .unwrap_or_else(|| input.instructions.clone());
+                                    (resolved.config_toml, model, instructions)
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        role = %agent_role,
+                                        base_role = %base_role,
+                                        error = %e,
+                                        "failed to resolve base role for crew agent, skipping spawn"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // Pure inline crew agent — no activity call needed.
+                            let model = crew_agent
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| input.model.clone());
+                            let instructions = crew_agent
+                                .instructions
+                                .clone()
+                                .unwrap_or_else(|| input.instructions.clone());
+                            (config_toml.clone(), model, instructions)
+                        }
+                    } else if agent_role != "default" {
+                        // Non-crew, non-default role — resolve via activity.
                         let resolve_input = ResolveRoleConfigInput {
                             config_toml: config_toml.clone(),
                             cwd: project_context.cwd.clone(),
@@ -396,11 +477,13 @@ impl SessionWorkflow {
             if ctx.continue_as_new_suggested() {
                 tracing::info!("server suggested continue-as-new for session");
                 let agents = ctx.state(|s| s.agents.clone());
+                let crew_agents = ctx.state(|s| s.crew_agents.clone());
                 let state = SessionContinueAsNewState {
                     agents,
                     config_toml: config_toml.clone(),
                     project_context: project_context.clone(),
                     mcp_tools: mcp_tools.clone(),
+                    crew_agents,
                 };
 
                 let mut can_input = input.clone();

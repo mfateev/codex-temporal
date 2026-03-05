@@ -1,5 +1,6 @@
 //! Unit and integration tests for the codex-temporal harness.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use codex_temporal::entropy::TemporalRandomSource;
@@ -55,7 +56,7 @@ fn temporal_random_f64_in_range() {
 
 #[tokio::test]
 async fn buffer_event_sink_collects_and_drains() {
-    let sink = BufferEventSink::new();
+    let sink = BufferEventSink::new(4096, 0);
     assert!(sink.is_empty());
 
     // Use a real event type that we can construct.
@@ -76,6 +77,10 @@ async fn buffer_event_sink_collects_and_drains() {
     let drained = sink.drain();
     assert_eq!(drained.len(), 2);
     assert!(sink.is_empty(), "drain should clear the buffer");
+
+    // After drain, offset should have advanced — watermark reflects drained count.
+    let (_events, watermark) = sink.events_since(0);
+    assert_eq!(watermark, 2, "offset should advance after drain");
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +206,7 @@ async fn session_new_minimal_creates_usable_session() {
         .expect("config");
     let config = Arc::new(config);
 
-    let event_sink: Arc<dyn EventSink> = Arc::new(BufferEventSink::new());
+    let event_sink: Arc<dyn EventSink> = Arc::new(BufferEventSink::new(4096, 0));
     let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
 
     let session = codex_core::Session::new_minimal(
@@ -302,7 +307,7 @@ fn pending_approval_decision_lifecycle() {
 
 #[tokio::test]
 async fn buffer_event_sink_events_since_returns_subset() {
-    let sink = BufferEventSink::new();
+    let sink = BufferEventSink::new(4096, 0);
 
     use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
 
@@ -350,7 +355,7 @@ async fn buffer_event_sink_events_since_returns_subset() {
 
 #[tokio::test]
 async fn buffer_event_sink_emit_event_sync_works() {
-    let sink = BufferEventSink::new();
+    let sink = BufferEventSink::new(4096, 0);
 
     use codex_protocol::protocol::{Event, EventMsg};
 
@@ -364,6 +369,147 @@ async fn buffer_event_sink_emit_event_sync_works() {
     let (events, watermark) = sink.events_since(0);
     assert_eq!(events.len(), 1);
     assert_eq!(watermark, 1);
+}
+
+#[tokio::test]
+async fn buffer_event_sink_rolling_window_evicts_oldest() {
+    let capacity = 10;
+    let sink = BufferEventSink::new(capacity, 0);
+
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    // Push capacity + 5 events.
+    let total = capacity + 5;
+    for i in 0..total {
+        let event = Event {
+            id: format!("ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink.emit_event(event).await;
+    }
+
+    // Buffer should contain exactly `capacity` events.
+    assert_eq!(sink.len(), capacity);
+
+    // events_since(0) returns only the window (client is behind).
+    let (events, watermark) = sink.events_since(0);
+    assert_eq!(events.len(), capacity);
+    assert_eq!(watermark, total);
+
+    // The first event in the buffer should be ev-5 (0..4 were evicted).
+    let first: Event = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(first.id, "ev-5");
+
+    // events_since with the correct watermark returns empty.
+    let (events, watermark2) = sink.events_since(watermark);
+    assert!(events.is_empty());
+    assert_eq!(watermark2, watermark);
+}
+
+#[tokio::test]
+async fn buffer_event_sink_snapshot_and_restore() {
+    let sink = BufferEventSink::new(100, 0);
+
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    for i in 0..5 {
+        let event = Event {
+            id: format!("ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink.emit_event(event).await;
+    }
+
+    // Snapshot.
+    let (offset, snapshot) = sink.snapshot();
+    assert_eq!(offset, 0);
+    assert_eq!(snapshot.len(), 5);
+
+    // Restore into a new sink.
+    let restored = BufferEventSink::from_snapshot(offset, snapshot, 100);
+    assert_eq!(restored.len(), 5);
+
+    // events_since should return the same results.
+    let (orig_events, orig_wm) = sink.events_since(0);
+    let (rest_events, rest_wm) = restored.events_since(0);
+    assert_eq!(orig_events, rest_events);
+    assert_eq!(orig_wm, rest_wm);
+
+    // events_since(3) on restored should return last 2 events.
+    let (events, watermark) = restored.events_since(3);
+    assert_eq!(events.len(), 2);
+    assert_eq!(watermark, 5);
+}
+
+#[tokio::test]
+async fn buffer_event_sink_offset_continuity_across_can() {
+    use codex_protocol::protocol::{Event, EventMsg, TurnStartedEvent};
+
+    // Simulate first CAN run: push 20 events into a capacity-10 buffer.
+    let sink1 = BufferEventSink::new(10, 0);
+    for i in 0..20 {
+        let event = Event {
+            id: format!("run1-ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{i}"),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink1.emit_event(event).await;
+    }
+
+    // Client polled and has watermark=20.
+    let (_events, client_watermark) = sink1.events_since(0);
+    assert_eq!(client_watermark, 20);
+
+    // Snapshot for CAN.
+    let (offset, snapshot) = sink1.snapshot();
+    assert_eq!(offset, 10); // 10 events were evicted
+
+    // Restore in new run.
+    let sink2 = BufferEventSink::from_snapshot(offset, snapshot, 10);
+
+    // Push 5 more events in the new run.
+    for i in 0..5 {
+        let event = Event {
+            id: format!("run2-ev-{i}"),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: format!("turn-{}", 20 + i),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        };
+        sink2.emit_event(event).await;
+    }
+
+    // Client polls with old watermark=20 — should get the 5 new events.
+    let (events, new_watermark) = sink2.events_since(20);
+    assert_eq!(events.len(), 5);
+    assert_eq!(new_watermark, 25); // monotonically increasing
+
+    // Verify watermark is monotonic.
+    assert!(new_watermark > client_watermark);
+
+    // Client polls with new watermark — should get empty.
+    let (events, wm) = sink2.events_since(new_watermark);
+    assert!(events.is_empty());
+    assert_eq!(wm, 25);
+
+    // Client that fell far behind (watermark=5) gets whatever is in the buffer.
+    let (events, wm) = sink2.events_since(5);
+    // Buffer has 10 old + 5 new = 15, but capacity is 10, so 5 were evicted.
+    // Buffer contains events from offset=15..25 (10 events).
+    assert_eq!(events.len(), 10);
+    assert_eq!(wm, 25);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +704,8 @@ fn continue_as_new_state_roundtrips_through_json() {
         effort_override: None,
         summary_override: None,
         personality_override: None,
+        event_offset: 0,
+        event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -598,6 +746,8 @@ fn workflow_input_with_continued_state_roundtrips() {
             effort_override: None,
             summary_override: None,
             personality_override: None,
+            event_offset: 0,
+            event_snapshot: vec![],
         }),
         role: "default".to_string(),
         config_toml: None,
@@ -732,6 +882,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
     }
 }
 
@@ -791,6 +942,7 @@ async fn dispatch_shell_with_cwd() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -824,6 +976,7 @@ sandbox_mode = "read-only"
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(toml_str.to_string()),
+        worker_token: None,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -833,6 +986,77 @@ sandbox_mode = "read-only"
         output.exit_code, 0,
         "write command should fail under read-only sandbox, got output: {}",
         output.output,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Input validation tests for dispatch_tool
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dispatch_tool_rejects_empty_tool_name() {
+    let input = ToolExecInput {
+        tool_name: "".to_string(),
+        call_id: "test-empty".to_string(),
+        arguments: "{}".to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/tmp".to_string(),
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
+    };
+
+    let result = dispatch_tool(input).await;
+    assert!(result.is_err(), "empty tool_name should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("tool_name must not be empty"),
+        "error should mention tool_name: {err}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_tool_rejects_nonexistent_cwd() {
+    let input = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "test-bad-cwd".to_string(),
+        arguments: r#"{"command":["echo","hi"]}"#.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: "/nonexistent/path/that/does/not/exist".to_string(),
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
+    };
+
+    let result = dispatch_tool(input).await;
+    assert!(result.is_err(), "nonexistent cwd should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cwd does not exist"),
+        "error should mention cwd: {err}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_tool_rejects_cwd_that_is_file() {
+    // Create a temporary file to use as a non-directory cwd.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let file_path = tmp.path().to_string_lossy().to_string();
+
+    let input = ToolExecInput {
+        tool_name: "shell".to_string(),
+        call_id: "test-file-cwd".to_string(),
+        arguments: r#"{"command":["echo","hi"]}"#.to_string(),
+        model: "gpt-4o".to_string(),
+        cwd: file_path,
+        config_toml: Some(FULL_ACCESS_TOML.to_string()),
+        worker_token: None,
+    };
+
+    let result = dispatch_tool(input).await;
+    assert!(result.is_err(), "file as cwd should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cwd is not a directory"),
+        "error should mention not a directory: {err}"
     );
 }
 
@@ -879,7 +1103,7 @@ async fn dispatch_with_experimental_tools(
     let (_specs, registry) = builder.build();
 
     let conversation_id = ThreadId::new();
-    let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new());
+    let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new(4096, 0));
     let storage: Arc<dyn codex_core::StorageBackend> = Arc::new(InMemoryStorage::new());
 
     let session = Session::new_minimal(
@@ -1054,6 +1278,7 @@ fn harness_state_roundtrips() {
                 crew_type: None,
             },
         ],
+        credentials_available: None,
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1071,6 +1296,28 @@ fn harness_input_defaults_when_empty() {
     assert!(
         input.continued_state.is_none(),
         "continued_state should default to None"
+    );
+}
+
+#[test]
+fn harness_state_credentials_available_roundtrips() {
+    let state = HarnessState {
+        sessions: vec![],
+        credentials_available: Some(true),
+    };
+    let json = serde_json::to_string(&state).unwrap();
+    let back: HarnessState = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.credentials_available, Some(true));
+}
+
+#[test]
+fn harness_state_credentials_available_defaults_to_none() {
+    // JSON without credentials_available should deserialize to None (backward compat).
+    let json = r#"{"sessions":[]}"#;
+    let back: HarnessState = serde_json::from_str(json).unwrap();
+    assert!(
+        back.credentials_available.is_none(),
+        "credentials_available should default to None when absent"
     );
 }
 
@@ -1427,15 +1674,22 @@ fn model_call_input_provider_defaults_to_none() {
 fn config_output_roundtrips() {
     let original = ConfigOutput {
         config_toml: "model = \"gpt-4o\"\napproval_policy = \"on-request\"\n".to_string(),
+        worker_token: Some("test-token-123".to_string()),
     };
     let json = serde_json::to_string(&original).unwrap();
     let back: ConfigOutput = serde_json::from_str(&json).unwrap();
     assert_eq!(back.config_toml, original.config_toml);
+    assert_eq!(back.worker_token, original.worker_token);
+
+    // Backward compat: old JSON without worker_token should default to None.
+    let old_json = r#"{"config_toml":"model = \"gpt-4o\"\n"}"#;
+    let back_old: ConfigOutput = serde_json::from_str(old_json).unwrap();
+    assert!(back_old.worker_token.is_none(), "missing worker_token should default to None");
 }
 
 #[test]
 fn tool_exec_input_config_toml_roundtrip() {
-    // With config_toml present.
+    // With config_toml and worker_token present.
     let input_with = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c1".to_string(),
@@ -1443,16 +1697,22 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
+        worker_token: Some("tok-abc".to_string()),
     };
     let json_with = serde_json::to_string(&input_with).unwrap();
     assert!(
         json_with.contains("config_toml"),
         "config_toml should be serialized when Some"
     );
+    assert!(
+        json_with.contains("worker_token"),
+        "worker_token should be serialized when Some"
+    );
     let back_with: ToolExecInput = serde_json::from_str(&json_with).unwrap();
     assert_eq!(back_with.config_toml, input_with.config_toml);
+    assert_eq!(back_with.worker_token, input_with.worker_token);
 
-    // With config_toml absent (backward compat).
+    // With config_toml and worker_token absent (backward compat).
     let input_none = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c2".to_string(),
@@ -1460,19 +1720,28 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: None,
+        worker_token: None,
     };
     let json_none = serde_json::to_string(&input_none).unwrap();
     assert!(
         !json_none.contains("config_toml"),
         "config_toml:None should be skipped in serialization"
     );
+    assert!(
+        !json_none.contains("worker_token"),
+        "worker_token:None should be skipped in serialization"
+    );
 
-    // Deserializing old-format JSON without config_toml should default to None.
+    // Deserializing old-format JSON without config_toml/worker_token should default to None.
     let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
     let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
     assert!(
         back_old.config_toml.is_none(),
         "missing config_toml should default to None"
+    );
+    assert!(
+        back_old.worker_token.is_none(),
+        "missing worker_token should default to None"
     );
 }
 
@@ -1715,6 +1984,8 @@ fn continue_as_new_state_with_mcp_tools() {
         effort_override: None,
         summary_override: None,
         personality_override: None,
+        event_offset: 0,
+        event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1756,6 +2027,8 @@ fn continue_as_new_state_with_approval_policy_roundtrips() {
         effort_override: None,
         summary_override: None,
         personality_override: None,
+        event_offset: 0,
+        event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -1880,6 +2153,7 @@ fn session_workflow_input_roundtrips_through_json() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -1979,6 +2253,7 @@ fn session_continue_as_new_state_roundtrips() {
             git_info: None,
         },
         mcp_tools: std::collections::HashMap::new(),
+        crew_agents: BTreeMap::new(),
     };
 
     let json = serde_json::to_string(&state).unwrap();
@@ -2360,6 +2635,7 @@ fn apply_crew_type_interpolates_placeholders() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2416,6 +2692,7 @@ fn apply_crew_type_rejects_missing_required_input() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2464,6 +2741,7 @@ fn apply_crew_type_uses_input_defaults() {
         personality: None,
         developer_instructions: None,
         model_provider: None,
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -2542,4 +2820,276 @@ impl Drop for EnvGuard {
             None => unsafe { std::env::remove_var(&self.key) },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Crew subagent scoping tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_workflow_input_crew_agents_roundtrip() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let mut crew_agents = BTreeMap::new();
+    crew_agents.insert(
+        "helper".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: Some("gpt-4o-mini".to_string()),
+            instructions: Some("Help with tasks.".to_string()),
+            description: Some("A helpful assistant".to_string()),
+        },
+    );
+    crew_agents.insert(
+        "reviewer".to_string(),
+        CrewAgentDef {
+            role: Some("explorer".to_string()),
+            model: None,
+            instructions: None,
+            description: Some("Reviews code changes".to_string()),
+        },
+    );
+
+    let input = SessionWorkflowInput {
+        user_message: "test".to_string(),
+        model: "gpt-4o".to_string(),
+        instructions: "Be helpful.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents: crew_agents.clone(),
+        continued_state: None,
+    };
+
+    let json = serde_json::to_string(&input).unwrap();
+    let back: SessionWorkflowInput = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.crew_agents.len(), 2);
+    assert!(back.crew_agents.contains_key("helper"));
+    assert!(back.crew_agents.contains_key("reviewer"));
+
+    let helper = &back.crew_agents["helper"];
+    assert_eq!(helper.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(helper.instructions.as_deref(), Some("Help with tasks."));
+    assert!(helper.role.is_none());
+
+    let reviewer = &back.crew_agents["reviewer"];
+    assert_eq!(reviewer.role.as_deref(), Some("explorer"));
+    assert!(reviewer.model.is_none());
+}
+
+#[test]
+fn session_workflow_input_crew_agents_default_when_missing() {
+    use codex_temporal::types::SessionWorkflowInput;
+
+    // JSON without crew_agents field — should default to empty.
+    let json = r#"{
+        "user_message": "hello",
+        "model": "gpt-4o",
+        "instructions": "test"
+    }"#;
+
+    let input: SessionWorkflowInput = serde_json::from_str(json).unwrap();
+    assert!(
+        input.crew_agents.is_empty(),
+        "crew_agents should default to empty"
+    );
+}
+
+#[test]
+fn apply_crew_type_populates_crew_agents() {
+    use codex_temporal::config_loader::apply_crew_type;
+    use codex_temporal::types::SessionWorkflowInput;
+
+    let crew = CrewType {
+        name: "test".to_string(),
+        description: "test crew".to_string(),
+        mode: CrewMode::Autonomous,
+        initial_prompt: Some("Work on {task}".to_string()),
+        inputs: {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "task".to_string(),
+                CrewInputSpec {
+                    description: "The task".to_string(),
+                    required: true,
+                    default: None,
+                },
+            );
+            m
+        },
+        main_agent: "coordinator".to_string(),
+        agents: {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "coordinator".to_string(),
+                CrewAgentDef {
+                    role: None,
+                    model: Some("gpt-4o".to_string()),
+                    instructions: Some("Coordinate {task}".to_string()),
+                    description: Some("Main coordinator".to_string()),
+                },
+            );
+            m.insert(
+                "helper".to_string(),
+                CrewAgentDef {
+                    role: None,
+                    model: Some("gpt-4o-mini".to_string()),
+                    instructions: Some("Help with {task}".to_string()),
+                    description: Some("Helper agent".to_string()),
+                },
+            );
+            m.insert(
+                "fixer".to_string(),
+                CrewAgentDef {
+                    role: Some("explorer".to_string()),
+                    model: None,
+                    instructions: None,
+                    description: Some("Fixes bugs".to_string()),
+                },
+            );
+            m
+        },
+        approval_policy: None,
+    };
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert("task".to_string(), "bug-fixing".to_string());
+
+    let mut base = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "default-model".to_string(),
+        instructions: "default".to_string(),
+        approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: codex_protocol::config_types::ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents: BTreeMap::new(),
+        continued_state: None,
+    };
+
+    apply_crew_type(&crew, &inputs, &mut base).unwrap();
+
+    // Main agent (coordinator) should NOT be in crew_agents.
+    assert!(
+        !base.crew_agents.contains_key("coordinator"),
+        "main agent should not be in crew_agents"
+    );
+
+    // Non-main agents should be in crew_agents.
+    assert_eq!(base.crew_agents.len(), 2);
+    assert!(base.crew_agents.contains_key("helper"));
+    assert!(base.crew_agents.contains_key("fixer"));
+
+    // Helper should have interpolated instructions.
+    let helper = &base.crew_agents["helper"];
+    assert_eq!(helper.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(
+        helper.instructions.as_deref(),
+        Some("Help with bug-fixing")
+    );
+    assert!(helper.role.is_none());
+
+    // Fixer should have role reference but no interpolation (no instructions template).
+    let fixer = &base.crew_agents["fixer"];
+    assert_eq!(fixer.role.as_deref(), Some("explorer"));
+    assert!(fixer.instructions.is_none());
+    assert_eq!(fixer.description.as_deref(), Some("Fixes bugs"));
+}
+
+#[test]
+fn inject_crew_roles_into_toml_adds_roles() {
+    use codex_temporal::config_loader::inject_crew_roles_into_toml;
+
+    let base_toml = r#"
+model = "gpt-4o"
+"#;
+
+    let mut crew_agents = BTreeMap::new();
+    crew_agents.insert(
+        "helper".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: Some("gpt-4o-mini".to_string()),
+            instructions: Some("Help out".to_string()),
+            description: Some("A helper agent".to_string()),
+        },
+    );
+    crew_agents.insert(
+        "reviewer".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: None,
+            instructions: None,
+            description: None,
+        },
+    );
+
+    let result = inject_crew_roles_into_toml(base_toml, &crew_agents).unwrap();
+
+    // Parse result and verify [agents] entries exist.
+    let doc: toml::Value = toml::from_str(&result).unwrap();
+    let agents = doc.get("agents").and_then(|v| v.as_table()).unwrap();
+
+    assert!(agents.contains_key("helper"), "helper should be in agents table");
+    assert!(agents.contains_key("reviewer"), "reviewer should be in agents table");
+
+    // Helper should have description.
+    let helper = agents.get("helper").and_then(|v| v.as_table()).unwrap();
+    assert_eq!(
+        helper.get("description").and_then(|v| v.as_str()),
+        Some("A helper agent")
+    );
+
+    // Reviewer has no description — table exists but may be empty.
+    assert!(agents.contains_key("reviewer"));
+}
+
+#[test]
+fn session_continue_as_new_state_crew_agents_roundtrip() {
+    use codex_temporal::types::{AgentLifecycle, AgentRecord, SessionContinueAsNewState};
+
+    let mut crew_agents = BTreeMap::new();
+    crew_agents.insert(
+        "worker".to_string(),
+        CrewAgentDef {
+            role: None,
+            model: Some("gpt-4o-mini".to_string()),
+            instructions: Some("Do work.".to_string()),
+            description: Some("Worker agent".to_string()),
+        },
+    );
+
+    let state = SessionContinueAsNewState {
+        agents: vec![AgentRecord {
+            agent_id: "session/main".to_string(),
+            workflow_id: "session/main".to_string(),
+            role: "default".to_string(),
+            status: AgentLifecycle::Running,
+        }],
+        config_toml: "model = \"gpt-4o\"".to_string(),
+        project_context: ProjectContextOutput {
+            cwd: "/tmp".to_string(),
+            user_instructions: None,
+            git_info: None,
+        },
+        mcp_tools: std::collections::HashMap::new(),
+        crew_agents: crew_agents.clone(),
+    };
+
+    let json = serde_json::to_string(&state).unwrap();
+    let back: SessionContinueAsNewState = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(back.crew_agents.len(), 1);
+    assert!(back.crew_agents.contains_key("worker"));
+    let worker = &back.crew_agents["worker"];
+    assert_eq!(worker.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(worker.instructions.as_deref(), Some("Do work."));
 }

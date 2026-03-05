@@ -9,7 +9,7 @@ use codex_core::{ModelProviderInfo, ToolSpec};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{ResponseInputItem, ResponseItem};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
-use codex_protocol::protocol::{AskForApproval, GitInfo, RolloutItem, TokenUsage};
+use codex_protocol::protocol::{AskForApproval, Event, GitInfo, RolloutItem, TokenUsage};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -78,6 +78,12 @@ pub struct ToolExecInput {
     /// sandbox policy, etc. When absent, falls back to Config::for_harness().
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_toml: Option<String>,
+    /// Worker-issued token for activity-level authentication.
+    /// When set, the activity verifies this matches the worker's own token
+    /// before executing the tool. Prevents unauthorized activity dispatch
+    /// from rogue workflows on shared task queues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_token: Option<String>,
 }
 
 /// Output from the `tool_exec` activity.
@@ -148,6 +154,11 @@ pub struct ProjectContextOutput {
 pub struct ConfigOutput {
     /// Merged config.toml content as a TOML string.
     pub config_toml: String,
+    /// Worker-issued token for activity-level authentication.
+    /// Workflows include this token in subsequent `ToolExecInput` calls;
+    /// the `tool_exec` activity verifies it before executing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +437,9 @@ pub struct HarnessInput {
 pub struct HarnessState {
     /// Known sessions tracked by the harness.
     pub sessions: Vec<SessionEntry>,
+    /// Whether the worker has API credentials available (checked once at startup).
+    #[serde(default)]
+    pub credentials_available: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +567,10 @@ pub struct SessionWorkflowInput {
     /// Model provider info from config.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<ModelProviderInfo>,
+    /// Crew agent definitions (non-main agents from a crew type).
+    /// Keyed by agent name (e.g. "helper", "fixer").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crew_agents: BTreeMap<String, CrewAgentDef>,
     /// State carried over from a previous continue-as-new execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_state: Option<SessionContinueAsNewState>,
@@ -571,6 +589,7 @@ impl From<AgentWorkflowInput> for SessionWorkflowInput {
             personality: input.personality,
             developer_instructions: input.developer_instructions,
             model_provider: input.model_provider,
+            crew_agents: BTreeMap::new(),
             continued_state: None,
         }
     }
@@ -619,6 +638,9 @@ pub struct SessionContinueAsNewState {
     /// Cached MCP tools.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
+    /// Crew agent definitions carried across CAN.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crew_agents: BTreeMap<String, CrewAgentDef>,
 }
 
 /// Record of a child agent workflow tracked by `SessionWorkflow`.
@@ -722,4 +744,10 @@ pub struct ContinueAsNewState {
     /// Overridden personality (from `Op::OverrideTurnContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personality_override: Option<Personality>,
+    /// Monotonic offset of evicted events from the rolling event buffer.
+    #[serde(default)]
+    pub event_offset: usize,
+    /// Snapshot of buffered events carried across CAN.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_snapshot: Vec<Event>,
 }

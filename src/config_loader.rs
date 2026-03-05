@@ -14,7 +14,7 @@ use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode}
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 
-use crate::types::{CrewMode, CrewType, SessionWorkflowInput};
+use crate::types::{CrewAgentDef, CrewMode, CrewType, SessionWorkflowInput};
 
 /// Holds the result of loading config.toml: a template
 /// [`SessionWorkflowInput`] and the resolved model provider info.
@@ -81,6 +81,7 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
         personality,
         developer_instructions,
         model_provider: None, // Set by caller from HarnessConfig.model_provider
+        crew_agents: BTreeMap::new(),
         continued_state: None,
     };
 
@@ -255,6 +256,25 @@ pub fn apply_crew_type(
         }
     }
 
+    // --- populate crew_agents with non-main agent definitions ---
+    for (agent_name, agent_def) in &crew.agents {
+        if agent_name == &crew.main_agent {
+            continue; // main agent is handled above via base input
+        }
+        base.crew_agents.insert(
+            agent_name.clone(),
+            CrewAgentDef {
+                role: agent_def.role.clone(),
+                model: agent_def.model.clone(),
+                instructions: agent_def
+                    .instructions
+                    .as_ref()
+                    .map(|i| interpolate(i, &vars)),
+                description: agent_def.description.clone(),
+            },
+        );
+    }
+
     Ok(())
 }
 
@@ -265,6 +285,52 @@ fn interpolate(template: &str, vars: &BTreeMap<String, String>) -> String {
         result = result.replace(&format!("{{{key}}}"), value);
     }
     result
+}
+
+/// Inject crew agent definitions into a config TOML string so they appear
+/// as `[agents.<name>]` entries.
+///
+/// This makes crew roles visible in `config.agent_roles` when the TOML is
+/// parsed downstream via [`config_from_toml`], which in turn causes
+/// `build_specs()` to include them in the `spawn_agent` tool description.
+///
+/// Existing agent entries in the TOML are preserved (crew definitions only
+/// fill in missing roles).
+pub fn inject_crew_roles_into_toml(
+    toml_str: &str,
+    crew_agents: &BTreeMap<String, CrewAgentDef>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if crew_agents.is_empty() {
+        return Ok(toml_str.to_string());
+    }
+
+    let mut doc: toml::Value = toml::from_str(toml_str)?;
+
+    // Ensure [agents] table exists.
+    let root = doc
+        .as_table_mut()
+        .ok_or("config TOML root is not a table")?;
+    if !root.contains_key("agents") {
+        root.insert("agents".to_string(), toml::Value::Table(toml::map::Map::new()));
+    }
+    let agents_table = root
+        .get_mut("agents")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("agents is not a table")?;
+
+    for (name, def) in crew_agents {
+        // Don't overwrite existing user-defined roles.
+        if agents_table.contains_key(name) {
+            continue;
+        }
+        let mut entry = toml::map::Map::new();
+        if let Some(ref desc) = def.description {
+            entry.insert("description".to_string(), toml::Value::String(desc.clone()));
+        }
+        agents_table.insert(name.clone(), toml::Value::Table(entry));
+    }
+
+    Ok(toml::to_string(&doc)?)
 }
 
 /// Reconstruct a [`Config`] from a TOML string previously produced by

@@ -7,29 +7,37 @@
 //!
 //! Workflow ID convention: `codex-harness-<user>`.
 
+use std::time::Duration;
+
 use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+    WorkflowTermination,
 };
 
+use crate::activities::CodexActivities;
 use crate::types::{HarnessInput, HarnessState, SessionEntry, SessionStatus};
 
 #[workflow]
 pub struct CodexHarness {
     sessions: Vec<SessionEntry>,
+    credentials_available: Option<bool>,
 }
 
 #[workflow_methods]
 impl CodexHarness {
     #[init]
     pub fn new(_ctx: &WorkflowContextView, input: HarnessInput) -> Self {
-        let sessions = input
-            .continued_state
-            .map(|s| s.sessions)
-            .unwrap_or_default();
-        Self { sessions }
+        let (sessions, credentials_available) = match input.continued_state {
+            Some(s) => (s.sessions, s.credentials_available),
+            None => (Vec::new(), None),
+        };
+        Self {
+            sessions,
+            credentials_available,
+        }
     }
 
     // ----- signals -----
@@ -86,6 +94,12 @@ impl CodexHarness {
         serde_json::to_string(&entry).unwrap_or_else(|_| "null".to_string())
     }
 
+    /// Whether the worker has API credentials available.
+    #[query]
+    pub fn credentials_available(&self, _ctx: &WorkflowContextView) -> bool {
+        self.credentials_available.unwrap_or(false)
+    }
+
     // ----- run -----
 
     /// The harness sits idle, maintaining state via signals/queries.
@@ -93,15 +107,34 @@ impl CodexHarness {
     /// history bounded).
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        // Check worker credentials once at startup (skipped on CAN if already known).
+        if ctx.state(|s| s.credentials_available.is_none()) {
+            let cred_result: Result<bool, _> = ctx
+                .start_activity(
+                    CodexActivities::check_credentials,
+                    (),
+                    ActivityOptions {
+                        schedule_to_close_timeout: Some(Duration::from_secs(10)),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            ctx.state_mut(|s| s.credentials_available = Some(cred_result.unwrap_or(false)));
+        }
+
         loop {
             // Wait until the server suggests CAN (history too large).
             ctx.wait_condition(|_s| ctx.continue_as_new_suggested())
                 .await;
 
-            // Carry sessions forward.
-            let sessions = ctx.state(|s| s.sessions.clone());
+            // Carry sessions and credentials forward.
+            let (sessions, credentials_available) =
+                ctx.state(|s| (s.sessions.clone(), s.credentials_available));
             let can_input = HarnessInput {
-                continued_state: Some(HarnessState { sessions }),
+                continued_state: Some(HarnessState {
+                    sessions,
+                    credentials_available,
+                }),
             };
 
             return Err(WorkflowTermination::continue_as_new(
