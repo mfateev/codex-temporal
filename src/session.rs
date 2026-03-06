@@ -25,6 +25,7 @@ use temporalio_client::{
     Client, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
 
+use crate::harness::{CodexHarness, CodexHarnessRun};
 use crate::session_workflow::{SessionWorkflow, SessionWorkflowRun};
 use crate::types::{SessionWorkflowInput, SpawnAgentInput};
 use crate::workflow::{AgentWorkflow, AgentWorkflowRun};
@@ -37,8 +38,8 @@ const TASK_QUEUE: &str = "codex-temporal";
 /// operations (start, shutdown, spawn) go to the parent `SessionWorkflow`.
 pub struct TemporalAgentSession {
     client: Client,
-    /// Workflow ID of the parent SessionWorkflow.
-    session_workflow_id: String,
+    /// Workflow ID of the parent SessionWorkflow (mutable for session switching).
+    session_workflow_id: Mutex<String>,
     /// Workflow ID of the currently polled AgentWorkflow.
     active_agent_workflow_id: Mutex<String>,
     /// Session-level input (model, instructions, etc.).
@@ -51,6 +52,10 @@ pub struct TemporalAgentSession {
     event_buffer: Mutex<Vec<Event>>,
     /// Set when shutdown has been signaled.
     shutdown: Mutex<bool>,
+    /// Monotonically increasing generation counter for stale-poll detection.
+    generation: Mutex<u64>,
+    /// Workflow ID of the CodexHarness (for querying session list).
+    harness_workflow_id: String,
 }
 
 impl TemporalAgentSession {
@@ -64,17 +69,32 @@ impl TemporalAgentSession {
         workflow_id: String,
         base_input: impl Into<SessionWorkflowInput>,
     ) -> Self {
+        Self::new_with_harness(client, workflow_id, base_input, None)
+    }
+
+    /// Create a new session with an explicit harness workflow ID.
+    ///
+    /// When `harness_id` is `None`, the default user-derived ID is used.
+    pub fn new_with_harness(
+        client: Client,
+        workflow_id: String,
+        base_input: impl Into<SessionWorkflowInput>,
+        harness_id: Option<String>,
+    ) -> Self {
         let base_input = base_input.into();
         let agent_workflow_id = format!("{workflow_id}/main");
+        let harness_workflow_id = harness_id.unwrap_or_else(derive_harness_workflow_id);
         Self {
             client,
-            session_workflow_id: workflow_id,
+            session_workflow_id: Mutex::new(workflow_id),
             active_agent_workflow_id: Mutex::new(agent_workflow_id),
             base_input,
             started: Mutex::new(false),
             events_index: Mutex::new(0),
             event_buffer: Mutex::new(Vec::new()),
             shutdown: Mutex::new(false),
+            generation: Mutex::new(0),
+            harness_workflow_id,
         }
     }
 
@@ -89,23 +109,39 @@ impl TemporalAgentSession {
         session_id: String,
         base_input: impl Into<SessionWorkflowInput>,
     ) -> Self {
+        Self::resume_with_harness(client, session_id, base_input, None)
+    }
+
+    /// Attach to an existing running workflow with an explicit harness workflow ID.
+    pub fn resume_with_harness(
+        client: Client,
+        session_id: String,
+        base_input: impl Into<SessionWorkflowInput>,
+        harness_id: Option<String>,
+    ) -> Self {
         let base_input = base_input.into();
         let agent_workflow_id = format!("{session_id}/main");
+        let harness_workflow_id = harness_id.unwrap_or_else(derive_harness_workflow_id);
         Self {
             client,
-            session_workflow_id: session_id,
+            session_workflow_id: Mutex::new(session_id),
             active_agent_workflow_id: Mutex::new(agent_workflow_id),
             base_input,
             started: Mutex::new(true), // already running
             events_index: Mutex::new(0),
             event_buffer: Mutex::new(Vec::new()),
             shutdown: Mutex::new(false),
+            generation: Mutex::new(0),
+            harness_workflow_id,
         }
     }
 
     /// Return the session workflow ID.
-    pub fn session_id(&self) -> &str {
-        &self.session_workflow_id
+    pub fn session_id(&self) -> String {
+        self.session_workflow_id
+            .lock()
+            .expect("lock poisoned")
+            .clone()
     }
 
     /// Return the active agent workflow ID.
@@ -129,11 +165,48 @@ impl TemporalAgentSession {
         self.event_buffer.lock().expect("lock poisoned").clear();
     }
 
-    /// Signal the SessionWorkflow to spawn a new agent.
-    pub async fn spawn_agent(&self, input: SpawnAgentInput) -> CodexResult<()> {
+    /// Switch to a different session entirely.
+    ///
+    /// Bumps the generation counter (so in-flight polls are discarded),
+    /// resets all internal state to point at the new session, and marks
+    /// the session as started (the target session is already running).
+    pub fn switch_session(&self, new_session_id: String) {
+        let mut generation = self.generation.lock().expect("lock poisoned");
+        *generation += 1;
+        *self.session_workflow_id.lock().expect("lock poisoned") = new_session_id.clone();
+        *self.active_agent_workflow_id.lock().expect("lock poisoned") =
+            format!("{new_session_id}/main");
+        *self.events_index.lock().expect("lock poisoned") = 0;
+        self.event_buffer.lock().expect("lock poisoned").clear();
+        *self.started.lock().expect("lock poisoned") = true;
+    }
+
+    /// Query the harness for the list of known sessions.
+    pub async fn query_sessions(&self) -> CodexResult<Vec<crate::types::SessionEntry>> {
         let handle = self
             .client
-            .get_workflow_handle::<SessionWorkflowRun>(&self.session_workflow_id);
+            .get_workflow_handle::<CodexHarnessRun>(&self.harness_workflow_id);
+
+        let json: String = handle
+            .query(
+                CodexHarness::list_sessions,
+                (),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .map_err(|e| CodexErr::Fatal(format!("failed to query sessions: {e}")))?;
+
+        let entries: Vec<crate::types::SessionEntry> =
+            serde_json::from_str(&json).unwrap_or_default();
+        Ok(entries)
+    }
+
+    /// Signal the SessionWorkflow to spawn a new agent.
+    pub async fn spawn_agent(&self, input: SpawnAgentInput) -> CodexResult<()> {
+        let session_id = self.session_id();
+        let handle = self
+            .client
+            .get_workflow_handle::<SessionWorkflowRun>(&session_id);
 
         handle
             .signal(
@@ -176,6 +249,7 @@ impl TemporalAgentSession {
         summary: ReasoningSummary,
         personality: Option<Personality>,
     ) -> CodexResult<String> {
+        let session_id = self.session_id();
         let input = SessionWorkflowInput {
             user_message: message,
             model: self.base_input.model.clone(),
@@ -196,7 +270,7 @@ impl TemporalAgentSession {
         };
 
         let options =
-            WorkflowStartOptions::new(TASK_QUEUE, &self.session_workflow_id).build();
+            WorkflowStartOptions::new(TASK_QUEUE, &session_id).build();
 
         self.client
             .start_workflow(SessionWorkflow::run, input, options)
@@ -206,7 +280,7 @@ impl TemporalAgentSession {
         *self.started.lock().expect("lock poisoned") = true;
 
         tracing::info!(
-            session_workflow_id = %self.session_workflow_id,
+            session_workflow_id = %session_id,
             "session workflow started"
         );
 
@@ -234,9 +308,10 @@ impl TemporalAgentSession {
 
     /// Signal shutdown to the SessionWorkflow.
     async fn signal_session_shutdown(&self) -> CodexResult<()> {
+        let session_id = self.session_id();
         let handle = self
             .client
-            .get_workflow_handle::<SessionWorkflowRun>(&self.session_workflow_id);
+            .get_workflow_handle::<SessionWorkflowRun>(&session_id);
 
         handle
             .signal(
@@ -253,7 +328,11 @@ impl TemporalAgentSession {
     }
 
     /// Poll the active agent workflow for new events via query.
+    ///
+    /// Uses a generation guard to discard stale results when a session
+    /// switch occurs mid-query.
     async fn poll_events(&self) -> CodexResult<Vec<Event>> {
+        let gen_before = *self.generation.lock().expect("lock poisoned");
         let from_index = *self.events_index.lock().expect("lock poisoned");
         let agent_id = self.active_agent_id();
 
@@ -271,6 +350,13 @@ impl TemporalAgentSession {
             .map_err(|e| {
                 CodexErr::Fatal(format!("failed to query events: {e}"))
             })?;
+
+        // Check generation after the (potentially slow) query completes.
+        let gen_after = *self.generation.lock().expect("lock poisoned");
+        if gen_before != gen_after {
+            // Session switched while this query was in flight — discard.
+            return Ok(Vec::new());
+        }
 
         // Parse the response: { "events": [...], "watermark": N }
         let result: serde_json::Value =
@@ -300,6 +386,29 @@ impl TemporalAgentSession {
 
         Ok(events)
     }
+}
+
+/// Derive the harness workflow ID for the current user.
+fn derive_harness_workflow_id() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
+    format!("codex-harness-{user}")
+}
+
+/// Filter replayed events into the set suitable for `initial_messages`.
+pub fn filter_initial_events(events: Vec<EventMsg>) -> Vec<EventMsg> {
+    events
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e,
+                EventMsg::AgentMessage(_)
+                    | EventMsg::TurnStarted(_)
+                    | EventMsg::TurnComplete(_)
+                    | EventMsg::ExecApprovalRequest(_)
+                    | EventMsg::ExecCommandBegin(_)
+            )
+        })
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -387,5 +496,76 @@ impl codex_core::AgentSession for TemporalAgentSession {
                 }
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl codex_tui::ExternalAgentBrowser for TemporalAgentSession {
+    async fn list_sessions(&self) -> Vec<codex_tui::ExternalSessionEntry> {
+        let current_id = self.session_id();
+        match self.query_sessions().await {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|e| {
+                    let is_current = e.session_id == current_id;
+                    let is_closed = e.status != crate::types::SessionStatus::Running;
+                    let description = {
+                        let status_str = if is_closed { " [closed]" } else { "" };
+                        Some(format!("{}{}", e.model, status_str))
+                    };
+                    codex_tui::ExternalSessionEntry {
+                        id: e.session_id,
+                        name: e.name.unwrap_or_else(|| "(unnamed)".to_string()),
+                        description,
+                        is_current,
+                        is_closed,
+                    }
+                })
+                .collect(),
+            Err(err) => {
+                tracing::error!(%err, "failed to query sessions from harness");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn switch_to(
+        &self,
+        session_id: &str,
+    ) -> color_eyre::eyre::Result<codex_tui::ExternalSwitchResult> {
+        use codex_protocol::protocol::{SandboxPolicy, SessionConfiguredEvent};
+        use codex_protocol::ThreadId;
+
+        self.switch_session(session_id.to_string());
+
+        // Fetch existing events from the new session to seed initial_messages.
+        let events = self
+            .fetch_initial_events()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("failed to fetch initial events: {e}"))?;
+        let filtered = filter_initial_events(events);
+
+        Ok(codex_tui::ExternalSwitchResult {
+            session_configured: SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                initial_messages: Some(filtered),
+                model: self.base_input.model.clone(),
+                model_provider_id: "openai".into(),
+                approval_policy: self.base_input.approval_policy,
+                sandbox_policy: SandboxPolicy::DangerFullAccess,
+                cwd: std::env::current_dir().unwrap_or_default(),
+                reasoning_effort: self.base_input.reasoning_effort,
+                history_log_id: 0,
+                history_entry_count: 0,
+                network_proxy: None,
+                rollout_path: None,
+            },
+        })
+    }
+
+    fn current_session_id(&self) -> Option<String> {
+        Some(self.session_id())
     }
 }

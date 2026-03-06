@@ -126,22 +126,7 @@ fn parse_resume_arg() -> (Option<String>, Option<String>) {
     (resume, prompt)
 }
 
-/// Filter replayed events into the set suitable for `initial_messages`.
-fn filter_initial_events(events: Vec<EventMsg>) -> Vec<EventMsg> {
-    events
-        .into_iter()
-        .filter(|e| {
-            matches!(
-                e,
-                EventMsg::AgentMessage(_)
-                    | EventMsg::TurnStarted(_)
-                    | EventMsg::TurnComplete(_)
-                    | EventMsg::ExecApprovalRequest(_)
-                    | EventMsg::ExecCommandBegin(_)
-            )
-        })
-        .collect()
-}
+use codex_temporal::session::filter_initial_events;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -305,13 +290,14 @@ async fn run_tui_session(
 
     // --- Run TUI ---
     codex_tui::run_with_session(
-        session,
+        session.clone(),
         session_configured,
         config,
         auth_manager,
         models_manager,
         model,
         initial_prompt,
+        Some(session as Arc<dyn codex_tui::ExternalAgentBrowser>),
     )
     .await?;
 
