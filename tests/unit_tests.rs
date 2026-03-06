@@ -2787,10 +2787,12 @@ initial_prompt = "Do beta things."
     let _guard = EnvGuard::set("CODEX_HOME", tmp.path().to_str().unwrap());
 
     let crews = discover_crew_types().unwrap();
-    assert_eq!(crews.len(), 2);
+    // 3 = built-in codex-default + alpha + beta
+    assert_eq!(crews.len(), 3);
     assert_eq!(crews[0].name, "alpha");
     assert_eq!(crews[1].name, "beta");
     assert_eq!(crews[1].mode, CrewMode::Autonomous);
+    assert_eq!(crews[2].name, "codex-default");
 }
 
 /// RAII guard that sets an env var for the duration of its lifetime
@@ -3092,4 +3094,107 @@ fn session_continue_as_new_state_crew_agents_roundtrip() {
     let worker = &back.crew_agents["worker"];
     assert_eq!(worker.model.as_deref(), Some("gpt-4o-mini"));
     assert_eq!(worker.instructions.as_deref(), Some("Do work."));
+}
+
+// ---------------------------------------------------------------------------
+// Built-in default crew tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn built_in_default_crew_has_explorer_and_worker() {
+    use codex_temporal::config_loader::built_in_default_crew;
+
+    let crew = built_in_default_crew();
+    assert_eq!(crew.name, "codex-default");
+    assert_eq!(crew.main_agent, "default");
+
+    // Should have 3 agents: default (main), explorer, worker.
+    assert_eq!(crew.agents.len(), 3);
+    assert!(crew.agents.contains_key("default"));
+    assert!(crew.agents.contains_key("explorer"));
+    assert!(crew.agents.contains_key("worker"));
+
+    // Explorer should reference the "explorer" role.
+    let explorer = &crew.agents["explorer"];
+    assert_eq!(explorer.role.as_deref(), Some("explorer"));
+    assert!(explorer.description.is_some());
+
+    // Worker should reference the "worker" role.
+    let worker = &crew.agents["worker"];
+    assert_eq!(worker.role.as_deref(), Some("worker"));
+    assert!(worker.description.is_some());
+}
+
+#[test]
+fn discover_crew_types_includes_built_in() {
+    use codex_temporal::config_loader::discover_crew_types;
+
+    // Point CODEX_HOME to a temp dir without a crews/ directory so only
+    // the built-in crew is returned.
+    let tmp = std::env::temp_dir().join(format!(
+        "codex-discover-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // SAFETY: unit tests in this file run sequentially (single thread).
+    let original = std::env::var("CODEX_HOME").ok();
+    unsafe { std::env::set_var("CODEX_HOME", &tmp) };
+
+    let crews = discover_crew_types().expect("discover_crew_types failed");
+
+    // Restore CODEX_HOME.
+    unsafe {
+        match original {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert!(
+        crews.iter().any(|c| c.name == "codex-default"),
+        "expected codex-default in discovered crews: {:?}",
+        crews.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn load_harness_config_populates_default_crew_agents() {
+    use codex_temporal::config_loader::load_harness_config;
+
+    // Point CODEX_HOME to a temp dir with minimal config.
+    let tmp = std::env::temp_dir().join(format!(
+        "codex-harness-crew-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("config.toml"), "").unwrap();
+
+    let original = std::env::var("CODEX_HOME").ok();
+    unsafe { std::env::set_var("CODEX_HOME", &tmp) };
+
+    let config = load_harness_config().await.expect("load_harness_config failed");
+
+    unsafe {
+        match original {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // crew_agents should contain explorer and worker (not default/main).
+    assert!(
+        config.base_input.crew_agents.contains_key("explorer"),
+        "expected explorer in crew_agents"
+    );
+    assert!(
+        config.base_input.crew_agents.contains_key("worker"),
+        "expected worker in crew_agents"
+    );
+    assert!(
+        !config.base_input.crew_agents.contains_key("default"),
+        "default (main agent) should not be in crew_agents"
+    );
 }

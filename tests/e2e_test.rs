@@ -2555,6 +2555,114 @@ description = "Helper agent for sub-tasks"
     drain_shutdown(&session).await;
 }
 
+/// Test that the built-in codex-default crew makes explorer and worker
+/// agents available without requiring an explicit `--crew` flag.
+///
+/// 1. Start a SessionWorkflow with default config (no crew_agents set
+///    explicitly — relies on `load_harness_config` populating them).
+/// 2. Submit a user turn asking the model to list available agents.
+/// 3. Verify that spawning an explorer agent succeeds via `spawn_agent`.
+/// 4. Query `list_agents` — verify explorer was spawned.
+async fn default_crew_agents_available(client: &Client) {
+    use codex_temporal::config_loader::built_in_default_crew;
+    use codex_temporal::session_workflow::{SessionWorkflow, SessionWorkflowRun};
+    use codex_temporal::types::{AgentRecord, SessionWorkflowInput, SpawnAgentInput};
+
+    // Build a SessionWorkflowInput with the built-in default crew agents,
+    // simulating what load_harness_config() does.
+    let default_crew = built_in_default_crew();
+    let mut crew_agents = std::collections::BTreeMap::new();
+    for (name, def) in &default_crew.agents {
+        if name == &default_crew.main_agent {
+            continue;
+        }
+        crew_agents.insert(name.clone(), def.clone());
+    }
+
+    let session_id = format!("e2e-default-crew-{}", uuid::Uuid::new_v4());
+    let base_input = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents,
+        continued_state: None,
+    };
+    let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
+
+    // Submit initial turn.
+    session
+        .submit(user_turn_op("Say hello."))
+        .await
+        .expect("submit failed");
+
+    // Wait for TurnComplete.
+    let timeout_at = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout_at {
+            panic!("timed out waiting for first TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    // Spawn explorer sub-agent via signal.
+    session
+        .spawn_agent(SpawnAgentInput {
+            role: "explorer".to_string(),
+            message: "What files exist in the current directory?".to_string(),
+        })
+        .await
+        .expect("spawn_agent explorer failed");
+
+    // Give the SessionWorkflow time to process the spawn.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Query list_agents on the SessionWorkflow.
+    let handle = client.get_workflow_handle::<SessionWorkflowRun>(&session_id);
+    let agents_json: String = handle
+        .query(
+            SessionWorkflow::list_agents,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await
+        .expect("list_agents query failed");
+
+    let agents: Vec<AgentRecord> = serde_json::from_str(&agents_json).unwrap_or_default();
+
+    assert!(
+        agents.len() >= 2,
+        "expected at least 2 agents (main + explorer), got {}: {:?}",
+        agents.len(),
+        agents
+    );
+
+    // Verify the main agent is present.
+    assert!(
+        agents.iter().any(|a| a.agent_id.ends_with("/main")),
+        "expected main agent in list: {:?}",
+        agents
+    );
+
+    // Verify the explorer agent was spawned.
+    assert!(
+        agents.iter().any(|a| a.role == "explorer"),
+        "expected explorer agent in list: {:?}",
+        agents
+    );
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -2782,6 +2890,9 @@ async fn e2e_tests_inner() {
 
     eprintln!("--- test: crew_subagent_spawn_flow ---");
     crew_subagent_spawn_flow(&client, &default_codex_home).await;
+
+    eprintln!("--- test: default_crew_agents_available ---");
+    default_crew_agents_available(&client).await;
 
     // --- teardown ---
     // Restore CODEX_HOME.

@@ -70,6 +70,17 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
     // --- model provider ---
     let model_provider = config.model_provider.clone();
 
+    // Populate crew_agents from the built-in default crew so that
+    // explorer and worker are available via spawn_agent in every session.
+    let default_crew = built_in_default_crew();
+    let mut crew_agents = BTreeMap::new();
+    for (agent_name, agent_def) in &default_crew.agents {
+        if agent_name == &default_crew.main_agent {
+            continue; // main agent is not a crew sub-agent
+        }
+        crew_agents.insert(agent_name.clone(), agent_def.clone());
+    }
+
     let base_input = SessionWorkflowInput {
         user_message: String::new(),
         model,
@@ -81,7 +92,7 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
         personality,
         developer_instructions,
         model_provider: None, // Set by caller from HarnessConfig.model_provider
-        crew_agents: BTreeMap::new(),
+        crew_agents,
         continued_state: None,
     };
 
@@ -160,26 +171,101 @@ fn crews_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(home.join("crews"))
 }
 
+/// Return the built-in `codex-default` crew type.
+///
+/// This crew groups the built-in `explorer` and `worker` roles as regular
+/// crew members so they are available via `spawn_agent` without requiring
+/// users to write a crew TOML file.
+pub fn built_in_default_crew() -> CrewType {
+    let mut agents = BTreeMap::new();
+
+    // Main agent — uses the "default" role with no overrides.
+    agents.insert(
+        "default".to_string(),
+        CrewAgentDef {
+            role: Some("default".to_string()),
+            model: None,
+            instructions: None,
+            description: Some("Default agent.".to_string()),
+        },
+    );
+
+    // Explorer agent.
+    agents.insert(
+        "explorer".to_string(),
+        CrewAgentDef {
+            role: Some("explorer".to_string()),
+            model: None,
+            instructions: None,
+            description: Some(
+                "Use `explorer` for specific codebase questions. \
+                 Explorers are fast and authoritative."
+                    .to_string(),
+            ),
+        },
+    );
+
+    // Worker agent.
+    agents.insert(
+        "worker".to_string(),
+        CrewAgentDef {
+            role: Some("worker".to_string()),
+            model: None,
+            instructions: None,
+            description: Some(
+                "Use for execution and production work. \
+                 Typical tasks: implement features, fix tests or bugs, \
+                 split large refactors into independent chunks."
+                    .to_string(),
+            ),
+        },
+    );
+
+    CrewType {
+        name: "codex-default".to_string(),
+        description: "Built-in crew with explorer and worker agents.".to_string(),
+        mode: CrewMode::Interactive,
+        initial_prompt: None,
+        inputs: BTreeMap::new(),
+        main_agent: "default".to_string(),
+        agents,
+        approval_policy: None,
+    }
+}
+
 /// Discover all crew types by scanning `{CODEX_HOME}/crews/*.toml`.
 ///
-/// Returns an empty vec (not an error) if the crews directory does not exist.
+/// The built-in `codex-default` crew is always included unless a user-defined
+/// `codex-default.toml` file exists (which overrides the built-in).
+///
+/// Returns an empty vec (not an error) if the crews directory does not exist
+/// (the built-in crew is still included).
 pub fn discover_crew_types() -> Result<Vec<CrewType>, Box<dyn std::error::Error>> {
     let dir = crews_dir()?;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
 
     let mut crews = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            let content = std::fs::read_to_string(&path)?;
-            let crew: CrewType = toml::from_str(&content).map_err(|e| {
-                format!("failed to parse {}: {e}", path.display())
-            })?;
-            crews.push(crew);
+    let mut has_user_default = false;
+
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                let content = std::fs::read_to_string(&path)?;
+                let crew: CrewType = toml::from_str(&content).map_err(|e| {
+                    format!("failed to parse {}: {e}", path.display())
+                })?;
+                if crew.name == "codex-default" {
+                    has_user_default = true;
+                }
+                crews.push(crew);
+            }
         }
+    }
+
+    // Prepend built-in crew if no user-defined override exists.
+    if !has_user_default {
+        crews.insert(0, built_in_default_crew());
     }
 
     // Sort by name for stable ordering.
@@ -188,10 +274,16 @@ pub fn discover_crew_types() -> Result<Vec<CrewType>, Box<dyn std::error::Error>
 }
 
 /// Load a single crew type by name from `{CODEX_HOME}/crews/{name}.toml`.
+///
+/// Falls back to the built-in `codex-default` crew when `name` is
+/// `"codex-default"` and no user file exists.
 pub fn load_crew_type(name: &str) -> Result<CrewType, Box<dyn std::error::Error>> {
     let dir = crews_dir()?;
     let path = dir.join(format!("{name}.toml"));
     if !path.exists() {
+        if name == "codex-default" {
+            return Ok(built_in_default_crew());
+        }
         return Err(format!("crew type '{}' not found at {}", name, path.display()).into());
     }
     let content = std::fs::read_to_string(&path)?;
