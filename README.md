@@ -116,6 +116,65 @@ cargo run --bin codex-temporal-tui -- --resume <session_id>  # direct resume
 
 The worker loads config from `~/.codex/config.toml` (same format as the standard Codex CLI). All settings — model, sandbox policy, approval policy, MCP servers, features — flow through to the workflow. Environment variables override config.toml values.
 
+## Building binaries
+
+### Build release binaries
+
+```bash
+cargo build --release
+```
+
+This produces three binaries in `target/release/`:
+
+| Binary | Description |
+|--------|-------------|
+| `codex-temporal-worker` | Temporal worker — runs workflows and activities |
+| `codex-temporal-client` | CLI client — start workflows, list sessions |
+| `codex-temporal-tui` | TUI — interactive Codex interface over Temporal |
+
+### Install to PATH
+
+```bash
+cargo install --path .
+```
+
+This installs all three binaries to `~/.cargo/bin/` (which should already be on your `PATH` if you have Rust installed via rustup).
+
+### Using the installed binaries
+
+Once installed (or using the binaries from `target/release/` directly), you no longer need `cargo run`:
+
+```bash
+# Start the worker
+export OPENAI_API_KEY="sk-..."
+codex-temporal-worker
+
+# Run a one-shot prompt
+codex-temporal-client "What is 2+2?"
+
+# List sessions
+codex-temporal-client list
+
+# Launch the TUI
+codex-temporal-tui
+
+# Resume a session
+codex-temporal-tui --resume
+```
+
+### Cross-compilation
+
+To build for a different target (e.g. `x86_64-unknown-linux-musl` for a static binary):
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+The binary will be at `target/x86_64-unknown-linux-musl/release/codex-temporal-worker` (and similarly for the other binaries).
+
+**Note:** The build requires the sibling `codex/` and `sdk-core/` repos to be checked out (see [Prerequisites](#prerequisites)), since several dependencies use local paths and git sources.
+
 ## Tests
 
 ### Unit tests (106 tests)
