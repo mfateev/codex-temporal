@@ -30,15 +30,15 @@ temporalio-client = { git = "https://github.com/mfateev/sdk-core.git", branch = 
 temporalio-macros = { git = "https://github.com/mfateev/sdk-core.git", branch = "task/rust-harness" }
 temporalio-common = { git = "https://github.com/mfateev/sdk-core.git", branch = "task/rust-harness" }
 
-# Codex crates — local path for development
-codex-core = { path = "../codex/codex-rs/core" }
-codex-feedback = { path = "../codex/codex-rs/feedback" }
-codex-protocol = { path = "../codex/codex-rs/protocol" }
-codex-otel = { path = "../codex/codex-rs/otel" }
-codex-tui = { path = "../codex/codex-rs/tui" }
-codex-shell-command = { path = "../codex/codex-rs/shell-command" }
-codex-apply-patch = { path = "../codex/codex-rs/apply-patch" }
-codex-rmcp-client = { path = "../codex/codex-rs/rmcp-client" }
+# Codex crates — task/codex-temporal branch of the codex fork
+codex-core = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-feedback = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-protocol = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-otel = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-tui = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-shell-command = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-apply-patch = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-rmcp-client = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
 rmcp = { version = "0.15.0", default-features = false, features = ["base64", "macros", "schemars"] }
 
 

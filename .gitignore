@@ -1,5 +1,6 @@
 /target
 Cargo.lock
+.cargo/config.toml
 
 # Test artifacts (e2e patch_approval_flow may create this in cwd)
 codex-patch-test.txt

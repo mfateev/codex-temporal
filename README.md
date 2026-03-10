@@ -28,7 +28,7 @@ Wraps the Codex agentic loop in a Temporal workflow so that multi-turn conversat
 - **Temporal CLI** (`temporal server start-dev`) or a running Temporal server
 - **Protocol Buffers compiler** (`protoc`) — required by the Temporal SDK
 - **OpenAI API key** (`OPENAI_API_KEY` env var)
-- **Sibling repos** checked out next to this one:
+- **Sibling repos** (only needed for local development — see [Local development](#local-development) below):
 
 ```
 parent/
@@ -36,6 +36,8 @@ parent/
   sdk-core/        # github.com/mfateev/sdk-core (branch: master)
   codex-temporal/  # this repo
 ```
+
+By default, all dependencies are fetched from git. You only need sibling checkouts if you want to iterate on codex crates locally.
 
 ## Quick start
 
@@ -173,7 +175,25 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 The binary will be at `target/x86_64-unknown-linux-musl/release/codex-temporal-worker` (and similarly for the other binaries).
 
-**Note:** The build requires the sibling `codex/` and `sdk-core/` repos to be checked out (see [Prerequisites](#prerequisites)), since several dependencies use local paths and git sources.
+All dependencies (codex crates, Temporal SDK) are fetched from git — no sibling repo checkouts required for building.
+
+### Local development
+
+For iterating on codex crates locally, create `.cargo/config.toml` to override the git dependencies with local paths:
+
+```toml
+[patch."https://github.com/mfateev/codex.git"]
+codex-core          = { path = "../codex/codex-rs/core" }
+codex-feedback      = { path = "../codex/codex-rs/feedback" }
+codex-protocol      = { path = "../codex/codex-rs/protocol" }
+codex-otel          = { path = "../codex/codex-rs/otel" }
+codex-tui           = { path = "../codex/codex-rs/tui" }
+codex-shell-command = { path = "../codex/codex-rs/shell-command" }
+codex-apply-patch   = { path = "../codex/codex-rs/apply-patch" }
+codex-rmcp-client   = { path = "../codex/codex-rs/rmcp-client" }
+```
+
+This file is gitignored. Remove or rename it to build from remote git sources.
 
 ## Tests
 
