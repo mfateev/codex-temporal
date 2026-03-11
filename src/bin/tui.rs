@@ -130,12 +130,23 @@ use codex_temporal::session::filter_initial_events;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Log to file to avoid corrupting the TUI terminal.
+    let log_dir = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".codex-temporal").join("logs"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/codex-temporal"));
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("tui.log"))
+        .expect("failed to open log file");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".parse().unwrap()),
+                .unwrap_or_else(|_| "warn".parse().unwrap()),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false)
         .init();
 
     let (resume_arg, initial_prompt) = parse_resume_arg();
