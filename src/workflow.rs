@@ -524,7 +524,7 @@ impl AgentWorkflow {
                 };
                 let project_context = input.project_context.clone().unwrap();
                 let mcp_tools = input.mcp_tools.clone();
-                tracing::info!("using pre-resolved config/context from parent workflow");
+                tracing::debug!("using pre-resolved config/context from parent workflow");
                 (config_output, project_context, mcp_tools)
             } else {
                 // Launch load_config and collect_project_context concurrently.
@@ -557,7 +557,7 @@ impl AgentWorkflow {
                 let mcp_tools: HashMap<String, serde_json::Value> =
                     if let Some(ref state) = input.continued_state {
                         if !state.mcp_tools.is_empty() {
-                            tracing::info!(
+                            tracing::debug!(
                                 tools = state.mcp_tools.len(),
                                 "reusing MCP tools from continue-as-new state"
                             );
@@ -595,7 +595,7 @@ impl AgentWorkflow {
         let context_items = build_context_items(&project_context);
 
         if !mcp_tools.is_empty() {
-            tracing::info!(tools = mcp_tools.len(), "MCP tools available");
+            tracing::debug!(tools = mcp_tools.len(), "MCP tools available");
         }
 
         // --- config ---
@@ -981,13 +981,13 @@ impl AgentWorkflow {
                                 if !outcome.needs_follow_up {
                                     break;
                                 }
-                                tracing::info!(
+                                tracing::debug!(
                                     iteration = iterations,
                                     "follow-up needed, continuing loop"
                                 );
                             }
                             Err(codex_core::error::CodexErr::TurnAborted) => {
-                                tracing::info!("try_run_sampling_request returned TurnAborted");
+                                tracing::debug!("try_run_sampling_request returned TurnAborted");
                                 turn_aborted = true;
                                 ctx.state_mut(|s| s.interrupt_requested = false);
                                 break;

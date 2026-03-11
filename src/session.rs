@@ -545,7 +545,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                             loop {
                                 tokio::select! {
                                     _ = cancel2.cancelled() => {
-                                        tracing::info!("submit retry loop cancelled by interrupt");
+                                        tracing::debug!("submit retry loop cancelled by interrupt");
                                         return;
                                     }
                                     _ = tokio::time::sleep(delay) => {}
@@ -563,7 +563,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                     .await
                                 {
                                     Ok(_) => {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             session_workflow_id = %session_id2,
                                             "session workflow started (after retry)"
                                         );
@@ -663,7 +663,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                             loop {
                                 tokio::select! {
                                     _ = cancel.cancelled() => {
-                                        tracing::info!("signal retry loop cancelled by interrupt");
+                                        tracing::debug!("signal retry loop cancelled by interrupt");
                                         return;
                                     }
                                     _ = tokio::time::sleep(delay) => {}
@@ -678,7 +678,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                     .await
                                 {
                                     Ok(_) => {
-                                        tracing::info!("signal_agent_op succeeded after retry");
+                                        tracing::debug!("signal_agent_op succeeded after retry");
                                         return;
                                     }
                                     Err(e) => {

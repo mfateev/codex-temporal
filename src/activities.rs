@@ -158,7 +158,7 @@ impl CodexActivities {
             SessionSource::Exec,
         );
 
-        tracing::info!(
+        tracing::debug!(
             model = %input.model_info.slug,
             input_items = prompt.input.len(),
             tools = prompt.tools.len(),
@@ -197,7 +197,7 @@ impl CodexActivities {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             output_items = items.len(),
             ?token_usage,
             "model_call completed"
@@ -244,7 +244,7 @@ impl CodexActivities {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             tool = %input.tool_name,
             call_id = %input.call_id,
             cwd = %input.cwd,
@@ -272,14 +272,14 @@ impl CodexActivities {
         _ctx: ActivityContext,
         _input: (),
     ) -> Result<ConfigOutput, ActivityError> {
-        tracing::info!("load_config activity invoked");
+        tracing::debug!("load_config activity invoked");
 
         let toml_string = ConfigBuilder::default()
             .build_toml_string()
             .await
             .map_err(|e| anyhow::anyhow!("config loading failed: {e}"))?;
 
-        tracing::info!(
+        tracing::debug!(
             toml_len = toml_string.len(),
             "config loaded successfully"
         );
@@ -301,7 +301,7 @@ impl CodexActivities {
         _ctx: ActivityContext,
         input: McpDiscoverInput,
     ) -> Result<McpDiscoverOutput, ActivityError> {
-        tracing::info!("discover_mcp_tools activity invoked");
+        tracing::debug!("discover_mcp_tools activity invoked");
 
         let cwd = std::path::PathBuf::from(&input.cwd);
         let config = config_from_toml(&input.config_toml, &cwd, None)
@@ -309,13 +309,13 @@ impl CodexActivities {
 
         let mcp_servers = config.mcp_servers.get().clone();
         if mcp_servers.is_empty() {
-            tracing::info!("no MCP servers configured");
+            tracing::debug!("no MCP servers configured");
             return Ok(McpDiscoverOutput {
                 tools: std::collections::HashMap::new(),
             });
         }
 
-        tracing::info!(servers = mcp_servers.len(), "initializing MCP servers");
+        tracing::debug!(servers = mcp_servers.len(), "initializing MCP servers");
 
         let mut manager = self.mcp_manager.lock().await;
         let discovered = manager
@@ -338,7 +338,7 @@ impl CodexActivities {
             })
             .collect();
 
-        tracing::info!("MCP discovery complete");
+        tracing::debug!("MCP discovery complete");
         Ok(McpDiscoverOutput { tools })
     }
 
@@ -352,7 +352,7 @@ impl CodexActivities {
         _ctx: ActivityContext,
         input: McpToolCallInput,
     ) -> Result<McpToolCallOutput, ActivityError> {
-        tracing::info!(
+        tracing::debug!(
             tool = %input.qualified_name,
             call_id = %input.call_id,
             "mcp_tool_call activity invoked"
@@ -411,7 +411,7 @@ impl CodexActivities {
             .unwrap_or_else(|_| PathBuf::from("/tmp"));
         let cwd_str = cwd.to_string_lossy().to_string();
 
-        tracing::info!(cwd = %cwd_str, "collecting project context");
+        tracing::debug!(cwd = %cwd_str, "collecting project context");
 
         // Build a minimal config pointing at the worker's cwd.
         let codex_home = PathBuf::from("/tmp/codex-temporal");
@@ -430,7 +430,7 @@ impl CodexActivities {
         // Collect git info (commit, branch, remote URL).
         let git_info = codex_core::git_info::collect_git_info(&cwd).await;
 
-        tracing::info!(
+        tracing::debug!(
             has_instructions = user_instructions.is_some(),
             has_git = git_info.is_some(),
             "project context collected"
@@ -490,7 +490,7 @@ impl CodexActivities {
         _ctx: ActivityContext,
         input: ResolveRoleConfigInput,
     ) -> Result<ResolveRoleConfigOutput, ActivityError> {
-        tracing::info!(role = %input.role_name, "resolve_role_config activity invoked");
+        tracing::debug!(role = %input.role_name, "resolve_role_config activity invoked");
 
         let cwd = PathBuf::from(&input.cwd);
         let mut config = config_from_toml(&input.config_toml, &cwd, None)
@@ -515,7 +515,7 @@ impl CodexActivities {
             model_provider: Some(config.model_provider.clone()),
         };
 
-        tracing::info!(
+        tracing::debug!(
             role = %input.role_name,
             model = ?output.model,
             "role config resolved"
