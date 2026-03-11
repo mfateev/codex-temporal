@@ -94,7 +94,7 @@ impl CodexActivities {
     #[activity]
     pub async fn model_call(
         self: Arc<Self>,
-        _ctx: ActivityContext,
+        ctx: ActivityContext,
         input: ModelCallInput,
     ) -> Result<ModelCallOutput, ActivityError> {
         // Use provider from workflow input (config.toml) if present,
@@ -182,6 +182,9 @@ impl CodexActivities {
         let mut items: Vec<ResponseItem> = Vec::new();
         let mut token_usage = None;
         while let Some(event) = stream.next().await {
+            // Heartbeat on every stream event so the server knows the
+            // activity is still alive while waiting for the model.
+            ctx.record_heartbeat(vec![]);
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items.push(item);

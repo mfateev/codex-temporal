@@ -61,6 +61,7 @@ impl ModelStreamer for TemporalModelStreamer {
 
         let opts = ActivityOptions {
             start_to_close_timeout: Some(Duration::from_secs(300)),
+            heartbeat_timeout: Some(Duration::from_secs(20)),
             cancellation_type: ActivityCancellationType::TryCancel,
             ..Default::default()
         };
