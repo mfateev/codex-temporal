@@ -3,14 +3,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use codex_temporal::entropy::TemporalRandomSource;
-use codex_temporal::sink::BufferEventSink;
-use codex_temporal::storage::InMemoryStorage;
-use codex_temporal::types::{
+use crate::entropy::TemporalRandomSource;
+use crate::sink::BufferEventSink;
+use crate::storage::InMemoryStorage;
+use crate::types::{
     ApprovalInput, CodexWorkflowInput, CodexWorkflowOutput, ConfigOutput, CrewAgentDef,
     CrewInputSpec, CrewMode, CrewType, HarnessInput, HarnessState, ModelCallOutput,
-    PendingApproval, ProjectContextOutput, SessionEntry, SessionStatus, ToolExecOutput,
-    UserTurnInput,
+    PendingApproval, ProjectContextOutput, SessionEntry, SessionStatus, StateUpdateRequest,
+    StateUpdateResponse, ToolExecOutput, UserTurnInput,
 };
 
 use codex_core::entropy::RandomSource;
@@ -672,7 +672,7 @@ fn workflow_input_reasoning_fields_default_when_missing() {
 fn continue_as_new_state_roundtrips_through_json() {
     use codex_protocol::protocol::{RolloutItem, TokenUsage};
     use codex_protocol::models::ResponseItem;
-    use codex_temporal::types::{ContinueAsNewState, UserTurnInput};
+    use crate::types::{ContinueAsNewState, UserTurnInput};
 
     let state = ContinueAsNewState {
         rollout_items: vec![RolloutItem::ResponseItem(ResponseItem::Message {
@@ -721,7 +721,7 @@ fn continue_as_new_state_roundtrips_through_json() {
 
 #[test]
 fn workflow_input_with_continued_state_roundtrips() {
-    use codex_temporal::types::ContinueAsNewState;
+    use crate::types::ContinueAsNewState;
 
     let input = CodexWorkflowInput {
         user_message: String::new(),
@@ -867,8 +867,8 @@ fn workflow_output_token_usage_defaults_to_none() {
 // These exercise the full build_specs → ToolRegistry::dispatch pipeline
 // without a Temporal worker or model API call.
 
-use codex_temporal::activities::dispatch_tool;
-use codex_temporal::types::ToolExecInput;
+use crate::activities::dispatch_tool;
+use crate::types::ToolExecInput;
 
 /// Default TOML config for tests that need unrestricted shell access.
 const FULL_ACCESS_TOML: &str = "model = \"gpt-4o\"\nsandbox_mode = \"danger-full-access\"\n";
@@ -1365,7 +1365,7 @@ fn project_context_output_defaults() {
 // build_context_items tests
 // ---------------------------------------------------------------------------
 
-use codex_temporal::workflow::build_context_items;
+use crate::workflow::build_context_items;
 
 #[test]
 fn build_context_items_with_instructions() {
@@ -1488,7 +1488,7 @@ fn extract_message_text(item: &codex_protocol::models::ResponseItem) -> String {
 // Config-loading new fields serde tests
 // ---------------------------------------------------------------------------
 
-use codex_temporal::types::ModelCallInput;
+use crate::types::ModelCallInput;
 
 #[test]
 fn workflow_input_developer_instructions_roundtrips() {
@@ -1748,7 +1748,7 @@ fn tool_exec_input_config_toml_roundtrip() {
 #[test]
 fn config_from_toml_constructs_features() {
     use codex_core::features::Feature;
-    use codex_temporal::config_loader::config_from_toml;
+    use crate::config_loader::config_from_toml;
 
     // Build a Config from a minimal TOML string.
     let toml_str = r#"
@@ -1845,7 +1845,7 @@ fn safe_command_skips_approval_under_on_request() {
 
 #[test]
 fn mcp_discover_output_serde_roundtrip() {
-    use codex_temporal::types::McpDiscoverOutput;
+    use crate::types::McpDiscoverOutput;
 
     let mut tools = std::collections::HashMap::new();
     tools.insert(
@@ -1865,7 +1865,7 @@ fn mcp_discover_output_serde_roundtrip() {
 
 #[test]
 fn mcp_tool_call_input_serde_roundtrip() {
-    use codex_temporal::types::McpToolCallInput;
+    use crate::types::McpToolCallInput;
 
     let input = McpToolCallInput {
         qualified_name: "mcp__echo__echo".to_string(),
@@ -1882,7 +1882,7 @@ fn mcp_tool_call_input_serde_roundtrip() {
 
 #[test]
 fn mcp_tool_call_output_serde_roundtrip_ok() {
-    use codex_temporal::types::McpToolCallOutput;
+    use crate::types::McpToolCallOutput;
 
     let output = McpToolCallOutput {
         call_id: "call-456".to_string(),
@@ -1900,7 +1900,7 @@ fn mcp_tool_call_output_serde_roundtrip_ok() {
 
 #[test]
 fn mcp_tool_call_output_serde_roundtrip_err() {
-    use codex_temporal::types::McpToolCallOutput;
+    use crate::types::McpToolCallOutput;
 
     let output = McpToolCallOutput {
         call_id: "call-789".to_string(),
@@ -1917,7 +1917,7 @@ fn mcp_tool_call_output_serde_roundtrip_err() {
 
 #[test]
 fn mcp_tool_call_output_into_response_item_ok() {
-    use codex_temporal::types::McpToolCallOutput;
+    use crate::types::McpToolCallOutput;
     use codex_protocol::models::ResponseInputItem;
 
     let output = McpToolCallOutput {
@@ -1942,7 +1942,7 @@ fn mcp_tool_call_output_into_response_item_ok() {
 
 #[test]
 fn mcp_tool_call_output_into_response_item_err() {
-    use codex_temporal::types::McpToolCallOutput;
+    use crate::types::McpToolCallOutput;
     use codex_protocol::models::ResponseInputItem;
 
     let output = McpToolCallOutput {
@@ -1964,7 +1964,7 @@ fn mcp_tool_call_output_into_response_item_err() {
 
 #[test]
 fn continue_as_new_state_with_mcp_tools() {
-    use codex_temporal::types::ContinueAsNewState;
+    use crate::types::ContinueAsNewState;
 
     let mut mcp_tools = std::collections::HashMap::new();
     mcp_tools.insert(
@@ -1996,7 +1996,7 @@ fn continue_as_new_state_with_mcp_tools() {
 
 #[test]
 fn continue_as_new_state_mcp_tools_default_when_missing() {
-    use codex_temporal::types::ContinueAsNewState;
+    use crate::types::ContinueAsNewState;
 
     // JSON without mcp_tools field — should default to empty.
     let json = r#"{
@@ -2012,7 +2012,7 @@ fn continue_as_new_state_mcp_tools_default_when_missing() {
 
 #[test]
 fn continue_as_new_state_with_approval_policy_roundtrips() {
-    use codex_temporal::types::ContinueAsNewState;
+    use crate::types::ContinueAsNewState;
     use codex_protocol::protocol::AskForApproval;
 
     let state = ContinueAsNewState {
@@ -2038,7 +2038,7 @@ fn continue_as_new_state_with_approval_policy_roundtrips() {
 
 #[test]
 fn continue_as_new_state_approval_policy_default_when_missing() {
-    use codex_temporal::types::ContinueAsNewState;
+    use crate::types::ContinueAsNewState;
 
     // JSON without approval_policy_override field — should default to None.
     let json = r#"{
@@ -2055,7 +2055,7 @@ fn continue_as_new_state_approval_policy_default_when_missing() {
 #[tokio::test]
 async fn config_toml_roundtrip_preserves_mcp_servers() {
     use codex_core::config::ConfigBuilder;
-    use codex_temporal::config_loader::config_from_toml;
+    use crate::config_loader::config_from_toml;
 
     let tmp = std::env::temp_dir().join(format!(
         "codex-mcp-config-test-{}",
@@ -2140,7 +2140,7 @@ fn mcp_tool_name_detection() {
 
 #[test]
 fn session_workflow_input_roundtrips_through_json() {
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::types::SessionWorkflowInput;
 
     let input = SessionWorkflowInput {
         user_message: "Hello".to_string(),
@@ -2167,7 +2167,7 @@ fn session_workflow_input_roundtrips_through_json() {
 
 #[test]
 fn session_workflow_input_backward_compat_defaults() {
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::types::SessionWorkflowInput;
 
     // Minimal JSON without optional fields.
     let json = r#"{"user_message":"hi","model":"gpt-4o","instructions":"test"}"#;
@@ -2235,9 +2235,9 @@ fn agent_workflow_input_with_new_fields_roundtrips() {
 
 #[test]
 fn session_continue_as_new_state_roundtrips() {
-    use codex_temporal::types::SessionContinueAsNewState;
-    use codex_temporal::types::AgentRecord;
-    use codex_temporal::types::AgentLifecycle;
+    use crate::types::SessionContinueAsNewState;
+    use crate::types::AgentRecord;
+    use crate::types::AgentLifecycle;
 
     let state = SessionContinueAsNewState {
         agents: vec![AgentRecord {
@@ -2266,7 +2266,7 @@ fn session_continue_as_new_state_roundtrips() {
 
 #[test]
 fn spawn_agent_input_roundtrips() {
-    use codex_temporal::types::SpawnAgentInput;
+    use crate::types::SpawnAgentInput;
 
     let input = SpawnAgentInput {
         role: "explorer".to_string(),
@@ -2282,7 +2282,7 @@ fn spawn_agent_input_roundtrips() {
 
 #[test]
 fn agent_record_roundtrips() {
-    use codex_temporal::types::{AgentRecord, AgentLifecycle};
+    use crate::types::{AgentRecord, AgentLifecycle};
 
     let record = AgentRecord {
         agent_id: "session/explorer-1".to_string(),
@@ -2301,7 +2301,7 @@ fn agent_record_roundtrips() {
 
 #[test]
 fn agent_summary_roundtrips() {
-    use codex_temporal::types::{AgentSummary, AgentLifecycle};
+    use crate::types::{AgentSummary, AgentLifecycle};
 
     let summary = AgentSummary {
         agent_id: "session/main".to_string(),
@@ -2321,7 +2321,7 @@ fn agent_summary_roundtrips() {
 
 #[test]
 fn resolve_role_config_input_roundtrips() {
-    use codex_temporal::types::ResolveRoleConfigInput;
+    use crate::types::ResolveRoleConfigInput;
 
     let input = ResolveRoleConfigInput {
         config_toml: "model = \"gpt-4o\"".to_string(),
@@ -2338,7 +2338,7 @@ fn resolve_role_config_input_roundtrips() {
 
 #[test]
 fn resolve_role_config_output_roundtrips() {
-    use codex_temporal::types::ResolveRoleConfigOutput;
+    use crate::types::ResolveRoleConfigOutput;
     use codex_protocol::openai_models::ReasoningEffort;
 
     let output = ResolveRoleConfigOutput {
@@ -2361,7 +2361,7 @@ fn resolve_role_config_output_roundtrips() {
 
 #[test]
 fn agent_lifecycle_serde() {
-    use codex_temporal::types::AgentLifecycle;
+    use crate::types::AgentLifecycle;
 
     for status in [AgentLifecycle::Running, AgentLifecycle::Completed, AgentLifecycle::Failed] {
         let json = serde_json::to_string(&status).unwrap();
@@ -2372,7 +2372,7 @@ fn agent_lifecycle_serde() {
 
 #[test]
 fn session_workflow_output_roundtrips() {
-    use codex_temporal::types::{SessionWorkflowOutput, AgentSummary, AgentLifecycle};
+    use crate::types::{SessionWorkflowOutput, AgentSummary, AgentLifecycle};
 
     let output = SessionWorkflowOutput {
         agents: vec![
@@ -2432,7 +2432,7 @@ fn backward_compat_type_aliases_work() {
 
 #[test]
 fn codex_workflow_input_converts_to_session_workflow_input() {
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::types::SessionWorkflowInput;
 
     let agent_input = CodexWorkflowInput {
         user_message: "hello".to_string(),
@@ -2585,8 +2585,8 @@ description = "Explores the code"
 #[test]
 fn apply_crew_type_interpolates_placeholders() {
     use std::collections::BTreeMap;
-    use codex_temporal::config_loader::apply_crew_type;
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::config_loader::apply_crew_type;
+    use crate::types::SessionWorkflowInput;
 
     let crew = CrewType {
         name: "test-crew".to_string(),
@@ -2658,8 +2658,8 @@ fn apply_crew_type_interpolates_placeholders() {
 #[test]
 fn apply_crew_type_rejects_missing_required_input() {
     use std::collections::BTreeMap;
-    use codex_temporal::config_loader::apply_crew_type;
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::config_loader::apply_crew_type;
+    use crate::types::SessionWorkflowInput;
 
     let crew = CrewType {
         name: "test".to_string(),
@@ -2707,8 +2707,8 @@ fn apply_crew_type_rejects_missing_required_input() {
 #[test]
 fn apply_crew_type_uses_input_defaults() {
     use std::collections::BTreeMap;
-    use codex_temporal::config_loader::apply_crew_type;
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::config_loader::apply_crew_type;
+    use crate::types::SessionWorkflowInput;
 
     let crew = CrewType {
         name: "test".to_string(),
@@ -2753,7 +2753,7 @@ fn apply_crew_type_uses_input_defaults() {
 
 #[test]
 fn discover_crew_types_reads_directory() {
-    use codex_temporal::config_loader::discover_crew_types;
+    use crate::config_loader::discover_crew_types;
 
     // Set CODEX_HOME to a temp directory with a crews/ subdirectory.
     let tmp = tempfile::tempdir().unwrap();
@@ -2830,7 +2830,7 @@ impl Drop for EnvGuard {
 
 #[test]
 fn session_workflow_input_crew_agents_roundtrip() {
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::types::SessionWorkflowInput;
 
     let mut crew_agents = BTreeMap::new();
     crew_agents.insert(
@@ -2886,7 +2886,7 @@ fn session_workflow_input_crew_agents_roundtrip() {
 
 #[test]
 fn session_workflow_input_crew_agents_default_when_missing() {
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::types::SessionWorkflowInput;
 
     // JSON without crew_agents field — should default to empty.
     let json = r#"{
@@ -2904,8 +2904,8 @@ fn session_workflow_input_crew_agents_default_when_missing() {
 
 #[test]
 fn apply_crew_type_populates_crew_agents() {
-    use codex_temporal::config_loader::apply_crew_type;
-    use codex_temporal::types::SessionWorkflowInput;
+    use crate::config_loader::apply_crew_type;
+    use crate::types::SessionWorkflowInput;
 
     let crew = CrewType {
         name: "test".to_string(),
@@ -3008,7 +3008,7 @@ fn apply_crew_type_populates_crew_agents() {
 
 #[test]
 fn inject_crew_roles_into_toml_adds_roles() {
-    use codex_temporal::config_loader::inject_crew_roles_into_toml;
+    use crate::config_loader::inject_crew_roles_into_toml;
 
     let base_toml = r#"
 model = "gpt-4o"
@@ -3056,7 +3056,7 @@ model = "gpt-4o"
 
 #[test]
 fn session_continue_as_new_state_crew_agents_roundtrip() {
-    use codex_temporal::types::{AgentLifecycle, AgentRecord, SessionContinueAsNewState};
+    use crate::types::{AgentLifecycle, AgentRecord, SessionContinueAsNewState};
 
     let mut crew_agents = BTreeMap::new();
     crew_agents.insert(
@@ -3102,7 +3102,7 @@ fn session_continue_as_new_state_crew_agents_roundtrip() {
 
 #[test]
 fn built_in_default_crew_has_explorer_and_worker() {
-    use codex_temporal::config_loader::built_in_default_crew;
+    use crate::config_loader::built_in_default_crew;
 
     let crew = built_in_default_crew();
     assert_eq!(crew.name, "codex-default");
@@ -3127,7 +3127,7 @@ fn built_in_default_crew_has_explorer_and_worker() {
 
 #[test]
 fn discover_crew_types_includes_built_in() {
-    use codex_temporal::config_loader::discover_crew_types;
+    use crate::config_loader::discover_crew_types;
 
     // Point CODEX_HOME to a temp dir without a crews/ directory so only
     // the built-in crew is returned.
@@ -3161,7 +3161,7 @@ fn discover_crew_types_includes_built_in() {
 
 #[tokio::test]
 async fn load_harness_config_populates_default_crew_agents() {
-    use codex_temporal::config_loader::load_harness_config;
+    use crate::config_loader::load_harness_config;
 
     // Point CODEX_HOME to a temp dir with minimal config.
     let tmp = std::env::temp_dir().join(format!(
@@ -3197,4 +3197,47 @@ async fn load_harness_config_populates_default_crew_agents() {
         !config.base_input.crew_agents.contains_key("default"),
         "default (main agent) should not be in crew_agents"
     );
+}
+
+// ---------------------------------------------------------------------------
+// StateUpdateRequest / StateUpdateResponse serde roundtrips
+// ---------------------------------------------------------------------------
+
+#[test]
+fn state_update_request_roundtrips() {
+    let req = StateUpdateRequest {
+        since_index: 42,
+        since_version: 7,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    let back: StateUpdateRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.since_index, 42);
+    assert_eq!(back.since_version, 7);
+}
+
+#[test]
+fn state_update_response_roundtrips() {
+    let resp = StateUpdateResponse {
+        events: vec![r#"{"id":"e1","msg":"ShutdownComplete"}"#.to_string()],
+        watermark: 10,
+        state_version: 5,
+        completed: true,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    let back: StateUpdateResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.events.len(), 1);
+    assert_eq!(back.watermark, 10);
+    assert_eq!(back.state_version, 5);
+    assert!(back.completed);
+}
+
+#[test]
+fn state_update_response_defaults_empty() {
+    // Minimal JSON should deserialize correctly.
+    let json = r#"{"events":[],"watermark":0,"state_version":0,"completed":false}"#;
+    let resp: StateUpdateResponse = serde_json::from_str(json).unwrap();
+    assert!(resp.events.is_empty());
+    assert_eq!(resp.watermark, 0);
+    assert_eq!(resp.state_version, 0);
+    assert!(!resp.completed);
 }

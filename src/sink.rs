@@ -44,8 +44,8 @@ impl BufferEventSink {
     /// Return JSON-serialized events starting from `from_index`, plus the new
     /// watermark (i.e. `offset + buffer_len`).
     ///
-    /// This is designed for query-based polling: the client tracks the
-    /// watermark and passes it back as `from_index` on the next call.
+    /// Used by the `get_state_update` update handler: the client tracks the
+    /// watermark and passes it back as `since_index` on the next call.
     pub fn events_since(&self, from_index: usize) -> (Vec<String>, usize) {
         let guard = self.events.lock().expect("lock poisoned");
         let offset = *self.offset.lock().expect("lock poisoned");

@@ -179,6 +179,7 @@ impl ToolCallHandler for TemporalToolHandler {
                             message: elicitation.message,
                         }),
                     });
+                    ctx.state_mut(|s| s.bump_version());
 
                     // Wait for resolution or interrupt.
                     ctx.wait_condition(|s| {
@@ -227,6 +228,7 @@ impl ToolCallHandler for TemporalToolHandler {
                         questions: args.questions,
                     }),
                 });
+                ctx.state_mut(|s| s.bump_version());
 
                 // Wait for response or interrupt.
                 ctx.wait_condition(|s| {
@@ -289,6 +291,7 @@ impl ToolCallHandler for TemporalToolHandler {
                         arguments: args_value,
                     }),
                 });
+                ctx.state_mut(|s| s.bump_version());
 
                 // Wait for response or interrupt.
                 ctx.wait_condition(|s| {
@@ -373,6 +376,7 @@ impl ToolCallHandler for TemporalToolHandler {
                         grant_root: None,
                     }),
                 });
+                ctx.state_mut(|s| s.bump_version());
 
                 // Wait for decision or interrupt.
                 ctx.wait_condition(|s| {
@@ -483,6 +487,7 @@ impl ToolCallHandler for TemporalToolHandler {
                     }),
                 };
                 events.emit_event_sync(approval_event);
+                ctx.state_mut(|s| s.bump_version());
 
                 // 3. Wait for approval decision or interrupt
                 ctx.wait_condition(|s| {

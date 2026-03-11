@@ -2897,6 +2897,9 @@ async fn e2e_tests_inner() {
     eprintln!("--- test: session_switch_via_browser ---");
     session_switch_via_browser(&client).await;
 
+    eprintln!("--- test: blocking_update_event_delivery ---");
+    blocking_update_event_delivery(&client).await;
+
     // --- teardown ---
     // Restore CODEX_HOME.
     // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
@@ -2911,6 +2914,56 @@ async fn e2e_tests_inner() {
     drop(client);
     drop(runtime);
     let _ = server.shutdown().await;
+}
+
+/// Test that the blocking `get_state_update` update handler delivers events
+/// with low latency (no polling backoff) and that `next_event()` works through
+/// the watcher-based pipeline.
+///
+/// 1. Start a session, submit a user turn.
+/// 2. Measure time until `TurnStarted` arrives via `next_event()`.
+/// 3. Assert latency is under 5 seconds (generous, but proves no 50-500ms backoff).
+/// 4. Drain to `TurnComplete` and shut down.
+async fn blocking_update_event_delivery(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    session
+        .submit(user_turn_op_with_model(
+            "Say hello in one word.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Measure time until TurnStarted arrives.
+    let start = tokio::time::Instant::now();
+    let timeout = start + Duration::from_secs(120);
+    let mut saw_turn_started = false;
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for events");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::TurnStarted(_) => {
+                saw_turn_started = true;
+                let elapsed = start.elapsed();
+                eprintln!("  TurnStarted arrived in {elapsed:?}");
+                // With the blocking update, events should arrive quickly.
+                // We use a generous 5s bound to avoid flaky tests on slow CI.
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "TurnStarted should arrive quickly, took {elapsed:?}"
+                );
+            }
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(saw_turn_started, "expected TurnStarted event");
+    drain_shutdown(&session).await;
 }
 
 /// Test that `ExternalAgentBrowser` correctly lists sessions and switches

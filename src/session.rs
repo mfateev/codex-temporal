@@ -1,8 +1,9 @@
 //! [`AgentSession`] implementation backed by a Temporal workflow.
 //!
 //! `TemporalAgentSession` translates the `submit(Op)` / `next_event()` API
-//! into Temporal signals and queries against the active [`AgentWorkflow`]
-//! child, while lifecycle operations go to the parent [`SessionWorkflow`].
+//! into Temporal signals and blocking updates against the active
+//! [`AgentWorkflow`] child, while lifecycle operations go to the parent
+//! [`SessionWorkflow`].
 //!
 //! ## Protocol mapping
 //!
@@ -12,9 +13,10 @@
 //! | `Shutdown`        | signal both SessionWorkflow and AgentWorkflow         |
 //! | all other Ops     | signal active AgentWorkflow                          |
 //!
-//! Events are retrieved by polling `get_events_since` on the active AgentWorkflow.
+//! Events are received via a background [`Watcher`] that calls the blocking
+//! `get_state_update` update handler in a loop.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use codex_core::error::{CodexErr, Result as CodexResult};
 use codex_protocol::config_types::{Personality, ReasoningSummary};
@@ -22,12 +24,14 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{Event, EventMsg, Op};
 use codex_protocol::user_input::UserInput;
 use temporalio_client::{
-    Client, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    Client, WorkflowExecuteUpdateOptions, WorkflowQueryOptions, WorkflowSignalOptions,
+    WorkflowStartOptions,
 };
 
 use crate::harness::{CodexHarness, CodexHarnessRun};
 use crate::session_workflow::{SessionWorkflow, SessionWorkflowRun};
-use crate::types::{SessionWorkflowInput, SpawnAgentInput};
+use crate::types::{SessionWorkflowInput, SpawnAgentInput, StateUpdateRequest};
+use crate::watcher::{Watcher, WatcherEvent};
 use crate::workflow::{AgentWorkflow, AgentWorkflowRun};
 
 const TASK_QUEUE: &str = "codex-temporal";
@@ -40,20 +44,22 @@ pub struct TemporalAgentSession {
     client: Client,
     /// Workflow ID of the parent SessionWorkflow (mutable for session switching).
     session_workflow_id: Mutex<String>,
-    /// Workflow ID of the currently polled AgentWorkflow.
+    /// Workflow ID of the currently watched AgentWorkflow.
     active_agent_workflow_id: Mutex<String>,
     /// Session-level input (model, instructions, etc.).
     base_input: SessionWorkflowInput,
     /// Whether the session workflow has been started.
     started: Mutex<bool>,
-    /// Monotonically increasing event watermark for query-based polling.
-    events_index: Mutex<usize>,
     /// Local buffer of deserialized events not yet returned to the caller.
-    event_buffer: Mutex<Vec<Event>>,
+    event_buffer: Arc<Mutex<Vec<Event>>>,
+    /// Notified when new events are pushed into `event_buffer`.
+    event_notify: Arc<tokio::sync::Notify>,
     /// Set when shutdown has been signaled.
     shutdown: Mutex<bool>,
-    /// Monotonically increasing generation counter for stale-poll detection.
-    generation: Mutex<u64>,
+    /// Monotonically increasing generation counter for stale-data detection.
+    generation: Arc<Mutex<u64>>,
+    /// Handle to cancel the background Watcher when switching sessions.
+    watch_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Workflow ID of the CodexHarness (for querying session list).
     harness_workflow_id: String,
 }
@@ -90,10 +96,11 @@ impl TemporalAgentSession {
             active_agent_workflow_id: Mutex::new(agent_workflow_id),
             base_input,
             started: Mutex::new(false),
-            events_index: Mutex::new(0),
-            event_buffer: Mutex::new(Vec::new()),
+            event_buffer: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
             shutdown: Mutex::new(false),
-            generation: Mutex::new(0),
+            generation: Arc::new(Mutex::new(0)),
+            watch_handle: Mutex::new(None),
             harness_workflow_id,
         }
     }
@@ -122,18 +129,21 @@ impl TemporalAgentSession {
         let base_input = base_input.into();
         let agent_workflow_id = format!("{session_id}/main");
         let harness_workflow_id = harness_id.unwrap_or_else(derive_harness_workflow_id);
-        Self {
+        let session = Self {
             client,
             session_workflow_id: Mutex::new(session_id),
             active_agent_workflow_id: Mutex::new(agent_workflow_id),
             base_input,
             started: Mutex::new(true), // already running
-            events_index: Mutex::new(0),
-            event_buffer: Mutex::new(Vec::new()),
+            event_buffer: Arc::new(Mutex::new(Vec::new())),
+            event_notify: Arc::new(tokio::sync::Notify::new()),
             shutdown: Mutex::new(false),
-            generation: Mutex::new(0),
+            generation: Arc::new(Mutex::new(0)),
+            watch_handle: Mutex::new(None),
             harness_workflow_id,
-        }
+        };
+        session.start_watching();
+        session
     }
 
     /// Return the session workflow ID.
@@ -154,31 +164,89 @@ impl TemporalAgentSession {
 
     /// Switch the active agent to a different child workflow.
     ///
-    /// Resets the event watermark and clears the buffer so poll_events
-    /// starts fresh from the new agent.
+    /// Stops the current watcher, clears the buffer, and starts watching
+    /// the new agent.
     pub fn switch_agent(&self, agent_workflow_id: String) {
+        self.stop_watching();
         *self
             .active_agent_workflow_id
             .lock()
             .expect("lock poisoned") = agent_workflow_id;
-        *self.events_index.lock().expect("lock poisoned") = 0;
         self.event_buffer.lock().expect("lock poisoned").clear();
+        self.start_watching();
     }
 
     /// Switch to a different session entirely.
     ///
-    /// Bumps the generation counter (so in-flight polls are discarded),
-    /// resets all internal state to point at the new session, and marks
-    /// the session as started (the target session is already running).
+    /// Bumps the generation counter (so in-flight data is discarded),
+    /// resets all internal state to point at the new session, and starts
+    /// a new watcher.
     pub fn switch_session(&self, new_session_id: String) {
-        let mut generation = self.generation.lock().expect("lock poisoned");
-        *generation += 1;
+        self.stop_watching();
+        *self.generation.lock().expect("lock poisoned") += 1;
         *self.session_workflow_id.lock().expect("lock poisoned") = new_session_id.clone();
         *self.active_agent_workflow_id.lock().expect("lock poisoned") =
             format!("{new_session_id}/main");
-        *self.events_index.lock().expect("lock poisoned") = 0;
         self.event_buffer.lock().expect("lock poisoned").clear();
         *self.started.lock().expect("lock poisoned") = true;
+        self.start_watching();
+    }
+
+    /// Start the background watcher for the active agent workflow.
+    fn start_watching(&self) {
+        self.stop_watching();
+        let client = self.client.clone();
+        let workflow_id = self.active_agent_id();
+        let buffer = Arc::clone(&self.event_buffer);
+        let notify = Arc::clone(&self.event_notify);
+        let generation = Arc::clone(&self.generation);
+        let gen_at_start = *generation.lock().expect("lock poisoned");
+
+        let handle = tokio::spawn(async move {
+            let watcher = Watcher::new(client, workflow_id);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+            tokio::spawn(async move {
+                watcher.run_watching(tx).await;
+            });
+
+            while let Some(result) = rx.recv().await {
+                // Check generation for staleness.
+                if *generation.lock().expect("lock poisoned") != gen_at_start {
+                    return;
+                }
+                match result {
+                    WatcherEvent::Events(events, _watermark, _version) => {
+                        if !events.is_empty() {
+                            buffer.lock().expect("lock poisoned").extend(events);
+                            notify.notify_one();
+                        }
+                    }
+                    WatcherEvent::Completed => {
+                        buffer.lock().expect("lock poisoned").push(Event {
+                            id: String::new(),
+                            msg: EventMsg::ShutdownComplete,
+                        });
+                        notify.notify_one();
+                        return;
+                    }
+                    WatcherEvent::Error(e) => {
+                        tracing::error!(error = %e, "watcher terminated with error");
+                        notify.notify_one();
+                        return;
+                    }
+                }
+            }
+        });
+
+        *self.watch_handle.lock().expect("lock poisoned") = Some(handle);
+    }
+
+    /// Stop the background watcher.
+    fn stop_watching(&self) {
+        if let Some(handle) = self.watch_handle.lock().expect("lock poisoned").take() {
+            handle.abort();
+        }
     }
 
     /// Query the harness for the list of known sessions.
@@ -220,12 +288,35 @@ impl TemporalAgentSession {
         Ok(())
     }
 
-    /// Fetch all existing events from the workflow and advance the watermark.
+    /// Fetch all existing events from the workflow via a one-shot
+    /// `get_state_update` call.
     ///
     /// Call **before** launching the TUI to populate `initial_messages` so
     /// the user sees the full conversation history immediately on resume.
     pub async fn fetch_initial_events(&self) -> CodexResult<Vec<EventMsg>> {
-        let events = self.poll_events().await?;
+        let agent_id = self.active_agent_id();
+        let handle = self
+            .client
+            .get_workflow_handle::<AgentWorkflowRun>(&agent_id);
+
+        let resp = handle
+            .execute_update(
+                AgentWorkflow::get_state_update,
+                StateUpdateRequest {
+                    since_index: 0,
+                    since_version: 0,
+                },
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .map_err(|e| CodexErr::Fatal(format!("failed to fetch initial events: {e}")))?;
+
+        let events: Vec<Event> = resp
+            .events
+            .iter()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect();
+
         Ok(events.into_iter().map(|e| e.msg).collect())
     }
 
@@ -278,6 +369,7 @@ impl TemporalAgentSession {
             .map_err(|e| CodexErr::Fatal(format!("failed to start workflow: {e}")))?;
 
         *self.started.lock().expect("lock poisoned") = true;
+        self.start_watching();
 
         tracing::info!(
             session_workflow_id = %session_id,
@@ -325,66 +417,6 @@ impl TemporalAgentSession {
             })?;
 
         Ok(())
-    }
-
-    /// Poll the active agent workflow for new events via query.
-    ///
-    /// Uses a generation guard to discard stale results when a session
-    /// switch occurs mid-query.
-    async fn poll_events(&self) -> CodexResult<Vec<Event>> {
-        let gen_before = *self.generation.lock().expect("lock poisoned");
-        let from_index = *self.events_index.lock().expect("lock poisoned");
-        let agent_id = self.active_agent_id();
-
-        let handle = self
-            .client
-            .get_workflow_handle::<AgentWorkflowRun>(&agent_id);
-
-        let result_json: String = handle
-            .query(
-                AgentWorkflow::get_events_since,
-                from_index,
-                WorkflowQueryOptions::default(),
-            )
-            .await
-            .map_err(|e| {
-                CodexErr::Fatal(format!("failed to query events: {e}"))
-            })?;
-
-        // Check generation after the (potentially slow) query completes.
-        let gen_after = *self.generation.lock().expect("lock poisoned");
-        if gen_before != gen_after {
-            // Session switched while this query was in flight — discard.
-            return Ok(Vec::new());
-        }
-
-        // Parse the response: { "events": [...], "watermark": N }
-        let result: serde_json::Value =
-            serde_json::from_str(&result_json).map_err(|e| {
-                CodexErr::Fatal(format!("failed to parse query response: {e}"))
-            })?;
-
-        let watermark = result["watermark"]
-            .as_u64()
-            .unwrap_or(from_index as u64) as usize;
-
-        let event_strings = result["events"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-
-        let mut events = Vec::new();
-        for val in event_strings {
-            let json_str = val.as_str().unwrap_or("");
-            if let Ok(event) = serde_json::from_str::<Event>(json_str) {
-                events.push(event);
-            }
-        }
-
-        // Update watermark.
-        *self.events_index.lock().expect("lock poisoned") = watermark;
-
-        Ok(events)
     }
 }
 
@@ -450,51 +482,24 @@ impl codex_core::AgentSession for TemporalAgentSession {
     }
 
     async fn next_event(&self) -> CodexResult<Event> {
-        // First check the local buffer.
-        {
-            let mut buf = self.event_buffer.lock().expect("lock poisoned");
-            if !buf.is_empty() {
-                return Ok(buf.remove(0));
-            }
-        }
-
-        // Poll with adaptive backoff.
-        let mut backoff_ms = 50u64;
-        let max_backoff_ms = 500u64;
-
         loop {
+            // Check the local buffer first.
+            {
+                let mut buf = self.event_buffer.lock().expect("lock poisoned");
+                if !buf.is_empty() {
+                    return Ok(buf.remove(0));
+                }
+            }
+
+            // If not started, wait a bit (watcher not yet running).
             let started = *self.started.lock().expect("lock poisoned");
             if !started {
-                // Workflow not started yet — wait for a submit.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
 
-            match self.poll_events().await {
-                Ok(events) if !events.is_empty() => {
-                    let mut buf = self.event_buffer.lock().expect("lock poisoned");
-                    buf.extend(events);
-                    return Ok(buf.remove(0));
-                }
-                Ok(_) => {
-                    // No new events — backoff and retry.
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
-                }
-                Err(e) => {
-                    // Query failed — could be workflow completed. Check shutdown.
-                    let shutdown = *self.shutdown.lock().expect("lock poisoned");
-                    if shutdown {
-                        return Ok(Event {
-                            id: String::new(),
-                            msg: EventMsg::ShutdownComplete,
-                        });
-                    }
-                    tracing::warn!(error = %e, "event poll failed, retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
-                }
-            }
+            // Wait for the watcher to push events.
+            self.event_notify.notified().await;
         }
     }
 }

@@ -19,4 +19,8 @@ pub mod storage;
 pub mod streamer;
 pub mod tools;
 pub mod types;
+pub mod watcher;
 pub mod workflow;
+
+#[cfg(test)]
+mod unit_tests;
