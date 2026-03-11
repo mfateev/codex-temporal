@@ -370,26 +370,6 @@ impl TemporalAgentSession {
         Ok("ok".to_string())
     }
 
-    /// Signal shutdown to the SessionWorkflow.
-    async fn signal_session_shutdown(&self) -> CodexResult<()> {
-        let session_id = self.session_id();
-        let handle = self
-            .client
-            .get_workflow_handle::<SessionWorkflowRun>(&session_id);
-
-        handle
-            .signal(
-                SessionWorkflow::shutdown,
-                (),
-                WorkflowSignalOptions::default(),
-            )
-            .await
-            .map_err(|e| {
-                CodexErr::Fatal(format!("failed to signal session shutdown: {e}"))
-            })?;
-
-        Ok(())
-    }
 }
 
 /// Derive the harness workflow ID for the current user.
@@ -697,16 +677,65 @@ impl codex_core::AgentSession for TemporalAgentSession {
 
         // Track shutdown locally so next_event() can detect it.
         if matches!(op, Op::Shutdown) {
+            // Cancel any in-flight submit retry loop.
+            if let Some(token) = self.submit_cancel.lock().expect("lock poisoned").take() {
+                token.cancel();
+            }
             *self.shutdown.lock().expect("lock poisoned") = true;
-            // Wake next_event() so it can detect shutdown.
+            // Push ShutdownComplete immediately so the TUI can exit without
+            // waiting for a gRPC round-trip that may hang if the backend is
+            // unreachable (the "connecting to backend..." scenario).
+            {
+                let mut buf = self.event_buffer.lock().expect("lock poisoned");
+                buf.push(Event {
+                    id: String::new(),
+                    msg: EventMsg::ShutdownComplete,
+                });
+            }
             self.event_notify.notify_one();
-            // Signal shutdown to both the agent and session workflows.
-            let _ = self.signal_agent_op(op.clone()).await;
-            let _ = self.signal_session_shutdown().await;
+            // Fire-and-forget signal to both workflows (best effort).
+            let op_clone = op.clone();
+            let client = self.client.clone();
+            let agent_id = self.active_agent_id();
+            let session_id = self.session_id();
+            tokio::spawn(async move {
+                let agent_handle =
+                    client.get_workflow_handle::<AgentWorkflowRun>(&agent_id);
+                let _ = agent_handle
+                    .signal(
+                        AgentWorkflow::receive_op,
+                        op_clone,
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await;
+                let session_handle =
+                    client.get_workflow_handle::<SessionWorkflowRun>(&session_id);
+                let _ = session_handle
+                    .signal(
+                        SessionWorkflow::shutdown,
+                        (),
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await;
+            });
             return Ok("ok".to_string());
         }
 
-        self.signal_agent_op(op).await
+        // Apply a timeout to the signal call so a stuck gRPC connection
+        // doesn't permanently block the op-forwarding task (and prevent
+        // subsequent ops like Shutdown from being processed).
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.signal_agent_op(op),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("signal_agent_op timed out after 10s");
+                Err(CodexErr::Fatal("signal_agent_op timed out".to_string()))
+            }
+        }
     }
 
     async fn next_event(&self) -> CodexResult<Event> {
