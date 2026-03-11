@@ -8,8 +8,8 @@
 //!
 //! - **`receive_op` signal**: Generic signal that dispatches all client
 //!   operations (user turns, approvals, shutdown, compact, etc.).
-//! - **`get_events_since` query**: Returns JSON-serialized events from a
-//!   given index (for client polling).
+//! - **`get_state_update` update**: Blocking handler that returns new events
+//!   when `state_version` changes.  Replaces the old query-based polling.
 //!
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
@@ -53,7 +53,8 @@ use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
-    PendingPatchApproval, PendingUserInput, ProjectContextOutput, UserTurnInput,
+    PendingPatchApproval, PendingUserInput, ProjectContextOutput, StateUpdateRequest,
+    StateUpdateResponse, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -100,6 +101,10 @@ pub struct AgentWorkflow {
     /// Set by `Op::Interrupt`; checked between loop iterations and during
     /// approval waits.
     pub(crate) interrupt_requested: bool,
+    /// Monotonically increasing counter bumped on every mutation visible to
+    /// external observers.  Used by `get_state_update` to detect changes
+    /// without polling.
+    state_version: u64,
 }
 
 /// Extract the text message from user input items.
@@ -247,6 +252,7 @@ impl AgentWorkflow {
                 summary_override: state.summary_override,
                 personality_override: state.personality_override,
                 interrupt_requested: false,
+                state_version: 0,
                 input,
             };
         }
@@ -286,6 +292,7 @@ impl AgentWorkflow {
             summary_override: None,
             personality_override: None,
             interrupt_requested: false,
+            state_version: 0,
         }
     }
 
@@ -293,6 +300,11 @@ impl AgentWorkflow {
     pub fn effective_approval_policy(&self) -> AskForApproval {
         self.approval_policy_override
             .unwrap_or(self.input.approval_policy)
+    }
+
+    /// Bump the monotonic state version counter.
+    pub(crate) fn bump_version(&mut self) {
+        self.state_version += 1;
     }
 
     // ----- signals -----
@@ -318,6 +330,7 @@ impl AgentWorkflow {
                     summary: summary.unwrap_or_default(),
                     personality,
                 });
+                self.bump_version();
             }
             Op::ExecApproval { id, decision, .. } => {
                 if let Some(ref mut pa) = self.pending_approval {
@@ -329,6 +342,7 @@ impl AgentWorkflow {
                                 | ReviewDecision::ApprovedExecpolicyAmendment { .. }
                         );
                         pa.decision = Some(approved);
+                        self.bump_version();
                     }
                 }
             }
@@ -336,14 +350,17 @@ impl AgentWorkflow {
                 if let Some(ref mut pui) = self.pending_user_input {
                     if pui.call_id == id {
                         pui.response = Some(response);
+                        self.bump_version();
                     }
                 }
             }
             Op::Shutdown => {
                 self.shutdown_requested = true;
+                self.bump_version();
             }
             Op::Compact => {
                 self.compact_requested = true;
+                self.bump_version();
             }
             Op::PatchApproval { id, decision, .. } => {
                 if let Some(ref mut pa) = self.pending_patch_approval {
@@ -355,6 +372,7 @@ impl AgentWorkflow {
                                 | ReviewDecision::ApprovedExecpolicyAmendment { .. }
                         );
                         pa.decision = Some(approved);
+                        self.bump_version();
                     }
                 }
             }
@@ -381,11 +399,13 @@ impl AgentWorkflow {
                 if let Some(p) = personality {
                     self.personality_override = Some(p);
                 }
+                self.bump_version();
             }
             Op::DynamicToolResponse { id, response } => {
                 if let Some(ref mut pdt) = self.pending_dynamic_tool {
                     if pdt.call_id == id {
                         pdt.response = Some(response);
+                        self.bump_version();
                     }
                 }
             }
@@ -397,11 +417,13 @@ impl AgentWorkflow {
                 if let Some(ref mut pe) = self.pending_elicitation {
                     if pe.server_name == server_name && pe.request_id == request_id {
                         pe.response = Some(decision);
+                        self.bump_version();
                     }
                 }
             }
             Op::Interrupt => {
                 self.interrupt_requested = true;
+                self.bump_version();
             }
             _ => {
                 // Unknown/unhandled Op — ignore.
@@ -409,19 +431,46 @@ impl AgentWorkflow {
         }
     }
 
-    // ----- queries -----
+    // ----- updates -----
 
-    /// Return JSON-serialized events starting from `from_index`.
-    ///
-    /// Returns `(events_json[], new_watermark)` encoded as a JSON string.
-    #[query]
-    pub fn get_events_since(&self, _ctx: &WorkflowContextView, from_index: usize) -> String {
-        let (events, watermark) = self.events.events_since(from_index);
-        serde_json::json!({
-            "events": events,
-            "watermark": watermark,
+    /// Blocking update handler: returns new events when the workflow state
+    /// changes.  Replaces the old `get_events_since` query + client-side
+    /// polling loop.
+    #[update]
+    pub async fn get_state_update(
+        ctx: &mut WorkflowContext<Self>,
+        req: StateUpdateRequest,
+    ) -> Result<StateUpdateResponse, Box<dyn std::error::Error + Send + Sync>> {
+        // Snapshot version at entry.
+        let entry_version = ctx.state(|s| s.state_version);
+
+        // Check if data is immediately available.
+        let (events, watermark) = ctx.state(|s| s.events.events_since(req.since_index));
+        let shutdown = ctx.state(|s| s.shutdown_requested);
+        if !events.is_empty() || entry_version != req.since_version || shutdown {
+            let version = ctx.state(|s| s.state_version);
+            return Ok(StateUpdateResponse {
+                events,
+                watermark,
+                state_version: version,
+                completed: shutdown,
+            });
+        }
+
+        // Block until state changes.
+        ctx.wait_condition(|s| s.state_version != entry_version || s.shutdown_requested)
+            .await;
+
+        // Re-read after wakeup.
+        let (events, watermark) = ctx.state(|s| s.events.events_since(req.since_index));
+        let version = ctx.state(|s| s.state_version);
+        let shutdown = ctx.state(|s| s.shutdown_requested);
+        Ok(StateUpdateResponse {
+            events,
+            watermark,
+            state_version: version,
+            completed: shutdown,
         })
-        .to_string()
     }
 
     // ----- run -----
@@ -687,6 +736,7 @@ impl AgentWorkflow {
                             id: String::new(),
                             msg: EventMsg::ContextCompacted(ContextCompactedEvent),
                         });
+                        ctx.state_mut(|s| s.bump_version());
 
                         let pending = ctx.state(|s| s.user_turns.clone());
                         let turn_count = ctx.state(|s| s.turn_counter);
@@ -745,6 +795,7 @@ impl AgentWorkflow {
                             collaboration_mode_kind: Default::default(),
                         }),
                     });
+                    ctx.state_mut(|s| s.bump_version());
 
                     // Seed user message into session history.
                     let user_item = ResponseItem::Message {
@@ -936,6 +987,7 @@ impl AgentWorkflow {
                                 reason: TurnAbortReason::Interrupted,
                             }),
                         });
+                        ctx.state_mut(|s| s.bump_version());
                     } else {
                         // Emit TurnComplete
                         events.emit_event_sync(Event {
@@ -945,6 +997,7 @@ impl AgentWorkflow {
                                 last_agent_message: last_agent_message.clone(),
                             }),
                         });
+                        ctx.state_mut(|s| s.bump_version());
                     }
 
                     // Check if server suggests continue-as-new (history too large).
@@ -1003,6 +1056,7 @@ impl AgentWorkflow {
             id: String::new(),
             msg: EventMsg::ShutdownComplete,
         });
+        ctx.state_mut(|s| s.bump_version());
 
         Ok(AgentWorkflowOutput {
             last_agent_message,
@@ -1011,15 +1065,6 @@ impl AgentWorkflow {
         })
     }
 
-    /// Legacy query — returns JSON-serialized events (kept for backward compat).
-    ///
-    /// Uses `events_since(0)` instead of the old `drain()` to avoid
-    /// conflicting with the rolling buffer semantics.
-    #[query]
-    pub fn get_events(&self, _ctx: &WorkflowContextView) -> Vec<String> {
-        let (events, _watermark) = self.events.events_since(0);
-        events
-    }
 }
 
 /// Re-export the macro-generated `Run` marker type so other modules (e.g.

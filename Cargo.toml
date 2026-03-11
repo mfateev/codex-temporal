@@ -9,6 +9,7 @@ repository = "https://github.com/mfateev/codex-temporal"
 [dependencies]
 anyhow = "1.0"
 chrono = "0.4"
+color-eyre = "0.6"
 reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -16,7 +17,7 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -29,15 +30,15 @@ temporalio-client = { git = "https://github.com/mfateev/sdk-core.git", branch = 
 temporalio-macros = { git = "https://github.com/mfateev/sdk-core.git", branch = "task/rust-harness" }
 temporalio-common = { git = "https://github.com/mfateev/sdk-core.git", branch = "task/rust-harness" }
 
-# Codex crates — local path for development
-codex-core = { path = "../codex/codex-rs/core" }
-codex-feedback = { path = "../codex/codex-rs/feedback" }
-codex-protocol = { path = "../codex/codex-rs/protocol" }
-codex-otel = { path = "../codex/codex-rs/otel" }
-codex-tui = { path = "../codex/codex-rs/tui" }
-codex-shell-command = { path = "../codex/codex-rs/shell-command" }
-codex-apply-patch = { path = "../codex/codex-rs/apply-patch" }
-codex-rmcp-client = { path = "../codex/codex-rs/rmcp-client" }
+# Codex crates — task/codex-temporal branch of the codex fork
+codex-core = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-feedback = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-protocol = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-otel = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-tui = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-shell-command = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-apply-patch = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-rmcp-client = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
 rmcp = { version = "0.15.0", default-features = false, features = ["base64", "macros", "schemars"] }
 
 

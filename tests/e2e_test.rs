@@ -2555,6 +2555,114 @@ description = "Helper agent for sub-tasks"
     drain_shutdown(&session).await;
 }
 
+/// Test that the built-in codex-default crew makes explorer and worker
+/// agents available without requiring an explicit `--crew` flag.
+///
+/// 1. Start a SessionWorkflow with default config (no crew_agents set
+///    explicitly — relies on `load_harness_config` populating them).
+/// 2. Submit a user turn asking the model to list available agents.
+/// 3. Verify that spawning an explorer agent succeeds via `spawn_agent`.
+/// 4. Query `list_agents` — verify explorer was spawned.
+async fn default_crew_agents_available(client: &Client) {
+    use codex_temporal::config_loader::built_in_default_crew;
+    use codex_temporal::session_workflow::{SessionWorkflow, SessionWorkflowRun};
+    use codex_temporal::types::{AgentRecord, SessionWorkflowInput, SpawnAgentInput};
+
+    // Build a SessionWorkflowInput with the built-in default crew agents,
+    // simulating what load_harness_config() does.
+    let default_crew = built_in_default_crew();
+    let mut crew_agents = std::collections::BTreeMap::new();
+    for (name, def) in &default_crew.agents {
+        if name == &default_crew.main_agent {
+            continue;
+        }
+        crew_agents.insert(name.clone(), def.clone());
+    }
+
+    let session_id = format!("e2e-default-crew-{}", uuid::Uuid::new_v4());
+    let base_input = SessionWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        crew_agents,
+        continued_state: None,
+    };
+    let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
+
+    // Submit initial turn.
+    session
+        .submit(user_turn_op("Say hello."))
+        .await
+        .expect("submit failed");
+
+    // Wait for TurnComplete.
+    let timeout_at = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout_at {
+            panic!("timed out waiting for first TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+
+    // Spawn explorer sub-agent via signal.
+    session
+        .spawn_agent(SpawnAgentInput {
+            role: "explorer".to_string(),
+            message: "What files exist in the current directory?".to_string(),
+        })
+        .await
+        .expect("spawn_agent explorer failed");
+
+    // Give the SessionWorkflow time to process the spawn.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Query list_agents on the SessionWorkflow.
+    let handle = client.get_workflow_handle::<SessionWorkflowRun>(&session_id);
+    let agents_json: String = handle
+        .query(
+            SessionWorkflow::list_agents,
+            (),
+            WorkflowQueryOptions::default(),
+        )
+        .await
+        .expect("list_agents query failed");
+
+    let agents: Vec<AgentRecord> = serde_json::from_str(&agents_json).unwrap_or_default();
+
+    assert!(
+        agents.len() >= 2,
+        "expected at least 2 agents (main + explorer), got {}: {:?}",
+        agents.len(),
+        agents
+    );
+
+    // Verify the main agent is present.
+    assert!(
+        agents.iter().any(|a| a.agent_id.ends_with("/main")),
+        "expected main agent in list: {:?}",
+        agents
+    );
+
+    // Verify the explorer agent was spawned.
+    assert!(
+        agents.iter().any(|a| a.role == "explorer"),
+        "expected explorer agent in list: {:?}",
+        agents
+    );
+
+    drain_shutdown(&session).await;
+}
+
 // ---------------------------------------------------------------------------
 // Single test entry-point
 // ---------------------------------------------------------------------------
@@ -2783,6 +2891,15 @@ async fn e2e_tests_inner() {
     eprintln!("--- test: crew_subagent_spawn_flow ---");
     crew_subagent_spawn_flow(&client, &default_codex_home).await;
 
+    eprintln!("--- test: default_crew_agents_available ---");
+    default_crew_agents_available(&client).await;
+
+    eprintln!("--- test: session_switch_via_browser ---");
+    session_switch_via_browser(&client).await;
+
+    eprintln!("--- test: blocking_update_event_delivery ---");
+    blocking_update_event_delivery(&client).await;
+
     // --- teardown ---
     // Restore CODEX_HOME.
     // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
@@ -2797,4 +2914,251 @@ async fn e2e_tests_inner() {
     drop(client);
     drop(runtime);
     let _ = server.shutdown().await;
+}
+
+/// Test that the blocking `get_state_update` update handler delivers events
+/// with low latency (no polling backoff) and that `next_event()` works through
+/// the watcher-based pipeline.
+///
+/// 1. Start a session, submit a user turn.
+/// 2. Measure time until `TurnStarted` arrives via `next_event()`.
+/// 3. Assert latency is under 5 seconds (generous, but proves no 50-500ms backoff).
+/// 4. Drain to `TurnComplete` and shut down.
+async fn blocking_update_event_delivery(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    session
+        .submit(user_turn_op_with_model(
+            "Say hello in one word.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit failed");
+
+    // Measure time until TurnStarted arrives.
+    let start = tokio::time::Instant::now();
+    let timeout = start + Duration::from_secs(120);
+    let mut saw_turn_started = false;
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for events");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::TurnStarted(_) => {
+                saw_turn_started = true;
+                let elapsed = start.elapsed();
+                eprintln!("  TurnStarted arrived in {elapsed:?}");
+                // With the blocking update, events should arrive quickly.
+                // We use a generous 5s bound to avoid flaky tests on slow CI.
+                assert!(
+                    elapsed < Duration::from_secs(5),
+                    "TurnStarted should arrive quickly, took {elapsed:?}"
+                );
+            }
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) => break,
+            _ => {}
+        }
+    }
+
+    assert!(saw_turn_started, "expected TurnStarted event");
+    drain_shutdown(&session).await;
+}
+
+/// Test that `ExternalAgentBrowser` correctly lists sessions and switches
+/// between them via the harness.
+async fn session_switch_via_browser(client: &Client) {
+    use codex_tui::ExternalAgentBrowser;
+
+    // 1. Start a dedicated harness.
+    let harness_id = format!("e2e-switch-harness-{}", uuid::Uuid::new_v4());
+    let harness_input = HarnessInput {
+        continued_state: None,
+    };
+    let harness_options = WorkflowStartOptions::new(TASK_QUEUE, &harness_id)
+        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+        .build();
+    client
+        .start_workflow(CodexHarness::run, harness_input, harness_options)
+        .await
+        .expect("failed to start harness workflow");
+
+    let harness_handle = client.get_workflow_handle::<CodexHarnessRun>(&harness_id);
+
+    // 2. Create two session workflows and register them with the harness.
+    let base_input_a = CodexWorkflowInput {
+        user_message: String::new(),
+        model: "gpt-4o-mini".to_string(),
+        instructions: "You are a helpful coding assistant. Be concise.".to_string(),
+        approval_policy: Default::default(),
+        web_search_mode: None,
+        reasoning_effort: None,
+        reasoning_summary: ReasoningSummary::Auto,
+        personality: None,
+        developer_instructions: None,
+        model_provider: None,
+        continued_state: None,
+        role: "default".to_string(),
+        config_toml: None,
+        project_context: None,
+        mcp_tools: std::collections::HashMap::new(),
+        dynamic_tools: Vec::new(),
+    };
+    let base_input_b = base_input_a.clone();
+
+    let wf_id_a = format!("e2e-switch-a-{}", uuid::Uuid::new_v4());
+    let wf_id_b = format!("e2e-switch-b-{}", uuid::Uuid::new_v4());
+
+    let session_a = TemporalAgentSession::new_with_harness(
+        client.clone(),
+        wf_id_a.clone(),
+        base_input_a.clone(),
+        Some(harness_id.clone()),
+    );
+
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Register session A.
+    harness_handle
+        .signal(
+            CodexHarness::register_session,
+            SessionEntry {
+                session_id: wf_id_a.clone(),
+                name: Some("Session A".to_string()),
+                model: "gpt-4o-mini".to_string(),
+                created_at_millis: now_millis,
+                status: SessionStatus::Running,
+                crew_type: None,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("register session A");
+
+    // Register session B.
+    harness_handle
+        .signal(
+            CodexHarness::register_session,
+            SessionEntry {
+                session_id: wf_id_b.clone(),
+                name: Some("Session B".to_string()),
+                model: "gpt-4o-mini".to_string(),
+                created_at_millis: now_millis + 1000,
+                status: SessionStatus::Running,
+                crew_type: None,
+            },
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .expect("register session B");
+
+    // Submit a turn to session A so it has history.
+    session_a
+        .submit(user_turn_op_with_model(
+            "Say exactly: 'hello from session A'",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit to session A failed");
+    let msg_a = wait_for_turn_complete(&session_a).await;
+    assert!(msg_a.is_some(), "session A should produce a response");
+
+    // Start session B separately, submit a turn to it too.
+    let session_b_temp = TemporalAgentSession::new_with_harness(
+        client.clone(),
+        wf_id_b.clone(),
+        base_input_b,
+        Some(harness_id.clone()),
+    );
+    session_b_temp
+        .submit(user_turn_op_with_model(
+            "Say exactly: 'hello from session B'",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit to session B failed");
+    let msg_b = wait_for_turn_complete(&session_b_temp).await;
+    assert!(msg_b.is_some(), "session B should produce a response");
+
+    // Allow signals to propagate.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3. Use ExternalAgentBrowser to list sessions.
+    let entries = session_a.list_sessions().await;
+    assert!(
+        entries.len() >= 2,
+        "expected at least 2 sessions, got {}",
+        entries.len()
+    );
+
+    // Session A should be marked as current.
+    let entry_a = entries.iter().find(|e| e.id == wf_id_a);
+    assert!(entry_a.is_some(), "session A should appear in list");
+    assert!(
+        entry_a.unwrap().is_current,
+        "session A should be marked as current"
+    );
+
+    // Session B should NOT be marked as current.
+    let entry_b = entries.iter().find(|e| e.id == wf_id_b);
+    assert!(entry_b.is_some(), "session B should appear in list");
+    assert!(
+        !entry_b.unwrap().is_current,
+        "session B should not be marked as current"
+    );
+
+    // 4. Switch to session B via ExternalAgentBrowser.
+    let switch_result = session_a.switch_to(&wf_id_b).await;
+    assert!(switch_result.is_ok(), "switch_to should succeed");
+    let result = switch_result.unwrap();
+
+    // The switch result should contain initial_messages from session B.
+    assert!(
+        result.session_configured.initial_messages.is_some(),
+        "switch result should have initial_messages"
+    );
+    let initial_msgs = result.session_configured.initial_messages.unwrap();
+    assert!(
+        !initial_msgs.is_empty(),
+        "initial_messages should not be empty after switching to a session with history"
+    );
+
+    // 5. Verify internal state points to session B.
+    assert_eq!(
+        session_a.session_id(),
+        wf_id_b,
+        "session_id should now be session B"
+    );
+    assert_eq!(
+        session_a.active_agent_id(),
+        format!("{wf_id_b}/main"),
+        "active_agent_id should point to session B's main agent"
+    );
+
+    // 6. Submit a turn to verify ops go to session B.
+    session_a
+        .submit(user_turn_op_with_model(
+            "Respond with just 'confirmed B'",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit to switched session should succeed");
+    let msg_switched = wait_for_turn_complete(&session_a).await;
+    assert!(
+        msg_switched.is_some(),
+        "should receive a response after switching sessions"
+    );
+
+    // 7. Verify current_session_id reflects the switch.
+    assert_eq!(
+        session_a.current_session_id(),
+        Some(wf_id_b.clone()),
+        "current_session_id should return session B"
+    );
+
+    drain_shutdown(&session_a).await;
 }
