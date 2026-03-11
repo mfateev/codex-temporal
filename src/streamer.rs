@@ -76,10 +76,21 @@ impl ModelStreamer for TemporalModelStreamer {
                 return Err(codex_core::error::CodexErr::TurnAborted);
             }
             result = &mut activity => result.map_err(|e| {
-                codex_core::error::CodexErr::Stream(
-                    format!("model_call activity failed: {e}"),
-                    None,
-                )
+                let msg = format!("{e}");
+                // Preserve non-retryable semantics: if the activity error
+                // message matches a known fatal condition, map to the
+                // corresponding non-retryable CodexErr so the workflow
+                // does not attempt its own retry loop.
+                if msg.contains("Quota exceeded") {
+                    codex_core::error::CodexErr::QuotaExceeded
+                } else if msg.contains("upgrade to Plus") || msg.contains("UsageNotIncluded") {
+                    codex_core::error::CodexErr::UsageNotIncluded
+                } else {
+                    codex_core::error::CodexErr::Stream(
+                        format!("model_call activity failed: {e}"),
+                        None,
+                    )
+                }
             })?,
         };
 

@@ -884,6 +884,7 @@ impl AgentWorkflow {
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
                     let mut iterations = 0u32;
                     let mut turn_aborted = false;
+                    let mut turn_error: Option<codex_core::error::CodexErr> = None;
 
                     // Reset interrupt flag at the start of each turn.
                     ctx.state_mut(|s| s.interrupt_requested = false);
@@ -993,6 +994,7 @@ impl AgentWorkflow {
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "try_run_sampling_request failed");
+                                turn_error = Some(e);
                                 break;
                             }
                         }
@@ -1012,6 +1014,18 @@ impl AgentWorkflow {
                         });
                         ctx.state_mut(|s| s.bump_version());
                     } else {
+                        // If the turn ended with an error, emit an Error
+                        // event so the user sees what went wrong (e.g.
+                        // "Quota exceeded").
+                        if let Some(ref err) = turn_error {
+                            let error_event = err.to_error_event(None);
+                            events.emit_event_sync(Event {
+                                id: turn_id.clone(),
+                                msg: EventMsg::Error(error_event),
+                            });
+                            ctx.state_mut(|s| s.bump_version());
+                        }
+
                         // Emit TurnComplete
                         events.emit_event_sync(Event {
                             id: turn_id.clone(),

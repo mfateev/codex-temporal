@@ -14,6 +14,7 @@ use codex_core::{
     ToolPayload, TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams,
     built_in_model_providers,
 };
+use codex_core::error::CodexErr;
 use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter};
 use codex_otel::SessionTelemetry;
 use codex_protocol::models::{BaseInstructions, ResponseItem};
@@ -176,7 +177,7 @@ impl CodexActivities {
                 None,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("model stream failed: {e}"))?;
+            .map_err(|e| codex_err_to_activity_error(e))?;
 
         let mut items: Vec<ResponseItem> = Vec::new();
         let mut token_usage = None;
@@ -191,7 +192,7 @@ impl CodexActivities {
                 }
                 Ok(_) => {} // Created, Delta, etc.
                 Err(e) => {
-                    return Err(anyhow::anyhow!("model stream error: {e}").into());
+                    return Err(codex_err_to_activity_error(e));
                 }
             }
         }
@@ -521,6 +522,20 @@ impl CodexActivities {
         );
 
         Ok(output)
+    }
+}
+
+/// Convert a [`CodexErr`] into the appropriate [`ActivityError`] variant.
+///
+/// Non-retryable errors (quota exceeded, auth failures, invalid requests, etc.)
+/// are returned as `ActivityError::NonRetryable` so Temporal does not retry them.
+/// Retryable errors (transient network/stream failures) use the default
+/// `ActivityError::Retryable` path.
+fn codex_err_to_activity_error(e: CodexErr) -> ActivityError {
+    if e.is_retryable() {
+        ActivityError::from(anyhow::anyhow!(e))
+    } else {
+        ActivityError::NonRetryable(Box::new(e))
     }
 }
 
