@@ -9,6 +9,7 @@ use std::time::Duration;
 use codex_protocol::protocol::Event;
 use temporalio_client::{Client, WorkflowExecuteUpdateOptions};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::types::{StateUpdateRequest, StateUpdateResponse};
 use crate::workflow::{AgentWorkflow, AgentWorkflowRun};
@@ -33,7 +34,7 @@ pub struct Watcher {
 /// How long a single `execute_update` call may block before we retry.
 /// Prevents indefinite hangs when the worker is down and the workflow
 /// cannot make progress.
-const WATCH_TIMEOUT: Duration = Duration::from_secs(30);
+const WATCH_TIMEOUT: Duration = Duration::from_secs(3600);
 
 impl Watcher {
     pub fn new(client: Client, workflow_id: String) -> Self {
@@ -49,6 +50,7 @@ impl Watcher {
         &self,
         since_index: usize,
         since_version: u64,
+        update_id: &str,
     ) -> Result<StateUpdateResponse, String> {
         let handle = self
             .client
@@ -60,7 +62,9 @@ impl Watcher {
                 since_index,
                 since_version,
             },
-            WorkflowExecuteUpdateOptions::default(),
+            WorkflowExecuteUpdateOptions::builder()
+                .update_id(update_id.to_string())
+                .build(),
         );
 
         let resp: StateUpdateResponse =
@@ -79,13 +83,19 @@ impl Watcher {
     pub async fn run_watching(self, tx: mpsc::Sender<WatcherEvent>) {
         let mut since_index: usize = 0;
         let mut since_version: u64 = 0;
+        // Stable update ID per logical watch call.  Reused on timeout retries
+        // so the server deduplicates and we rejoin the in-flight update
+        // instead of creating a new handler invocation.
+        let mut update_id = Uuid::new_v4().to_string();
 
         loop {
-            match self.watch(since_index, since_version).await {
+            match self.watch(since_index, since_version, &update_id).await {
                 Ok(resp) => {
                     since_index = resp.watermark;
                     since_version = resp.state_version;
                     let completed = resp.completed;
+                    // New logical watch — rotate the update ID.
+                    update_id = Uuid::new_v4().to_string();
 
                     // Parse JSON event strings into Event objects.
                     let events: Vec<Event> = resp
@@ -117,6 +127,9 @@ impl Watcher {
                             "watcher: update timed out, retrying"
                         );
                     } else {
+                        // Non-timeout error — rotate ID so we don't rejoin a
+                        // failed update.
+                        update_id = Uuid::new_v4().to_string();
                         tracing::warn!(
                             error = %e,
                             "watcher: update call failed, retrying"
