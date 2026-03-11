@@ -19,7 +19,7 @@ pub enum WatcherEvent {
     Events(Vec<Event>, usize /* watermark */, u64 /* version */),
     /// Workflow completed — client should stop.
     Completed,
-    /// Unrecoverable error after retries.
+    /// Connection error — watcher keeps retrying, session can show status.
     Error(String),
 }
 
@@ -30,7 +30,10 @@ pub struct Watcher {
     workflow_id: String,
 }
 
-const MAX_CONSECUTIVE_ERRORS: u32 = 3;
+/// How long a single `execute_update` call may block before we retry.
+/// Prevents indefinite hangs when the worker is down and the workflow
+/// cannot make progress.
+const WATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Watcher {
     pub fn new(client: Client, workflow_id: String) -> Self {
@@ -40,7 +43,8 @@ impl Watcher {
         }
     }
 
-    /// Single blocking call.  Returns when the workflow has new state.
+    /// Single blocking call.  Returns when the workflow has new state or
+    /// after `WATCH_TIMEOUT` — whichever comes first.
     async fn watch(
         &self,
         since_index: usize,
@@ -50,33 +54,35 @@ impl Watcher {
             .client
             .get_workflow_handle::<AgentWorkflowRun>(&self.workflow_id);
 
-        let resp: StateUpdateResponse = handle
-            .execute_update(
-                AgentWorkflow::get_state_update,
-                StateUpdateRequest {
-                    since_index,
-                    since_version,
-                },
-                WorkflowExecuteUpdateOptions::default(),
-            )
-            .await
-            .map_err(|e| format!("update failed: {e}"))?;
+        let fut = handle.execute_update(
+            AgentWorkflow::get_state_update,
+            StateUpdateRequest {
+                since_index,
+                since_version,
+            },
+            WorkflowExecuteUpdateOptions::default(),
+        );
+
+        let resp: StateUpdateResponse =
+            tokio::time::timeout(WATCH_TIMEOUT, fut)
+                .await
+                .map_err(|_| "update timed out (workflow may be stalled)".to_string())?
+                .map_err(|e| format!("update failed: {e}"))?;
 
         Ok(resp)
     }
 
     /// Continuous loop.  Sends parsed events on `tx`.  Each iteration blocks
     /// until the workflow has new data (no polling, no backoff for success).
-    /// Returns when the workflow completes or after MAX_CONSECUTIVE_ERRORS.
+    /// Returns only when the workflow completes or the receiver is dropped.
+    /// All errors (RPC failures, local timeouts) retry indefinitely.
     pub async fn run_watching(self, tx: mpsc::Sender<WatcherEvent>) {
         let mut since_index: usize = 0;
         let mut since_version: u64 = 0;
-        let mut consecutive_errors: u32 = 0;
 
         loop {
             match self.watch(since_index, since_version).await {
                 Ok(resp) => {
-                    consecutive_errors = 0;
                     since_index = resp.watermark;
                     since_version = resp.state_version;
                     let completed = resp.completed;
@@ -104,17 +110,23 @@ impl Watcher {
                     }
                 }
                 Err(e) => {
-                    consecutive_errors += 1;
-                    tracing::warn!(
-                        error = %e,
-                        consecutive = consecutive_errors,
-                        "watcher: update call failed"
-                    );
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        let _ = tx.send(WatcherEvent::Error(e)).await;
-                        return;
+                    let is_timeout = e.contains("timed out");
+                    if is_timeout {
+                        tracing::debug!(
+                            error = %e,
+                            "watcher: update timed out, retrying"
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            "watcher: update call failed, retrying"
+                        );
+                        // Notify the session so it can show a status message.
+                        if tx.send(WatcherEvent::Error(e)).await.is_err() {
+                            return; // receiver dropped
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
         }
