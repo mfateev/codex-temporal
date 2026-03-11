@@ -719,9 +719,6 @@ pub struct ResolveRoleConfigOutput {
 pub struct StateUpdateRequest {
     /// Last watermark received (same semantics as `get_events_since` index).
     pub since_index: usize,
-    /// Last `state_version` the client saw.  The handler returns immediately
-    /// if the current version differs.
-    pub since_version: u64,
 }
 
 /// Response from the blocking `get_state_update` update handler.
@@ -731,8 +728,6 @@ pub struct StateUpdateResponse {
     pub events: Vec<String>,
     /// New watermark for the next call.
     pub watermark: usize,
-    /// Current state version.
-    pub state_version: u64,
     /// True when the workflow is shutting down — client should stop watching.
     pub completed: bool,
 }

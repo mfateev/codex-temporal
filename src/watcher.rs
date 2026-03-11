@@ -17,7 +17,7 @@ use crate::workflow::{AgentWorkflow, AgentWorkflowRun};
 /// Result of a single watch cycle.
 pub enum WatcherEvent {
     /// New events arrived.
-    Events(Vec<Event>, usize /* watermark */, u64 /* version */),
+    Events(Vec<Event>, usize /* watermark */),
     /// Workflow completed — client should stop.
     Completed,
     /// Connection error — watcher keeps retrying, session can show status.
@@ -49,7 +49,6 @@ impl Watcher {
     async fn watch(
         &self,
         since_index: usize,
-        since_version: u64,
         update_id: &str,
     ) -> Result<StateUpdateResponse, String> {
         let handle = self
@@ -60,7 +59,6 @@ impl Watcher {
             AgentWorkflow::get_state_update,
             StateUpdateRequest {
                 since_index,
-                since_version,
             },
             WorkflowExecuteUpdateOptions::builder()
                 .update_id(update_id.to_string())
@@ -82,17 +80,15 @@ impl Watcher {
     /// All errors (RPC failures, local timeouts) retry indefinitely.
     pub async fn run_watching(self, tx: mpsc::Sender<WatcherEvent>) {
         let mut since_index: usize = 0;
-        let mut since_version: u64 = 0;
         // Stable update ID per logical watch call.  Reused on timeout retries
         // so the server deduplicates and we rejoin the in-flight update
         // instead of creating a new handler invocation.
         let mut update_id = Uuid::new_v4().to_string();
 
         loop {
-            match self.watch(since_index, since_version, &update_id).await {
+            match self.watch(since_index, &update_id).await {
                 Ok(resp) => {
                     since_index = resp.watermark;
-                    since_version = resp.state_version;
                     let completed = resp.completed;
                     // New logical watch — rotate the update ID.
                     update_id = Uuid::new_v4().to_string();
@@ -106,7 +102,7 @@ impl Watcher {
 
                     if !events.is_empty() || completed {
                         if tx
-                            .send(WatcherEvent::Events(events, since_index, since_version))
+                            .send(WatcherEvent::Events(events, since_index))
                             .await
                             .is_err()
                         {

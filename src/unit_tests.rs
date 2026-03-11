@@ -3205,12 +3205,10 @@ async fn load_harness_config_populates_default_crew_agents() {
 fn state_update_request_roundtrips() {
     let req = StateUpdateRequest {
         since_index: 42,
-        since_version: 7,
     };
     let json = serde_json::to_string(&req).unwrap();
     let back: StateUpdateRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(back.since_index, 42);
-    assert_eq!(back.since_version, 7);
 }
 
 #[test]
@@ -3218,24 +3216,21 @@ fn state_update_response_roundtrips() {
     let resp = StateUpdateResponse {
         events: vec![r#"{"id":"e1","msg":"ShutdownComplete"}"#.to_string()],
         watermark: 10,
-        state_version: 5,
         completed: true,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let back: StateUpdateResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(back.events.len(), 1);
     assert_eq!(back.watermark, 10);
-    assert_eq!(back.state_version, 5);
     assert!(back.completed);
 }
 
 #[test]
 fn state_update_response_defaults_empty() {
     // Minimal JSON should deserialize correctly.
-    let json = r#"{"events":[],"watermark":0,"state_version":0,"completed":false}"#;
+    let json = r#"{"events":[],"watermark":0,"completed":false}"#;
     let resp: StateUpdateResponse = serde_json::from_str(json).unwrap();
     assert!(resp.events.is_empty());
     assert_eq!(resp.watermark, 0);
-    assert_eq!(resp.state_version, 0);
     assert!(!resp.completed);
 }

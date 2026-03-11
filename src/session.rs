@@ -224,7 +224,7 @@ impl TemporalAgentSession {
                     return;
                 }
                 match result {
-                    WatcherEvent::Events(events, _watermark, _version) => {
+                    WatcherEvent::Events(events, _watermark) => {
                         stall_notified = false;
                         if !events.is_empty() {
                             buffer.lock().expect("lock poisoned").extend(events);
@@ -323,7 +323,6 @@ impl TemporalAgentSession {
                 AgentWorkflow::get_state_update,
                 StateUpdateRequest {
                     since_index: 0,
-                    since_version: 0,
                 },
                 WorkflowExecuteUpdateOptions::default(),
             )
@@ -562,7 +561,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                                 return;
                                             }
                                             match result {
-                                                WatcherEvent::Events(events, _, _) => {
+                                                WatcherEvent::Events(events, _) => {
                                                     stall_notified = false;
                                                     if !events.is_empty() {
                                                         buffer3.lock().expect("lock poisoned").extend(events);

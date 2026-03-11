@@ -9,7 +9,7 @@
 //! - **`receive_op` signal**: Generic signal that dispatches all client
 //!   operations (user turns, approvals, shutdown, compact, etc.).
 //! - **`get_state_update` update**: Blocking handler that returns new events
-//!   when `state_version` changes.  Replaces the old query-based polling.
+//!   when the event watermark advances.  Replaces the old query-based polling.
 //!
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
@@ -105,8 +105,7 @@ pub struct AgentWorkflow {
     /// `Op::Interrupt` to abort in-flight activities immediately.
     current_turn_cancellation: Option<CancellationToken>,
     /// Monotonically increasing counter bumped on every mutation visible to
-    /// external observers.  Used by `get_state_update` to detect changes
-    /// without polling.
+    /// external observers.
     state_version: u64,
 }
 
@@ -450,34 +449,30 @@ impl AgentWorkflow {
         ctx: &mut WorkflowContext<Self>,
         req: StateUpdateRequest,
     ) -> Result<StateUpdateResponse, Box<dyn std::error::Error + Send + Sync>> {
-        // Snapshot version at entry.
-        let entry_version = ctx.state(|s| s.state_version);
-
         // Check if data is immediately available.
         let (events, watermark) = ctx.state(|s| s.events.events_since(req.since_index));
         let shutdown = ctx.state(|s| s.shutdown_requested);
-        if !events.is_empty() || entry_version != req.since_version || shutdown {
-            let version = ctx.state(|s| s.state_version);
+        if !events.is_empty() || shutdown {
             return Ok(StateUpdateResponse {
                 events,
                 watermark,
-                state_version: version,
                 completed: shutdown,
             });
         }
 
-        // Block until state changes.
-        ctx.wait_condition(|s| s.state_version != entry_version || s.shutdown_requested)
-            .await;
+        // Block until new events arrive (watermark advances) or shutdown.
+        let entry_watermark = watermark;
+        ctx.wait_condition(|s| {
+            s.events.watermark() != entry_watermark || s.shutdown_requested
+        })
+        .await;
 
         // Re-read after wakeup.
         let (events, watermark) = ctx.state(|s| s.events.events_since(req.since_index));
-        let version = ctx.state(|s| s.state_version);
         let shutdown = ctx.state(|s| s.shutdown_requested);
         Ok(StateUpdateResponse {
             events,
             watermark,
-            state_version: version,
             completed: shutdown,
         })
     }

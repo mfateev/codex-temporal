@@ -81,6 +81,14 @@ impl BufferEventSink {
         self.len() == 0
     }
 
+    /// Current watermark (offset + buffer length).  Cheap check for whether
+    /// new events exist without serializing them.
+    pub fn watermark(&self) -> usize {
+        let offset = *self.offset.lock().expect("lock poisoned");
+        let len = self.events.lock().expect("lock poisoned").len();
+        offset + len
+    }
+
     /// Return the latest cumulative `TokenUsage` from buffered `TokenCount`
     /// events, if any.
     pub fn latest_token_usage(&self) -> Option<TokenUsage> {
