@@ -50,6 +50,7 @@ fn user_turn_op(text: &str) -> Op {
         model: "gpt-4o".to_string(),
         effort: None,
         summary: Some(ReasoningSummary::Auto),
+        service_tier: None,
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,

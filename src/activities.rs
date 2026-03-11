@@ -11,10 +11,11 @@ use codex_core::config::ConfigBuilder;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::{
     EventSink, ModelClient, ModelProviderInfo, Prompt, ResponseEvent, Session, StorageBackend,
-    ToolInvocation, ToolPayload, TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams,
-    build_specs, built_in_model_providers,
+    ToolPayload, TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams,
+    built_in_model_providers,
 };
-use codex_otel::OtelManager;
+use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter};
+use codex_otel::SessionTelemetry;
 use codex_protocol::models::{BaseInstructions, ResponseItem};
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::ThreadId;
@@ -124,7 +125,7 @@ impl CodexActivities {
             provider,
             SessionSource::Exec,
             None,  // model_verbosity
-            None,  // responses_websocket_version
+            false, // responses_websockets_enabled_by_feature
             false, // request compression
             false, // timing metrics
             None,  // beta features header
@@ -143,7 +144,7 @@ impl CodexActivities {
             output_schema: None,
         };
 
-        let otel_manager = OtelManager::new(
+        let session_telemetry = SessionTelemetry::new(
             conversation_id,
             &input.model_info.slug,
             &input.model_info.slug,
@@ -168,9 +169,10 @@ impl CodexActivities {
             .stream(
                 &prompt,
                 &input.model_info,
-                &otel_manager,
+                &session_telemetry,
                 input.effort,
                 input.summary,
+                None,
                 None,
             )
             .await
@@ -581,15 +583,14 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     let model_info =
         ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
 
-    // Build the tool registry with all standard tools enabled.
+    // Build the tool router with all standard tools enabled.
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
         features: &config.features,
         web_search_mode: None,
         session_source: SessionSource::Exec,
     });
-    let builder = build_specs(&tools_config, None, None, &[]);
-    let (_specs, registry) = builder.build();
+    let router = ToolRouter::from_config(&tools_config, None, None, &[]);
 
     // Construct minimal Session + TurnContext for the dispatch.
     let conversation_id = ThreadId::new();
@@ -612,20 +613,20 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
 
     let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
 
-    // Build the tool invocation.
-    let invocation = ToolInvocation {
-        session,
-        turn: turn_context,
-        tracker,
-        call_id: input.call_id.clone(),
+    // Build a ToolCall for the router.
+    let tool_call = ToolCall {
         tool_name: input.tool_name.clone(),
+        call_id: input.call_id.clone(),
         payload: ToolPayload::Function {
             arguments: input.arguments.clone(),
         },
     };
 
-    // Dispatch via the registry.
-    match registry.dispatch(invocation).await {
+    // Dispatch via the router.
+    match router
+        .dispatch_tool_call(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
+        .await
+    {
         Ok(response_item) => {
             let (output, exit_code) = extract_tool_output(&response_item);
             Ok(ToolExecOutput {

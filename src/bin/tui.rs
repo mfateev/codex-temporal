@@ -267,6 +267,7 @@ async fn run_tui_session(
         initial_messages,
         network_proxy: None,
         rollout_path: None,
+        service_tier: None,
     };
 
     // --- Build Config ---

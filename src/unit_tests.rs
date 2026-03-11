@@ -1066,8 +1066,9 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
 
 use codex_core::{
     Session, TurnContext, TurnDiffTracker,
-    ToolInvocation, ToolPayload, ToolsConfig, ToolsConfigParams, build_specs,
+    ToolPayload, ToolsConfig, ToolsConfigParams,
 };
+use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_protocol::ThreadId;
 use tokio::sync::Mutex;
@@ -1099,8 +1100,7 @@ async fn dispatch_with_experimental_tools(
         web_search_mode: None,
         session_source: codex_protocol::protocol::SessionSource::Exec,
     });
-    let builder = build_specs(&tools_config, None, None, &[]);
-    let (_specs, registry) = builder.build();
+    let router = ToolRouter::from_config(&tools_config, None, None, &[]);
 
     let conversation_id = ThreadId::new();
     let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new(4096, 0));
@@ -1122,18 +1122,18 @@ async fn dispatch_with_experimental_tools(
 
     let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
 
-    let invocation = ToolInvocation {
-        session,
-        turn: turn_context,
-        tracker,
-        call_id: "test-call".to_string(),
+    let tool_call = ToolCall {
         tool_name: tool_name.to_string(),
+        call_id: "test-call".to_string(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),
         },
     };
 
-    match registry.dispatch(invocation).await {
+    match router
+        .dispatch_tool_call(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
+        .await
+    {
         Ok(item) => {
             // Extract text from the response item.
             match &item {
@@ -1930,11 +1930,10 @@ fn mcp_tool_call_output_into_response_item_ok() {
 
     let item = output.into_response_input_item();
     match item {
-        ResponseInputItem::McpToolCallOutput { call_id, result } => {
+        ResponseInputItem::McpToolCallOutput { call_id, output } => {
             assert_eq!(call_id, "call-resp");
-            assert!(result.is_ok());
-            let ctr = result.unwrap();
-            assert_eq!(ctr.content.len(), 1);
+            assert!(output.success());
+            assert_eq!(output.content.len(), 1);
         }
         other => panic!("expected McpToolCallOutput, got {:?}", other),
     }
@@ -1953,10 +1952,9 @@ fn mcp_tool_call_output_into_response_item_err() {
 
     let item = output.into_response_input_item();
     match item {
-        ResponseInputItem::McpToolCallOutput { call_id, result } => {
+        ResponseInputItem::McpToolCallOutput { call_id, output } => {
             assert_eq!(call_id, "call-err");
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "server crashed");
+            assert!(!output.success());
         }
         other => panic!("expected McpToolCallOutput, got {:?}", other),
     }

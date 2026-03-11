@@ -566,6 +566,7 @@ impl codex_tui::ExternalAgentBrowser for TemporalAgentSession {
                 history_entry_count: 0,
                 network_proxy: None,
                 rollout_path: None,
+                service_tier: None,
             },
         })
     }

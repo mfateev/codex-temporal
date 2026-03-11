@@ -19,7 +19,7 @@ use codex_core::error::CodexErr;
 use codex_core::ToolCall;
 use codex_core::ToolCallHandler;
 use codex_protocol::models::{FunctionCallOutputPayload, ResponseInputItem};
-use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::approvals::{ElicitationRequest, ElicitationRequestEvent};
 use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::protocol::{
@@ -28,7 +28,8 @@ use codex_protocol::protocol::{
 use codex_protocol::request_user_input::{RequestUserInputArgs, RequestUserInputEvent};
 use codex_shell_command::is_dangerous_command::command_might_be_dangerous;
 use codex_shell_command::is_safe_command::is_known_safe_command;
-use temporalio_sdk::{ActivityOptions, WorkflowContext};
+use temporalio_common::protos::coresdk::workflow_commands::ActivityCancellationType;
+use temporalio_sdk::{ActivityOptions, CancellableFuture, WorkflowContext};
 use tokio_util::sync::CancellationToken;
 
 use crate::activities::CodexActivities;
@@ -103,7 +104,7 @@ impl ToolCallHandler for TemporalToolHandler {
     fn handle_tool_call(
         &self,
         call: ToolCall,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> Self::Future {
         let ctx = self.ctx.clone();
         let events = self.events.clone();
@@ -149,15 +150,23 @@ impl ToolCallHandler for TemporalToolHandler {
                 let opts = ActivityOptions {
                     start_to_close_timeout: Some(Duration::from_secs(120)),
                     heartbeat_timeout: Some(Duration::from_secs(30)),
+                    cancellation_type: ActivityCancellationType::TryCancel,
                     ..Default::default()
                 };
 
-                let mut output = ctx
-                    .start_activity(CodexActivities::mcp_tool_call, mcp_input, opts)
-                    .await
-                    .map_err(|e| {
+                let activity =
+                    ctx.start_activity(CodexActivities::mcp_tool_call, mcp_input, opts);
+                tokio::pin!(activity);
+                let mut output = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        activity.cancel();
+                        return Ok(denied_response(call_id));
+                    }
+                    result = &mut activity => result.map_err(|e| {
                         CodexErr::Fatal(format!("mcp_tool_call activity failed: {e}"))
-                    })?;
+                    })?,
+                };
 
                 // Check if the MCP server requested elicitation during this call.
                 if let Some(elicitation) = output.elicitation.take() {
@@ -174,9 +183,14 @@ impl ToolCallHandler for TemporalToolHandler {
                     events.emit_event_sync(Event {
                         id: turn_id.clone(),
                         msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                            turn_id: Some(turn_id.clone()),
                             server_name: elicitation.server_name,
                             id: elicitation.request_id,
-                            message: elicitation.message,
+                            request: ElicitationRequest::Form {
+                                meta: None,
+                                message: elicitation.message,
+                                requested_schema: serde_json::Value::Object(Default::default()),
+                            },
                         }),
                     });
                     ctx.state_mut(|s| s.bump_version());
@@ -423,15 +437,23 @@ impl ToolCallHandler for TemporalToolHandler {
                 let opts = ActivityOptions {
                     start_to_close_timeout: Some(Duration::from_secs(600)),
                     heartbeat_timeout: Some(Duration::from_secs(30)),
+                    cancellation_type: ActivityCancellationType::TryCancel,
                     ..Default::default()
                 };
 
-                let output = ctx
-                    .start_activity(CodexActivities::tool_exec, input, opts)
-                    .await
-                    .map_err(|e| {
+                let activity =
+                    ctx.start_activity(CodexActivities::tool_exec, input, opts);
+                tokio::pin!(activity);
+                let output = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => {
+                        activity.cancel();
+                        return Ok(denied_response(call_id));
+                    }
+                    result = &mut activity => result.map_err(|e| {
                         CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
-                    })?;
+                    })?,
+                };
 
                 return Ok(output.into_response_input_item());
             }
@@ -482,6 +504,7 @@ impl ToolCallHandler for TemporalToolHandler {
                         proposed_execpolicy_amendment: None,
                         proposed_network_policy_amendments: None,
                         additional_permissions: None,
+                        skill_metadata: None,
                         available_decisions: None,
                         parsed_cmd: Vec::new(),
                     }),
@@ -539,13 +562,22 @@ impl ToolCallHandler for TemporalToolHandler {
             let opts = ActivityOptions {
                 start_to_close_timeout: Some(Duration::from_secs(600)),
                 heartbeat_timeout: Some(Duration::from_secs(30)),
+                cancellation_type: ActivityCancellationType::TryCancel,
                 ..Default::default()
             };
 
-            let output = ctx
-                .start_activity(CodexActivities::tool_exec, input, opts)
-                .await
-                .map_err(|e| CodexErr::Fatal(format!("tool_exec activity failed: {e}")))?;
+            let activity = ctx.start_activity(CodexActivities::tool_exec, input, opts);
+            tokio::pin!(activity);
+            let output = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => {
+                    activity.cancel();
+                    return Ok(denied_response(call_id));
+                }
+                result = &mut activity => result.map_err(|e| {
+                    CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
+                })?,
+            };
 
             Ok(output.into_response_input_item())
         })

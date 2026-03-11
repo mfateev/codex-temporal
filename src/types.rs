@@ -223,9 +223,11 @@ pub struct CapturedElicitation {
 impl McpToolCallOutput {
     /// Convert this output into a `ResponseInputItem::McpToolCallOutput`.
     pub fn into_response_input_item(self) -> ResponseInputItem {
+        use codex_protocol::mcp::CallToolResult;
+
         let result = match self.result {
             Ok(value) => {
-                match serde_json::from_value::<codex_protocol::mcp::CallToolResult>(value) {
+                match serde_json::from_value::<CallToolResult>(value) {
                     Ok(ctr) => Ok(ctr),
                     Err(e) => Err(format!("failed to deserialize CallToolResult: {e}")),
                 }
@@ -235,7 +237,7 @@ impl McpToolCallOutput {
 
         ResponseInputItem::McpToolCallOutput {
             call_id: self.call_id,
-            result,
+            output: CallToolResult::from_result(result),
         }
     }
 }

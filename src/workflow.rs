@@ -101,6 +101,9 @@ pub struct AgentWorkflow {
     /// Set by `Op::Interrupt`; checked between loop iterations and during
     /// approval waits.
     pub(crate) interrupt_requested: bool,
+    /// Cancellation token for the current in-flight turn.  Cancelled by
+    /// `Op::Interrupt` to abort in-flight activities immediately.
+    current_turn_cancellation: Option<CancellationToken>,
     /// Monotonically increasing counter bumped on every mutation visible to
     /// external observers.  Used by `get_state_update` to detect changes
     /// without polling.
@@ -252,6 +255,7 @@ impl AgentWorkflow {
                 summary_override: state.summary_override,
                 personality_override: state.personality_override,
                 interrupt_requested: false,
+                current_turn_cancellation: None,
                 state_version: 0,
                 input,
             };
@@ -292,6 +296,7 @@ impl AgentWorkflow {
             summary_override: None,
             personality_override: None,
             interrupt_requested: false,
+            current_turn_cancellation: None,
             state_version: 0,
         }
     }
@@ -413,6 +418,7 @@ impl AgentWorkflow {
                 server_name,
                 request_id,
                 decision,
+                ..
             } => {
                 if let Some(ref mut pe) = self.pending_elicitation {
                     if pe.server_name == server_name && pe.request_id == request_id {
@@ -423,6 +429,9 @@ impl AgentWorkflow {
             }
             Op::Interrupt => {
                 self.interrupt_requested = true;
+                if let Some(ref token) = self.current_turn_cancellation {
+                    token.cancel();
+                }
                 self.bump_version();
             }
             _ => {
@@ -860,14 +869,19 @@ impl AgentWorkflow {
                     sess.record_items(&turn_context, &[user_item]).await;
 
                     // --- run the agentic loop for this turn ---
+                    let cancellation_token = CancellationToken::new();
+                    ctx.state_mut(|s| {
+                        s.current_turn_cancellation = Some(cancellation_token.clone());
+                    });
+
                     let mut streamer = TemporalModelStreamer::new(
                         ctx.clone(),
                         conversation_id.to_string(),
                         input.model_provider.clone(),
+                        cancellation_token.clone(),
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-                    let cancellation_token = CancellationToken::new();
                     let mut iterations = 0u32;
                     let mut turn_aborted = false;
 
@@ -971,12 +985,21 @@ impl AgentWorkflow {
                                     "follow-up needed, continuing loop"
                                 );
                             }
+                            Err(codex_core::error::CodexErr::TurnAborted) => {
+                                tracing::info!("try_run_sampling_request returned TurnAborted");
+                                turn_aborted = true;
+                                ctx.state_mut(|s| s.interrupt_requested = false);
+                                break;
+                            }
                             Err(e) => {
                                 tracing::error!(error = %e, "try_run_sampling_request failed");
                                 break;
                             }
                         }
                     }
+
+                    // Clear the turn cancellation token now that the loop is done.
+                    ctx.state_mut(|s| s.current_turn_cancellation = None);
 
                     if turn_aborted {
                         // Emit TurnAborted event.

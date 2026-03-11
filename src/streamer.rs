@@ -4,11 +4,13 @@
 use std::time::Duration;
 
 use codex_core::{ModelProviderInfo, ModelStreamer, Prompt, ResponseEvent, ResponseStream};
-use codex_otel::OtelManager;
-use codex_protocol::config_types::ReasoningSummary;
+use codex_otel::SessionTelemetry;
+use codex_protocol::config_types::{ReasoningSummary, ServiceTier};
 use codex_protocol::openai_models::{ModelInfo, ReasoningEffort};
-use temporalio_sdk::{ActivityOptions, WorkflowContext};
+use temporalio_common::protos::coresdk::workflow_commands::ActivityCancellationType;
+use temporalio_sdk::{ActivityOptions, CancellableFuture, WorkflowContext};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::activities::CodexActivities;
 use crate::types::ModelCallInput;
@@ -19,6 +21,7 @@ pub struct TemporalModelStreamer {
     ctx: WorkflowContext<AgentWorkflow>,
     conversation_id: String,
     provider: Option<ModelProviderInfo>,
+    cancellation_token: CancellationToken,
 }
 
 impl TemporalModelStreamer {
@@ -26,8 +29,9 @@ impl TemporalModelStreamer {
         ctx: WorkflowContext<AgentWorkflow>,
         conversation_id: String,
         provider: Option<ModelProviderInfo>,
+        cancellation_token: CancellationToken,
     ) -> Self {
-        Self { ctx, conversation_id, provider }
+        Self { ctx, conversation_id, provider, cancellation_token }
     }
 }
 
@@ -36,9 +40,10 @@ impl ModelStreamer for TemporalModelStreamer {
         &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
-        _otel_manager: &OtelManager,
+        _session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffort>,
         summary: ReasoningSummary,
+        _service_tier: Option<ServiceTier>,
         _turn_metadata_header: Option<&str>,
     ) -> codex_core::error::Result<ResponseStream> {
         let input = ModelCallInput {
@@ -56,19 +61,27 @@ impl ModelStreamer for TemporalModelStreamer {
 
         let opts = ActivityOptions {
             start_to_close_timeout: Some(Duration::from_secs(300)),
+            cancellation_type: ActivityCancellationType::TryCancel,
             ..Default::default()
         };
 
-        let output = self
+        let activity = self
             .ctx
-            .start_activity(CodexActivities::model_call, input, opts)
-            .await
-            .map_err(|e| {
+            .start_activity(CodexActivities::model_call, input, opts);
+        tokio::pin!(activity);
+        let output = tokio::select! {
+            biased;
+            _ = self.cancellation_token.cancelled() => {
+                activity.cancel();
+                return Err(codex_core::error::CodexErr::TurnAborted);
+            }
+            result = &mut activity => result.map_err(|e| {
                 codex_core::error::CodexErr::Stream(
                     format!("model_call activity failed: {e}"),
                     None,
                 )
-            })?;
+            })?,
+        };
 
         // Synthesize the event sequence: Created → OutputItemDone* → Completed
         let (tx, rx) =
@@ -81,7 +94,6 @@ impl ModelStreamer for TemporalModelStreamer {
         tx.send(Ok(ResponseEvent::Completed {
             response_id: String::new(),
             token_usage: output.token_usage,
-            can_append: false,
         }))
         .await
         .ok();
