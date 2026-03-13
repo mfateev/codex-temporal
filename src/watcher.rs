@@ -3,6 +3,25 @@
 //! Each call blocks server-side until the workflow has new events, then
 //! returns them.  This replaces the old client-side query + exponential
 //! backoff polling loop.
+//!
+//! ## SDK bug workaround: "Update poll returned no outcome"
+//!
+//! The Temporal server uses a ~20-second long-poll interval for update
+//! RPCs.  `execute_update` internally calls `UpdateWorkflowExecution`
+//! (which blocks for one ~20s long poll), and if the update hasn't
+//! completed yet, falls through to `PollWorkflowExecutionUpdate` in
+//! `get_result()` (one more ~20s long poll).  If the update *still*
+//! hasn't completed after those two cycles (~40s total), `get_result()`
+//! returns `Err("Update poll returned no outcome")` instead of retrying.
+//!
+//! This is a bug in the Rust SDK (`WorkflowUpdateHandle::get_result` in
+//! `crates/client/src/workflow_handle.rs` — it calls
+//! `poll_workflow_execution_update` once and gives up).
+//! Tracked in: <https://github.com/temporalio/sdk-core/issues/1149>
+//!
+//! Until the SDK is fixed, we catch this specific error and retry
+//! `execute_update` with the same `update_id` so the server
+//! deduplicates and we rejoin the in-flight update.
 
 use std::time::Duration;
 
@@ -31,9 +50,9 @@ pub struct Watcher {
     workflow_id: String,
 }
 
-/// How long a single `execute_update` call may block before we retry.
-/// Prevents indefinite hangs when the worker is down and the workflow
-/// cannot make progress.
+/// How long a single watch cycle may block before we give up and retry
+/// from scratch.  Prevents indefinite hangs when the worker is down and
+/// the workflow cannot make progress.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(3600);
 
 impl Watcher {
@@ -46,32 +65,48 @@ impl Watcher {
 
     /// Single blocking call.  Returns when the workflow has new state or
     /// after `WATCH_TIMEOUT` — whichever comes first.
+    ///
+    /// Retries on "no outcome" errors (see module-level doc for details).
     async fn watch(
         &self,
         since_index: usize,
         update_id: &str,
     ) -> Result<StateUpdateResponse, String> {
-        let handle = self
-            .client
-            .get_workflow_handle::<AgentWorkflowRun>(&self.workflow_id);
+        let deadline = tokio::time::Instant::now() + WATCH_TIMEOUT;
 
-        let fut = handle.execute_update(
-            AgentWorkflow::get_state_update,
-            StateUpdateRequest {
-                since_index,
-            },
-            WorkflowExecuteUpdateOptions::builder()
-                .update_id(update_id.to_string())
-                .build(),
-        );
+        loop {
+            let handle = self
+                .client
+                .get_workflow_handle::<AgentWorkflowRun>(&self.workflow_id);
 
-        let resp: StateUpdateResponse =
-            tokio::time::timeout(WATCH_TIMEOUT, fut)
-                .await
-                .map_err(|_| "update timed out (workflow may be stalled)".to_string())?
-                .map_err(|e| format!("update failed: {e}"))?;
+            let fut = handle.execute_update(
+                AgentWorkflow::get_state_update,
+                StateUpdateRequest { since_index },
+                WorkflowExecuteUpdateOptions::builder()
+                    .update_id(update_id.to_string())
+                    .build(),
+            );
 
-        Ok(resp)
+            match tokio::time::timeout_at(deadline, fut).await {
+                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Err(e)) => {
+                    let msg = format!("{e}");
+                    if msg.contains("no outcome") {
+                        // Server long-poll expired before the update handler
+                        // completed (~40s).  Retry with the same update_id
+                        // so the server deduplicates.
+                        tracing::debug!("watcher: poll returned no outcome, retrying");
+                        continue;
+                    }
+                    return Err(format!("update failed: {e}"));
+                }
+                Err(_) => {
+                    return Err(
+                        "update timed out (workflow may be stalled)".to_string(),
+                    );
+                }
+            }
+        }
     }
 
     /// Continuous loop.  Sends parsed events on `tx`.  Each iteration blocks
