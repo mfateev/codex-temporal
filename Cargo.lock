@@ -1617,7 +1617,7 @@ dependencies = [
  "codex-utils-cache",
  "codex-utils-home-dir",
  "codex-utils-image",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0",
  "codex-utils-readiness",
  "codex-utils-stream-parser",
  "codex-utils-string",
@@ -1936,7 +1936,7 @@ dependencies = [
  "codex-keyring-store",
  "codex-protocol",
  "codex-utils-home-dir",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0",
  "futures",
  "keyring",
  "oauth2",
@@ -2054,6 +2054,7 @@ dependencies = [
  "codex-rmcp-client",
  "codex-shell-command",
  "codex-tui",
+ "codex-utils-pty 0.0.0 (git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal)",
  "color-eyre",
  "crossterm",
  "futures",
@@ -2243,6 +2244,22 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "filedescriptor",
+ "lazy_static",
+ "libc",
+ "log",
+ "portable-pty",
+ "shared_library",
+ "tokio",
+ "winapi",
+]
+
+[[package]]
+name = "codex-utils-pty"
+version = "0.0.0"
+source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#4c25ae0d52a52c6cf889508739a7b6b7f0f57125"
 dependencies = [
  "anyhow",
  "filedescriptor",
