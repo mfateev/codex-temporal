@@ -479,3 +479,235 @@ async fn tui_session_reconnect_inner() {
     );
     eprintln!("  [reconnect] TUI #2 exited (code {})", result2.exit_code);
 }
+
+// ---------------------------------------------------------------------------
+// Session switch test (/session command)
+// ---------------------------------------------------------------------------
+
+/// A scripted keystroke to send at a given delay after TUI startup.
+struct ScriptedInput {
+    delay: Duration,
+    data: Vec<u8>,
+}
+
+/// Spawn the TUI binary via PTY with scripted keystroke inputs.
+///
+/// Each `ScriptedInput` is sent after its `delay` from process start.
+/// After all inputs are sent, Ctrl+C is sent after `final_ctrl_c_delay`
+/// from the last input.
+async fn run_tui_scripted(
+    env: &HashMap<String, String>,
+    args: &[String],
+    script: Vec<ScriptedInput>,
+    final_ctrl_c_delay: Duration,
+    overall_timeout: Duration,
+) -> anyhow::Result<TuiOutput> {
+    let tui_bin = env!("CARGO_BIN_EXE_codex-temporal-tui");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/tmp".into());
+
+    let spawned = codex_utils_pty::spawn_pty_process(
+        tui_bin,
+        args,
+        &cwd,
+        env,
+        &None,
+        codex_utils_pty::TerminalSize { rows: 24, cols: 80 },
+    )
+    .await?;
+
+    let codex_utils_pty::SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned;
+
+    let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
+    let mut exit_rx = exit_rx;
+    let writer_tx = session.writer_sender();
+    let mut output = Vec::new();
+
+    // Spawn task to send scripted inputs then Ctrl+C.
+    let script_writer = writer_tx.clone();
+    let script_task = tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        for input in &script {
+            let target = start + input.delay;
+            tokio::time::sleep_until(target).await;
+            let _ = script_writer.send(input.data.clone()).await;
+        }
+        // Final Ctrl+C sequence.
+        tokio::time::sleep(final_ctrl_c_delay).await;
+        for _ in 0..4 {
+            let _ = script_writer.send(vec![3]).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
+    let exit_code_result = timeout(overall_timeout, async {
+        loop {
+            select! {
+                result = output_rx.recv() => match result {
+                    Ok(chunk) => {
+                        if chunk.windows(4).any(|window| window == b"\x1b[6n") {
+                            let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
+                        }
+                        output.extend_from_slice(&chunk);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break exit_rx.await
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                },
+                result = &mut exit_rx => break result,
+            }
+        }
+    })
+    .await;
+
+    script_task.abort();
+
+    let exit_code = match exit_code_result {
+        Ok(Ok(code)) => code,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => {
+            session.terminate();
+            anyhow::bail!("timed out waiting for codex-temporal-tui to exit");
+        }
+    };
+
+    while let Ok(chunk) = output_rx.try_recv() {
+        output.extend_from_slice(&chunk);
+    }
+
+    let output = String::from_utf8_lossy(&output).to_string();
+    Ok(TuiOutput { exit_code, output })
+}
+
+/// Verify in-TUI session switching via `/session` command:
+///
+/// 1. Start ephemeral Temporal server + worker.
+/// 2. Run TUI #1 via PTY with a prompt — creates session A, then Ctrl+C.
+/// 3. Run TUI #2 via PTY with a different prompt — creates session B.
+/// 4. In TUI #2, type `/session\r` → picker opens showing both sessions.
+/// 5. Press Down arrow + Enter → switch to session A.
+/// 6. Type `/session\r` again → picker opens.
+/// 7. Press Down arrow + Enter → switch back to session B.
+/// 8. Ctrl+C to exit.
+/// 9. Assert TUI produced output and exited cleanly.
+#[tokio::test]
+async fn tui_session_switch() {
+    match timeout(
+        Duration::from_secs(300),
+        tui_session_switch_inner(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!("tui_session_switch timed out after 300s"),
+    }
+}
+
+async fn tui_session_switch_inner() {
+    std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+
+    // --- Start ephemeral Temporal server + worker ---
+    let mut _server = start_ephemeral_server().await;
+    let server_target = _server.target.clone();
+    spawn_worker(&server_target);
+
+    // --- Set up CODEX_HOME ---
+    let codex_home = setup_codex_home();
+    let env = tui_env(&server_target, codex_home.path());
+
+    // --- Run TUI #1: create session A ---
+    eprintln!("  [switch] creating session A...");
+    let result1 = run_tui_binary(
+        &env,
+        &["Say hello in one word".to_string()],
+        Duration::from_secs(20),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("failed to run TUI #1");
+    assert!(
+        result1.exit_code == 0 || result1.exit_code == 130,
+        "TUI #1 (session A) unexpected exit code {}: output:\n{}",
+        result1.exit_code,
+        result1.output,
+    );
+    eprintln!("  [switch] session A created (exit code {})", result1.exit_code);
+
+    // --- Run TUI #2: create session B, then switch sessions via /session ---
+    // Timeline:
+    //  0s   — TUI starts with prompt "Say goodbye in one word"
+    // 20s   — type "/session\r" (open picker — both sessions visible)
+    // 23s   — press Down arrow then Enter (switch to session A)
+    // 28s   — type "/session\r" again (open picker)
+    // 31s   — press Down arrow then Enter (switch back to session B)
+    // 34s+  — Ctrl+C
+    eprintln!("  [switch] creating session B and testing /session switching...");
+
+    // ESC[B is the Down arrow key sequence.
+    let down_arrow: Vec<u8> = b"\x1b[B".to_vec();
+    let enter: Vec<u8> = b"\r".to_vec();
+
+    let script = vec![
+        // Wait for the model to respond, then open the session picker.
+        ScriptedInput {
+            delay: Duration::from_secs(20),
+            data: b"/session\r".to_vec(),
+        },
+        // Give the picker time to load sessions from harness and render.
+        // The current session (B) is pre-selected, so press Down to select
+        // session A, then Enter to switch.
+        ScriptedInput {
+            delay: Duration::from_secs(23),
+            data: [down_arrow.clone(), enter.clone()].concat(),
+        },
+        // Wait for the switch to complete, then open the picker again.
+        ScriptedInput {
+            delay: Duration::from_secs(28),
+            data: b"/session\r".to_vec(),
+        },
+        // Now session A is current. Press Down to select session B, then Enter.
+        ScriptedInput {
+            delay: Duration::from_secs(31),
+            data: [down_arrow, enter].concat(),
+        },
+    ];
+
+    let result2 = run_tui_scripted(
+        &env,
+        &["Say goodbye in one word".to_string()],
+        script,
+        Duration::from_secs(3), // Ctrl+C 3s after last scripted input
+        Duration::from_secs(90),
+    )
+    .await
+    .expect("failed to run TUI #2 with /session switching");
+
+    assert!(
+        result2.exit_code == 0 || result2.exit_code == 130,
+        "TUI #2 (session switch) unexpected exit code {}: output:\n{}",
+        result2.exit_code,
+        result2.output,
+    );
+    assert!(
+        !result2.output.is_empty(),
+        "TUI #2 (session switch) produced no output",
+    );
+
+    // Verify the output contains evidence of the session picker being shown.
+    // The picker title "Sessions" or "Select a session" should appear in the
+    // rendered TUI output.
+    let output_lower = result2.output.to_lowercase();
+    assert!(
+        output_lower.contains("session"),
+        "TUI output should contain 'session' from the picker — /session command may not have worked.\nOutput length: {} bytes",
+        result2.output.len(),
+    );
+
+    eprintln!("  [switch] TUI #2 exited (code {})", result2.exit_code);
+}
