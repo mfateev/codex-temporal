@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use codex_core::error::{CodexErr, Result as CodexResult};
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::protocol::{
-    BackgroundEventEvent, Event, EventMsg, Op, TurnAbortReason, TurnAbortedEvent,
+    BackgroundEventEvent, Event, EventMsg, Op, SandboxPolicy, SessionConfiguredEvent,
+    TurnAbortReason, TurnAbortedEvent,
 };
 use codex_protocol::user_input::UserInput;
 use temporalio_client::{
@@ -159,6 +160,35 @@ impl TemporalAgentSession {
             .lock()
             .expect("lock poisoned")
             .clone()
+    }
+
+    /// Build a synthetic `SessionConfigured` event from `base_input`.
+    ///
+    /// The Temporal workflow does not emit this event itself; instead the
+    /// client-side session injects it into the event buffer so that
+    /// consumers (TUI, tests) see the same protocol as codex-core.
+    fn build_session_configured_event(&self, input: &SessionWorkflowInput) -> Event {
+        use codex_protocol::ThreadId;
+        Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                initial_messages: None,
+                model: input.model.clone(),
+                model_provider_id: "openai".into(),
+                approval_policy: input.approval_policy,
+                sandbox_policy: SandboxPolicy::DangerFullAccess,
+                cwd: std::env::current_dir().unwrap_or_default(),
+                reasoning_effort: input.reasoning_effort,
+                history_log_id: 0,
+                history_entry_count: 0,
+                network_proxy: None,
+                rollout_path: None,
+                service_tier: None,
+            }),
+        }
     }
 
     /// Return the active agent workflow ID.
@@ -486,6 +516,13 @@ impl codex_core::AgentSession for TemporalAgentSession {
                     Ok(_) => {
                         *self.started.lock().expect("lock poisoned") = true;
                         *self.submit_cancel.lock().expect("lock poisoned") = None;
+                        // Inject SessionConfigured before the watcher starts
+                        // so it is the first event consumers see.
+                        {
+                            let evt = self.build_session_configured_event(&input);
+                            self.event_buffer.lock().expect("lock poisoned").push(evt);
+                            self.event_notify.notify_one();
+                        }
                         self.start_watching();
                         tracing::info!(
                             session_workflow_id = %session_id,
@@ -513,6 +550,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         let session_id2 = session_id.clone();
                         let buffer2 = Arc::clone(&self.event_buffer);
                         let notify2 = Arc::clone(&self.event_notify);
+                        let session_configured_evt = self.build_session_configured_event(&input);
                         let generation = Arc::clone(&self.generation);
                         let gen_at_start = *generation.lock().expect("lock poisoned");
                         let active_agent_id = self.active_agent_id();
@@ -546,6 +584,11 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                             session_workflow_id = %session_id2,
                                             "session workflow started (after retry)"
                                         );
+                                        // Inject SessionConfigured before the watcher starts.
+                                        {
+                                            buffer2.lock().expect("lock poisoned").push(session_configured_evt);
+                                            notify2.notify_one();
+                                        }
                                         // Start a watcher inline since we can't call self.start_watching().
                                         let watcher = Watcher::new(client2.clone(), active_agent_id.clone());
                                         let (wtx, mut wrx) = tokio::sync::mpsc::channel(64);
@@ -794,7 +837,6 @@ impl codex_tui::ExternalAgentBrowser for TemporalAgentSession {
         &self,
         session_id: &str,
     ) -> color_eyre::eyre::Result<codex_tui::ExternalSwitchResult> {
-        use codex_protocol::protocol::{SandboxPolicy, SessionConfiguredEvent};
         use codex_protocol::ThreadId;
 
         self.switch_session(session_id.to_string());
