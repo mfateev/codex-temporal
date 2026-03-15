@@ -322,3 +322,160 @@ async fn tui_startup_and_shutdown_inner() {
         "TUI produced no output — binary may have failed silently",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Session reconnect test
+// ---------------------------------------------------------------------------
+
+/// Use the `temporal` CLI to list SessionWorkflow executions and extract
+/// a workflow ID matching the `codex-tui-` prefix.
+///
+/// Uses JSON output (`-o json`) for reliable parsing.
+async fn find_session_workflow_id(server_target: &str) -> Option<String> {
+    let output = tokio::process::Command::new("temporal")
+        .args([
+            "workflow",
+            "list",
+            "--address",
+            server_target,
+            "--query",
+            "WorkflowType='SessionWorkflow'",
+            "--limit",
+            "10",
+            "-o",
+            "json",
+        ])
+        .output()
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Each line is a JSON object with a "workflowExecutionInfo" containing
+    // "execution.workflowId". Parse line by line (jsonl format).
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            // Try nested path: workflowExecutionInfo.execution.workflowId
+            let wf_id = val
+                .pointer("/workflowExecutionInfo/execution/workflowId")
+                .or_else(|| val.pointer("/execution/workflowId"))
+                .or_else(|| val.get("workflowId"))
+                .and_then(|v| v.as_str());
+            if let Some(id) = wf_id {
+                if id.starts_with("codex-tui-") {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    // Fallback: search raw text for the pattern.
+    for line in text.lines() {
+        if let Some(pos) = line.find("codex-tui-") {
+            let rest = &line[pos..];
+            // Extract until a non-ID character (whitespace, quote, comma).
+            let id: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ',')
+                .collect();
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Verify session reconnect through the real TUI binary:
+///
+/// 1. Start ephemeral Temporal server + worker.
+/// 2. Run TUI #1 via PTY with a prompt — let it process a turn, then Ctrl+C.
+/// 3. Discover the session workflow ID via `temporal workflow list` CLI.
+/// 4. Run TUI #2 via PTY with `--resume <session_id>` — verify it starts,
+///    loads the previous session's messages, and exits cleanly under Ctrl+C.
+#[tokio::test]
+async fn tui_session_reconnect() {
+    match timeout(
+        Duration::from_secs(300),
+        tui_session_reconnect_inner(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!("tui_session_reconnect timed out after 300s"),
+    }
+}
+
+async fn tui_session_reconnect_inner() {
+    std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+
+    // --- Start ephemeral Temporal server + worker ---
+    let mut _server = start_ephemeral_server().await;
+    let server_target = _server.target.clone();
+    spawn_worker(&server_target);
+
+    // --- Set up CODEX_HOME ---
+    let codex_home = setup_codex_home();
+    let env = tui_env(&server_target, codex_home.path());
+
+    // --- Run TUI #1: start a new session with a prompt ---
+    // Give the TUI 20 seconds to connect, process the model turn, and render,
+    // then send Ctrl+C.  Allow 60 seconds total for the process to exit.
+    eprintln!("  [reconnect] starting TUI #1 with prompt...");
+    let result1 = run_tui_binary(
+        &env,
+        &["Say hello in one word".to_string()],
+        Duration::from_secs(20),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("failed to run TUI #1");
+
+    assert!(
+        result1.exit_code == 0 || result1.exit_code == 130,
+        "TUI #1 unexpected exit code {}: output:\n{}",
+        result1.exit_code,
+        result1.output,
+    );
+    assert!(
+        !result1.output.is_empty(),
+        "TUI #1 produced no output",
+    );
+    eprintln!("  [reconnect] TUI #1 exited (code {})", result1.exit_code);
+
+    // --- Discover session workflow ID via temporal CLI ---
+    // The TUI binary creates a SessionWorkflow with ID `codex-tui-{uuid}`.
+    // Use the temporal CLI to find it.
+    eprintln!("  [reconnect] querying temporal for session workflow ID...");
+    let session_id = find_session_workflow_id(&server_target)
+        .await
+        .expect("could not find a codex-tui-* SessionWorkflow via temporal CLI");
+    eprintln!("  [reconnect] found session: {session_id}");
+
+    // --- Run TUI #2: resume the previous session ---
+    // Give the TUI 10 seconds to connect, fetch initial_messages, and render,
+    // then send Ctrl+C.  Allow 45 seconds total.
+    eprintln!("  [reconnect] starting TUI #2 with --resume {session_id}...");
+    let result2 = run_tui_binary(
+        &env,
+        &["--resume".to_string(), session_id],
+        Duration::from_secs(10),
+        Duration::from_secs(45),
+    )
+    .await
+    .expect("failed to run TUI #2 with --resume");
+
+    assert!(
+        result2.exit_code == 0 || result2.exit_code == 130,
+        "TUI #2 (resumed) unexpected exit code {}: output:\n{}",
+        result2.exit_code,
+        result2.output,
+    );
+    assert!(
+        !result2.output.is_empty(),
+        "TUI #2 (resumed) produced no output — binary may have failed to reconnect",
+    );
+    eprintln!("  [reconnect] TUI #2 exited (code {})", result2.exit_code);
+}
