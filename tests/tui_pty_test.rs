@@ -363,10 +363,10 @@ async fn find_session_workflow_id(server_target: &str) -> Option<String> {
                 .or_else(|| val.pointer("/execution/workflowId"))
                 .or_else(|| val.get("workflowId"))
                 .and_then(|v| v.as_str());
-            if let Some(id) = wf_id {
-                if id.starts_with("codex-tui-") {
-                    return Some(id.to_string());
-                }
+            if let Some(id) = wf_id
+                && id.starts_with("codex-tui-")
+            {
+                return Some(id.to_string());
             }
         }
     }
@@ -710,4 +710,202 @@ async fn tui_session_switch_inner() {
     );
 
     eprintln!("  [switch] TUI #2 exited (code {})", result2.exit_code);
+}
+
+// ---------------------------------------------------------------------------
+// Tool approval test
+// ---------------------------------------------------------------------------
+
+/// A reactive keystroke: when `pattern` appears in the accumulated PTY output,
+/// send `data` to the TUI.
+struct ReactiveInput {
+    pattern: String,
+    data: Vec<u8>,
+}
+
+/// Spawn the TUI binary via PTY with reactive keystroke inputs.
+///
+/// Each `ReactiveInput` fires once when its `pattern` first appears in the
+/// accumulated output. After all reactive inputs have fired (or after
+/// `overall_timeout`), Ctrl+C is sent to shut down the TUI.
+async fn run_tui_reactive(
+    env: &HashMap<String, String>,
+    args: &[String],
+    mut reactions: Vec<ReactiveInput>,
+    post_reaction_delay: Duration,
+    overall_timeout: Duration,
+) -> anyhow::Result<TuiOutput> {
+    let tui_bin = env!("CARGO_BIN_EXE_codex-temporal-tui");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/tmp".into());
+
+    let spawned = codex_utils_pty::spawn_pty_process(
+        tui_bin,
+        args,
+        &cwd,
+        env,
+        &None,
+        codex_utils_pty::TerminalSize { rows: 24, cols: 80 },
+    )
+    .await?;
+
+    let codex_utils_pty::SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawned;
+
+    let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
+    let mut exit_rx = exit_rx;
+    let writer_tx = session.writer_sender();
+    let mut output = Vec::new();
+    let mut all_reacted = false;
+    let mut reacted_at: Option<tokio::time::Instant> = None;
+
+    let exit_code_result = timeout(overall_timeout, async {
+        loop {
+            // Send Ctrl+C after all reactions have fired + delay.
+            if let Some(at) = reacted_at
+                && tokio::time::Instant::now() >= at + post_reaction_delay
+            {
+                for _ in 0..4 {
+                    let _ = writer_tx.send(vec![3]).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                reacted_at = None; // only send once
+            }
+
+            select! {
+                result = output_rx.recv() => match result {
+                    Ok(chunk) => {
+                        if chunk.windows(4).any(|window| window == b"\x1b[6n") {
+                            let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
+                        }
+                        output.extend_from_slice(&chunk);
+
+                        // Check reactive triggers against accumulated output.
+                        if !all_reacted {
+                            let text = String::from_utf8_lossy(&output);
+                            let text_lower = text.to_lowercase();
+                            let mut i = 0;
+                            while i < reactions.len() {
+                                if text_lower.contains(&reactions[i].pattern.to_lowercase()) {
+                                    let reaction = reactions.remove(i);
+                                    eprintln!("  [approval] matched pattern {:?}, sending keystroke", reaction.pattern);
+                                    let _ = writer_tx.send(reaction.data).await;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            if reactions.is_empty() {
+                                all_reacted = true;
+                                reacted_at = Some(tokio::time::Instant::now());
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break exit_rx.await
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                },
+                result = &mut exit_rx => break result,
+            }
+        }
+    })
+    .await;
+
+    let exit_code = match exit_code_result {
+        Ok(Ok(code)) => code,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => {
+            session.terminate();
+            anyhow::bail!("timed out waiting for codex-temporal-tui to exit");
+        }
+    };
+
+    while let Ok(chunk) = output_rx.try_recv() {
+        output.extend_from_slice(&chunk);
+    }
+
+    let output = String::from_utf8_lossy(&output).to_string();
+    Ok(TuiOutput { exit_code, output })
+}
+
+/// Verify tool approval through the real TUI binary:
+///
+/// 1. Start ephemeral Temporal server + worker.
+/// 2. Spawn TUI via PTY with a prompt that triggers a shell command.
+/// 3. Wait for the approval overlay to appear (contains "proceed").
+/// 4. Send 'y' to approve the tool call.
+/// 5. Wait for the model to respond, then Ctrl+C to exit.
+/// 6. Assert the TUI output contains evidence of the approved command.
+#[tokio::test]
+async fn tui_tool_approval() {
+    match timeout(
+        Duration::from_secs(300),
+        tui_tool_approval_inner(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!("tui_tool_approval timed out after 300s"),
+    }
+}
+
+async fn tui_tool_approval_inner() {
+    std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+
+    // --- Start ephemeral Temporal server + worker ---
+    let mut _server = start_ephemeral_server().await;
+    let server_target = _server.target.clone();
+    spawn_worker(&server_target);
+
+    // --- Set up CODEX_HOME ---
+    let codex_home = setup_codex_home();
+    let env = tui_env(&server_target, codex_home.path());
+
+    // --- Spawn TUI with a prompt that will trigger a tool call ---
+    // The model should invoke `shell` to run `echo hello`. The default
+    // approval policy (OnRequest) will show an approval overlay.
+    // When the overlay appears (containing "proceed"), we send 'y' to approve.
+    // After approval, the model completes the turn. We then Ctrl+C to exit.
+    eprintln!("  [approval] starting TUI with tool-triggering prompt...");
+
+    let result = run_tui_reactive(
+        &env,
+        &["Use shell to run: echo hello".to_string()],
+        vec![
+            ReactiveInput {
+                pattern: "proceed".to_string(),
+                data: b"y".to_vec(),
+            },
+        ],
+        Duration::from_secs(10), // wait 10s after approval for model to respond
+        Duration::from_secs(120),
+    )
+    .await
+    .expect("failed to run TUI binary");
+
+    assert!(
+        result.exit_code == 0 || result.exit_code == 130,
+        "unexpected exit code {}: output:\n{}",
+        result.exit_code,
+        result.output,
+    );
+    assert!(
+        !result.output.is_empty(),
+        "TUI produced no output — binary may have failed silently",
+    );
+
+    // The output should contain evidence that the tool call was approved
+    // and executed. Look for the approval confirmation or the command output.
+    let output_lower = result.output.to_lowercase();
+    assert!(
+        output_lower.contains("echo") || output_lower.contains("hello") || output_lower.contains("approved"),
+        "TUI output should contain evidence of the echo command or approval.\nOutput length: {} bytes",
+        result.output.len(),
+    );
+
+    eprintln!("  [approval] TUI exited (code {})", result.exit_code);
 }

@@ -68,8 +68,8 @@ async fn list_sessions(client: &Client) -> Result<(), Box<dyn std::error::Error>
     }
 
     println!(
-        "{:<40} {:<12} {:<16} {}",
-        "SESSION ID", "MODEL", "CREATED", "STATUS"
+        "{:<40} {:<12} {:<16} STATUS",
+        "SESSION ID", "MODEL", "CREATED"
     );
     for s in &sessions {
         let status = match s.status {
@@ -132,8 +132,8 @@ fn list_crew_types() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "{:<24} {:<14} {:<40} {}",
-        "NAME", "MODE", "DESCRIPTION", "REQUIRED INPUTS"
+        "{:<24} {:<14} {:<40} REQUIRED INPUTS",
+        "NAME", "MODE", "DESCRIPTION"
     );
     for crew in &crews {
         let mode = match crew.mode {
@@ -165,14 +165,14 @@ fn parse_input_args(args: &[String]) -> BTreeMap<String, String> {
     let mut inputs = BTreeMap::new();
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--input" {
-            if let Some(kv) = args.get(i + 1) {
-                if let Some((k, v)) = kv.split_once('=') {
-                    inputs.insert(k.to_string(), v.to_string());
-                }
-                i += 2;
-                continue;
+        if args[i] == "--input"
+            && let Some(kv) = args.get(i + 1)
+        {
+            if let Some((k, v)) = kv.split_once('=') {
+                inputs.insert(k.to_string(), v.to_string());
             }
+            i += 2;
+            continue;
         }
         i += 1;
     }

@@ -199,7 +199,7 @@ impl ToolCallHandler for TemporalToolHandler {
                     ctx.wait_condition(|s| {
                         s.pending_elicitation
                             .as_ref()
-                            .map_or(true, |p| p.response.is_some())
+                            .is_none_or(|p| p.response.is_some())
                             || s.interrupt_requested
                     })
                     .await;
@@ -248,7 +248,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.wait_condition(|s| {
                     s.pending_user_input
                         .as_ref()
-                        .map_or(true, |p| p.response.is_some())
+                        .is_none_or(|p| p.response.is_some())
                         || s.interrupt_requested
                 })
                 .await;
@@ -311,7 +311,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.wait_condition(|s| {
                     s.pending_dynamic_tool
                         .as_ref()
-                        .map_or(true, |p| p.response.is_some())
+                        .is_none_or(|p| p.response.is_some())
                         || s.interrupt_requested
                 })
                 .await;
@@ -396,7 +396,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.wait_condition(|s| {
                     s.pending_patch_approval
                         .as_ref()
-                        .map_or(true, |p| p.decision.is_some())
+                        .is_none_or(|p| p.decision.is_some())
                         || s.interrupt_requested
                 })
                 .await;
@@ -516,7 +516,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.wait_condition(|s| {
                     s.pending_approval
                         .as_ref()
-                        .map_or(true, |p| p.decision.is_some())
+                        .is_none_or(|p| p.decision.is_some())
                         || s.interrupt_requested
                 })
                 .await;

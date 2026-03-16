@@ -181,6 +181,7 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
 
 /// Build `ContinueAsNewState` from the current workflow state and return
 /// `Err(WorkflowTermination::ContinueAsNew(...))` to trigger CAN.
+#[allow(clippy::too_many_arguments)]
 fn do_continue_as_new(
     input: &AgentWorkflowInput,
     storage: &InMemoryStorage,
@@ -337,25 +338,25 @@ impl AgentWorkflow {
                 self.bump_version();
             }
             Op::ExecApproval { id, decision, .. } => {
-                if let Some(ref mut pa) = self.pending_approval {
-                    if pa.call_id == id {
-                        let approved = matches!(
-                            decision,
-                            ReviewDecision::Approved
-                                | ReviewDecision::ApprovedForSession
-                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                        );
-                        pa.decision = Some(approved);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pa) = self.pending_approval
+                    && pa.call_id == id
+                {
+                    let approved = matches!(
+                        decision,
+                        ReviewDecision::Approved
+                            | ReviewDecision::ApprovedForSession
+                            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                    );
+                    pa.decision = Some(approved);
+                    self.bump_version();
                 }
             }
             Op::UserInputAnswer { id, response, .. } => {
-                if let Some(ref mut pui) = self.pending_user_input {
-                    if pui.call_id == id {
-                        pui.response = Some(response);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pui) = self.pending_user_input
+                    && pui.call_id == id
+                {
+                    pui.response = Some(response);
+                    self.bump_version();
                 }
             }
             Op::Shutdown => {
@@ -367,17 +368,17 @@ impl AgentWorkflow {
                 self.bump_version();
             }
             Op::PatchApproval { id, decision, .. } => {
-                if let Some(ref mut pa) = self.pending_patch_approval {
-                    if pa.call_id == id {
-                        let approved = matches!(
-                            decision,
-                            ReviewDecision::Approved
-                                | ReviewDecision::ApprovedForSession
-                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                        );
-                        pa.decision = Some(approved);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pa) = self.pending_patch_approval
+                    && pa.call_id == id
+                {
+                    let approved = matches!(
+                        decision,
+                        ReviewDecision::Approved
+                            | ReviewDecision::ApprovedForSession
+                            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                    );
+                    pa.decision = Some(approved);
+                    self.bump_version();
                 }
             }
             Op::OverrideTurnContext {
@@ -406,11 +407,11 @@ impl AgentWorkflow {
                 self.bump_version();
             }
             Op::DynamicToolResponse { id, response } => {
-                if let Some(ref mut pdt) = self.pending_dynamic_tool {
-                    if pdt.call_id == id {
-                        pdt.response = Some(response);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pdt) = self.pending_dynamic_tool
+                    && pdt.call_id == id
+                {
+                    pdt.response = Some(response);
+                    self.bump_version();
                 }
             }
             Op::ResolveElicitation {
@@ -419,11 +420,11 @@ impl AgentWorkflow {
                 decision,
                 ..
             } => {
-                if let Some(ref mut pe) = self.pending_elicitation {
-                    if pe.server_name == server_name && pe.request_id == request_id {
-                        pe.response = Some(decision);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pe) = self.pending_elicitation
+                    && pe.server_name == server_name && pe.request_id == request_id
+                {
+                    pe.response = Some(decision);
+                    self.bump_version();
                 }
             }
             Op::Interrupt => {

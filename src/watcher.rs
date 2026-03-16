@@ -135,14 +135,13 @@ impl Watcher {
                         .filter_map(|s| serde_json::from_str(s).ok())
                         .collect();
 
-                    if !events.is_empty() || completed {
-                        if tx
+                    if (!events.is_empty() || completed)
+                        && tx
                             .send(WatcherEvent::Events(events, since_index))
                             .await
                             .is_err()
-                        {
-                            return; // receiver dropped
-                        }
+                    {
+                        return; // receiver dropped
                     }
 
                     if completed {

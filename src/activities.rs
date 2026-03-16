@@ -75,6 +75,12 @@ pub struct CodexActivities {
     worker_token: String,
 }
 
+impl Default for CodexActivities {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodexActivities {
     /// Create a new `CodexActivities` with the provider resolved once.
     pub fn new() -> Self {
@@ -122,7 +128,7 @@ impl CodexActivities {
 
         let model_client = ModelClient::new(
             None, // no AuthManager — uses env_key / bearer token
-            conversation_id.clone(),
+            conversation_id,
             provider,
             SessionSource::Exec,
             None,  // model_verbosity
@@ -177,7 +183,7 @@ impl CodexActivities {
                 None,
             )
             .await
-            .map_err(|e| codex_err_to_activity_error(e))?;
+            .map_err(codex_err_to_activity_error)?;
 
         let mut items: Vec<ResponseItem> = Vec::new();
         let mut token_usage = None;

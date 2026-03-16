@@ -186,11 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production, configure credentials on the worker directly or use a
     // secrets manager (e.g. HashiCorp Vault).
     let needs_token = !query_credentials_available(&client).await.unwrap_or(true);
-    if needs_token {
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            provider.experimental_bearer_token = Some(api_key);
-            provider.env_key = None; // Worker won't have this env var
-        }
+    if needs_token
+        && let Ok(api_key) = std::env::var("OPENAI_API_KEY")
+    {
+        provider.experimental_bearer_token = Some(api_key);
+        provider.env_key = None; // Worker won't have this env var
     }
     base_input.model_provider = Some(provider);
 

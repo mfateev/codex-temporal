@@ -963,9 +963,8 @@ async fn config_file_loaded(client: &Client) {
             Some(val) => std::env::set_var("CODEX_HOME", val),
             None => std::env::remove_var("CODEX_HOME"),
         }
-        match original_codex_model {
-            Some(val) => std::env::set_var("CODEX_MODEL", val),
-            None => {} // was already unset
+        if let Some(val) = original_codex_model {
+            std::env::set_var("CODEX_MODEL", val);
         }
     }
 

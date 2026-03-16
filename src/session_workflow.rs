@@ -212,12 +212,11 @@ impl SessionWorkflow {
             &config_toml,
             std::path::Path::new(&project_context.cwd),
             None,
-        ) {
-            if let Some(max_threads) = config.agent_max_threads {
-                if max_threads > 0 {
-                    ctx.state_mut(|s| s.max_agents = max_threads);
-                }
-            }
+        )
+            && let Some(max_threads) = config.agent_max_threads
+            && max_threads > 0
+        {
+            ctx.state_mut(|s| s.max_agents = max_threads);
         }
 
         // --- Phase 2: start the main agent ---

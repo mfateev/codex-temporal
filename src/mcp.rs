@@ -75,6 +75,12 @@ fn capturing_elicitation(
     })
 }
 
+impl Default for HarnessMcpManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HarnessMcpManager {
     /// Create an empty manager (no servers connected yet).
     pub fn new() -> Self {
@@ -215,15 +221,15 @@ impl HarnessMcpManager {
             let raw_name = tool.name.to_string();
 
             // Apply enabled/disabled filters.
-            if let Some(ref enabled) = config.enabled_tools {
-                if !enabled.contains(&raw_name) {
-                    continue;
-                }
+            if let Some(ref enabled) = config.enabled_tools
+                && !enabled.contains(&raw_name)
+            {
+                continue;
             }
-            if let Some(ref disabled) = config.disabled_tools {
-                if disabled.contains(&raw_name) {
-                    continue;
-                }
+            if let Some(ref disabled) = config.disabled_tools
+                && disabled.contains(&raw_name)
+            {
+                continue;
             }
 
             let qualified_name = format!("mcp__{}__{}", server_name, raw_name);

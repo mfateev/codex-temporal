@@ -97,7 +97,7 @@ async fn in_memory_storage_saves_and_reads() {
         message: "test".to_string(),
         replacement_history: None,
     });
-    storage.save(&[item.clone()]).await;
+    storage.save(std::slice::from_ref(&item)).await;
 
     assert_eq!(storage.items().len(), 1);
 

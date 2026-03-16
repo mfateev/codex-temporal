@@ -342,10 +342,10 @@ pub fn apply_crew_type(
     }
 
     // --- set user_message from initial_prompt (autonomous mode) ---
-    if crew.mode == CrewMode::Autonomous {
-        if let Some(ref prompt) = crew.initial_prompt {
-            base.user_message = interpolate(prompt, &vars);
-        }
+    if crew.mode == CrewMode::Autonomous
+        && let Some(ref prompt) = crew.initial_prompt
+    {
+        base.user_message = interpolate(prompt, &vars);
     }
 
     // --- populate crew_agents with non-main agent definitions ---
