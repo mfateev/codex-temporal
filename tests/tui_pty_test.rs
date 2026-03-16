@@ -908,4 +908,77 @@ async fn tui_tool_approval_inner() {
     );
 
     eprintln!("  [approval] TUI exited (code {})", result.exit_code);
+
+    // --- Verify the approval signal reached the workflow ---
+    // The ephemeral server is still alive (held by `_server`).
+    // Query workflow history to confirm the ExecApproval op was delivered.
+    eprintln!("  [approval] verifying workflow history...");
+
+    let list_output = tokio::process::Command::new("temporal")
+        .args([
+            "workflow", "list",
+            "--address", &server_target,
+            "--limit", "20",
+            "-o", "json",
+        ])
+        .output()
+        .await
+        .expect("temporal workflow list failed");
+    let list_text = String::from_utf8_lossy(&list_output.stdout);
+
+    // Find the agent workflow (ID ends with "/main").
+    let mut agent_wf_id: Option<String> = None;
+    for line in list_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Search for codex-tui-*/main pattern in any JSON or raw text.
+        if let Some(pos) = line.find("codex-tui-") {
+            let id: String = line[pos..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ',')
+                .collect();
+            if id.contains("/main") {
+                agent_wf_id = Some(id);
+                break;
+            }
+        }
+    }
+
+    if let Some(ref wf_id) = agent_wf_id {
+        eprintln!("  [approval] agent workflow: {wf_id}");
+
+        let history_output = tokio::process::Command::new("temporal")
+            .args([
+                "workflow", "show",
+                "--workflow-id", wf_id,
+                "--address", &server_target,
+                "-o", "json",
+            ])
+            .output()
+            .await
+            .expect("temporal workflow show failed");
+        let history_text = String::from_utf8_lossy(&history_output.stdout);
+
+        let has_approval = history_text.contains("exec_approval");
+        let has_tool_exec = history_text.contains("tool_exec");
+        eprintln!(
+            "  [approval] history check: exec_approval={has_approval}, tool_exec={has_tool_exec}"
+        );
+
+        assert!(
+            has_approval || has_tool_exec,
+            "BUG: workflow history contains no exec_approval signal and no tool_exec activity.\n\
+             The TUI showed the approval overlay and 'y' was sent, but the approval\n\
+             never reached the workflow. This is the known TUI→workflow signal bug.\n\
+             Agent workflow: {wf_id}",
+        );
+        eprintln!("  [approval] PASSED — approval signal reached the workflow");
+    } else {
+        eprintln!(
+            "  [approval] WARNING: could not find agent workflow in list — \
+             skipping history verification"
+        );
+    }
 }
