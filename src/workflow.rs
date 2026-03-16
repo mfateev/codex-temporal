@@ -353,7 +353,7 @@ impl AgentWorkflow {
             }
             Op::UserInputAnswer { id, response, .. } => {
                 if let Some(ref mut pui) = self.pending_user_input
-                    && pui.call_id == id
+                    && (pui.turn_id == id || pui.call_id == id)
                 {
                     pui.response = Some(response);
                     self.bump_version();

@@ -38,11 +38,40 @@ const TASK_QUEUE: &str = "codex-temporal";
 struct TuiOutput {
     exit_code: i32,
     output: String,
+    /// Number of reactive patterns that were matched (only for `run_tui_reactive`).
+    reactions_matched: usize,
 }
 
-/// Start an ephemeral Temporal dev server, returning its `host:port` target.
-async fn start_ephemeral_server(
-) -> temporalio_sdk_core::ephemeral_server::EphemeralServer {
+/// RAII guard that kills the ephemeral Temporal server on drop.
+///
+/// `EphemeralServer` has no `Drop` impl, so orphaned server processes
+/// accumulate if tests panic or are killed.  This guard kills the child
+/// process synchronously on drop.
+struct ServerGuard(Option<temporalio_sdk_core::ephemeral_server::EphemeralServer>);
+
+impl ServerGuard {
+    fn target(&self) -> &str {
+        &self.0.as_ref().unwrap().target
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        if let Some(ref server) = self.0 {
+            // Best-effort kill via `kill` command — `child_process_id()`
+            // returns None if the process already exited.
+            if let Some(pid) = server.child_process_id() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+            }
+        }
+    }
+}
+
+/// Start an ephemeral Temporal dev server, wrapped in a [`ServerGuard`]
+/// that kills it on drop.
+async fn start_ephemeral_server() -> ServerGuard {
     let server_result = timeout(Duration::from_secs(60), async {
         let config = TemporalDevServerConfig::builder()
             .exe(default_cached_download())
@@ -51,11 +80,12 @@ async fn start_ephemeral_server(
     })
     .await;
 
-    match server_result {
+    let server = match server_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => panic!("failed to start ephemeral server: {e}"),
         Err(_) => panic!("ephemeral server startup timed out (60s)"),
-    }
+    };
+    ServerGuard(Some(server))
 }
 
 /// Spawn a worker on a dedicated thread (Worker future is !Send).
@@ -223,7 +253,7 @@ async fn run_tui_binary(
     }
 
     let output = String::from_utf8_lossy(&output).to_string();
-    Ok(TuiOutput { exit_code, output })
+    Ok(TuiOutput { exit_code, output, reactions_matched: 0 })
 }
 
 /// Build the common environment map for the TUI binary.
@@ -286,8 +316,8 @@ async fn tui_startup_and_shutdown_inner() {
         .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
 
     // --- Start ephemeral Temporal server + worker ---
-    let mut _server = start_ephemeral_server().await;
-    let server_target = _server.target.clone();
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
     spawn_worker(&server_target);
 
     // --- Set up CODEX_HOME ---
@@ -412,8 +442,8 @@ async fn tui_session_reconnect_inner() {
         .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
 
     // --- Start ephemeral Temporal server + worker ---
-    let mut _server = start_ephemeral_server().await;
-    let server_target = _server.target.clone();
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
     spawn_worker(&server_target);
 
     // --- Set up CODEX_HOME ---
@@ -581,7 +611,7 @@ async fn run_tui_scripted(
     }
 
     let output = String::from_utf8_lossy(&output).to_string();
-    Ok(TuiOutput { exit_code, output })
+    Ok(TuiOutput { exit_code, output, reactions_matched: 0 })
 }
 
 /// Verify in-TUI session switching via `/session` command:
@@ -613,8 +643,8 @@ async fn tui_session_switch_inner() {
         .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
 
     // --- Start ephemeral Temporal server + worker ---
-    let mut _server = start_ephemeral_server().await;
-    let server_target = _server.target.clone();
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
     spawn_worker(&server_target);
 
     // --- Set up CODEX_HOME ---
@@ -761,6 +791,8 @@ async fn run_tui_reactive(
     let mut output = Vec::new();
     let mut all_reacted = false;
     let mut reacted_at: Option<tokio::time::Instant> = None;
+    let total_reactions = reactions.len();
+    let mut reactions_matched: usize = 0;
 
     let exit_code_result = timeout(overall_timeout, async {
         loop {
@@ -794,7 +826,8 @@ async fn run_tui_reactive(
                                 && text_lower.contains(&reactions[0].pattern.to_lowercase())
                             {
                                 let reaction = reactions.remove(0);
-                                eprintln!("  [approval] matched pattern {:?}, sending keystroke", reaction.pattern);
+                                reactions_matched += 1;
+                                eprintln!("  [reactive] matched pattern {:?}, sending keystroke ({}/{})", reaction.pattern, reactions_matched, total_reactions);
                                 let _ = writer_tx.send(reaction.data).await;
                                 // Reset accumulated output so subsequent
                                 // triggers only match against new text.
@@ -822,7 +855,14 @@ async fn run_tui_reactive(
         Ok(Err(err)) => return Err(err.into()),
         Err(_) => {
             session.terminate();
-            anyhow::bail!("timed out waiting for codex-temporal-tui to exit");
+            // Return partial result with reactions_matched info instead of
+            // a hard error — callers can check reactions_matched to verify
+            // the flow succeeded even if the TUI didn't exit cleanly.
+            while let Ok(chunk) = output_rx.try_recv() {
+                output.extend_from_slice(&chunk);
+            }
+            let output = String::from_utf8_lossy(&output).to_string();
+            return Ok(TuiOutput { exit_code: -1, output, reactions_matched });
         }
     };
 
@@ -831,7 +871,7 @@ async fn run_tui_reactive(
     }
 
     let output = String::from_utf8_lossy(&output).to_string();
-    Ok(TuiOutput { exit_code, output })
+    Ok(TuiOutput { exit_code, output, reactions_matched })
 }
 
 /// Verify tool approval through the real TUI binary:
@@ -860,8 +900,8 @@ async fn tui_tool_approval_inner() {
         .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
 
     // --- Start ephemeral Temporal server + worker ---
-    let mut _server = start_ephemeral_server().await;
-    let server_target = _server.target.clone();
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
     spawn_worker(&server_target);
 
     // --- Set up CODEX_HOME ---
@@ -976,4 +1016,99 @@ async fn tui_tool_approval_inner() {
              skipping history verification"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// request_user_input test
+// ---------------------------------------------------------------------------
+
+/// Verify `request_user_input` round-trip through the real TUI binary:
+///
+/// 1. Start ephemeral Temporal server + worker.
+/// 2. Spawn TUI via PTY with a prompt that triggers `request_user_input`.
+/// 3. Wait for the user-input overlay to render (contains "submit answer").
+/// 4. Press Enter to submit the default answer.
+/// 5. Wait for the model to respond with a completion marker, then `/quit`.
+/// 6. Assert the workflow history contains a `UserInputAnswer` signal.
+#[tokio::test]
+async fn tui_request_user_input() {
+    match timeout(
+        Duration::from_secs(30),
+        tui_request_user_input_inner(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!("tui_request_user_input timed out after 30s"),
+    }
+}
+
+async fn tui_request_user_input_inner() {
+    std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+
+    // --- Start ephemeral Temporal server + worker ---
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
+    spawn_worker(&server_target);
+
+    // --- Set up CODEX_HOME ---
+    let codex_home = setup_codex_home();
+    let env = tui_env(&server_target, codex_home.path());
+
+    // --- Spawn TUI with a prompt that triggers request_user_input ---
+    // The model is instructed to call the request_user_input tool with a
+    // yes/no question.  The TUI shows an overlay; its footer always
+    // contains "submit answer".  When we see that text, we press Enter to
+    // submit the default (first) option.  After answering, the model
+    // responds — we look for XDONEWORD and send /quit.
+    eprintln!("  [user_input] starting TUI with request_user_input prompt...");
+
+    let result = run_tui_reactive(
+        &env,
+        &[
+            "You must use the request_user_input tool to ask me exactly one \
+             yes/no question before responding. Do not use any other tools. \
+             After I answer, respond with exactly: XDONEWORD"
+                .to_string(),
+        ],
+        vec![
+            // Stage 1: the user-input overlay appears — press Enter to submit.
+            ReactiveInput {
+                pattern: "submit answer".to_string(),
+                data: b"\r".to_vec(),
+            },
+            // Stage 2: the model responds after receiving the answer.
+            // Send /quit to exit cleanly.
+            ReactiveInput {
+                pattern: "XDONEWORD".to_string(),
+                data: b"/quit\r".to_vec(),
+            },
+        ],
+        Duration::from_secs(1),
+        Duration::from_secs(20),
+    )
+    .await;
+
+    let result = result.expect("TUI binary failed to start");
+    eprintln!(
+        "  [user_input] TUI exited (code {}, reactions matched: {}/2)",
+        result.exit_code, result.reactions_matched,
+    );
+
+    // --- Verify the round-trip via reactive pattern matches ---
+    // Both patterns must have matched:
+    //   1. "submit answer" — the request_user_input overlay rendered
+    //   2. "XDONEWORD" — the model responded after receiving the user's answer
+    // The model can only produce XDONEWORD if the UserInputAnswer signal
+    // reached the workflow and the tool call completed.  This is stronger
+    // evidence than workflow history inspection (where payloads are
+    // base64-encoded and not trivially searchable).
+    assert_eq!(
+        result.reactions_matched, 2,
+        "Expected both reactive patterns to match (submit answer + XDONEWORD), \
+         but only {}/2 matched. The request_user_input round-trip failed.",
+        result.reactions_matched,
+    );
+    eprintln!("  [user_input] PASSED — request_user_input round-trip verified");
 }

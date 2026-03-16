@@ -229,6 +229,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.state_mut(|s| {
                     s.pending_user_input = Some(PendingUserInput {
                         call_id: call_id.clone(),
+                        turn_id: turn_id.clone(),
                         response: None,
                     });
                 });

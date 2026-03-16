@@ -287,6 +287,9 @@ pub struct PendingApproval {
 pub struct PendingUserInput {
     /// The call_id for the `request_user_input` tool call.
     pub call_id: String,
+    /// The turn_id used by the TUI overlay as the `id` in `Op::UserInputAnswer`.
+    /// Upstream codex-core matches by turn_id (sub_id), not call_id.
+    pub turn_id: String,
     /// Set to `Some(...)` when the client responds via `Op::UserInputAnswer`.
     pub response: Option<codex_protocol::request_user_input::RequestUserInputResponse>,
 }
