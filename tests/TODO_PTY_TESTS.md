@@ -7,14 +7,11 @@
 - **Session switch** — `tui_session_switch` (`/session` command)
 - **Tool approval (exec_command)** — `tui_tool_approval` (verifies ExecApproval signal reaches workflow)
 - **request_user_input** — `tui_request_user_input` (verifies round-trip: overlay → Enter → model responds). Bug fix: workflow matched `Op::UserInputAnswer.id` against `call_id`, but TUI overlay sends `turn_id` (matching upstream codex-core's `notify_user_input_response` which uses `sub_id`/`turn_id`).
+- **apply_patch approval** — `tui_apply_patch_approval` (verifies patch-approval overlay → 'y' → PatchApproval signal reaches workflow → tool_exec activity runs apply_patch). Same `thread_id.unwrap_or_default()` pattern as exec approval.
 - **Smoke test** — `tui_session_smoke_test` (non-PTY, direct session API)
 - **Tool approval (direct API)** — `tui_tool_approval_test` (non-PTY, direct session API)
 
 ## Not Tested
-
-### High Priority (same thread_id bug pattern)
-
-1. **`apply_patch` approval** — Model writes a file via `apply_patch`, user approves the patch. Same `thread_id.unwrap_or_default()` pattern at `chatwidget.rs:2981`. The `submit_op_to_thread` fix should cover this, but needs verification.
 
 ### Medium Priority
 

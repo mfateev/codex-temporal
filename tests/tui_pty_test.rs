@@ -21,7 +21,10 @@ use codex_temporal::harness::CodexHarness;
 use codex_temporal::session_workflow::SessionWorkflow;
 use codex_temporal::workflow::CodexWorkflow;
 
-use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
+use temporalio_client::{
+    Client, ClientOptions, Connection, ConnectionOptions, UntypedWorkflow,
+    WorkflowFetchHistoryOptions,
+};
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk::{Worker, WorkerOptions};
@@ -29,6 +32,93 @@ use temporalio_sdk_core::ephemeral_server::{TemporalDevServerConfig, default_cac
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 const TASK_QUEUE: &str = "codex-temporal";
+
+/// Connect a Temporal client and search the decoded payload data of a
+/// workflow's history events for the given needle strings.
+///
+/// Returns a `Vec<bool>` parallel to `needles`, indicating which were found.
+async fn search_workflow_history(
+    server_target: &str,
+    workflow_id: &str,
+    needles: &[&str],
+) -> Vec<bool> {
+    let conn = ConnectionOptions::new(
+        Url::parse(&format!("http://{}", server_target)).expect("bad URL"),
+    )
+    .build();
+    let connection = Connection::connect(conn)
+        .await
+        .expect("history check: connect failed");
+    let client = Client::new(connection, ClientOptions::new("default").build())
+        .expect("history check: client failed");
+
+    let handle = client.get_workflow_handle::<UntypedWorkflow>(workflow_id);
+    let history = handle
+        .fetch_history(WorkflowFetchHistoryOptions::default())
+        .await
+        .expect("history check: fetch_history failed");
+
+    let mut found = vec![false; needles.len()];
+
+    for event in history.events() {
+        // Serialize the event to JSON so we can search payload data fields.
+        // Proto `Payload.data` is bytes; serde_json will encode it as base64.
+        // But signal/activity input payloads that contain JSON strings can
+        // also be extracted by just looking at the raw bytes.
+        //
+        // Walk all payload data fields via the proto struct.
+        let payloads = extract_payloads(event);
+        for data in &payloads {
+            let text = String::from_utf8_lossy(data);
+            for (i, needle) in needles.iter().enumerate() {
+                if !found[i] && text.contains(needle) {
+                    found[i] = true;
+                }
+            }
+        }
+    }
+
+    found
+}
+
+/// Extract all `Payload.data` byte vectors from a history event's attributes.
+fn extract_payloads(
+    event: &temporalio_common::protos::temporal::api::history::v1::HistoryEvent,
+) -> Vec<Vec<u8>> {
+    use temporalio_common::protos::temporal::api::history::v1::history_event::Attributes;
+
+    let mut result = Vec::new();
+
+    let Some(ref attrs) = event.attributes else {
+        return result;
+    };
+
+    // Helper: extract data from a Payloads message.
+    let extract = |payloads: &Option<temporalio_common::protos::temporal::api::common::v1::Payloads>| -> Vec<Vec<u8>> {
+        payloads
+            .as_ref()
+            .map(|p| p.payloads.iter().map(|pl| pl.data.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    match attrs {
+        Attributes::WorkflowExecutionSignaledEventAttributes(a) => {
+            result.extend(extract(&a.input));
+        }
+        Attributes::ActivityTaskScheduledEventAttributes(a) => {
+            result.extend(extract(&a.input));
+        }
+        Attributes::ActivityTaskCompletedEventAttributes(a) => {
+            result.extend(extract(&a.result));
+        }
+        Attributes::WorkflowExecutionStartedEventAttributes(a) => {
+            result.extend(extract(&a.input));
+        }
+        _ => {}
+    }
+
+    result
+}
 
 // ---------------------------------------------------------------------------
 // Infrastructure
@@ -42,22 +132,54 @@ struct TuiOutput {
     reactions_matched: usize,
 }
 
+/// Sentinel file recording the PID and address of a leaked ephemeral server.
+const LEAKED_SERVER_FILE: &str = "/tmp/codex-temporal-test-server.json";
+
 /// RAII guard that kills the ephemeral Temporal server on drop.
 ///
 /// `EphemeralServer` has no `Drop` impl, so orphaned server processes
 /// accumulate if tests panic or are killed.  This guard kills the child
-/// process synchronously on drop.
-struct ServerGuard(Option<temporalio_sdk_core::ephemeral_server::EphemeralServer>);
+/// process synchronously on drop — unless `leak()` is called first, in
+/// which case the server stays running for manual inspection.
+struct ServerGuard {
+    server: Option<temporalio_sdk_core::ephemeral_server::EphemeralServer>,
+    leaked: bool,
+}
 
 impl ServerGuard {
     fn target(&self) -> &str {
-        &self.0.as_ref().unwrap().target
+        &self.server.as_ref().unwrap().target
+    }
+
+    /// Keep the server running after this guard is dropped.
+    /// Writes PID + address to [`LEAKED_SERVER_FILE`] so the next test
+    /// run can clean it up.
+    fn leak(&mut self) {
+        if let Some(ref server) = self.server {
+            if let Some(pid) = server.child_process_id() {
+                let info = serde_json::json!({
+                    "pid": pid,
+                    "target": server.target,
+                });
+                let _ = std::fs::write(LEAKED_SERVER_FILE, info.to_string());
+                eprintln!(
+                    "  [server] LEAKED — pid={pid}, address={}, inspect with:\n    \
+                     temporal workflow list --address {} -o json\n    \
+                     temporal workflow show --workflow-id <ID> --address {} -o json",
+                    server.target, server.target, server.target,
+                );
+            }
+        }
+        self.leaked = true;
     }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        if let Some(ref server) = self.0 {
+        if self.leaked {
+            return;
+        }
+        if let Some(ref server) = self.server {
             // Best-effort kill via `kill` command — `child_process_id()`
             // returns None if the process already exited.
             if let Some(pid) = server.child_process_id() {
@@ -69,9 +191,28 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Kill any previously leaked ephemeral server and remove the sentinel file.
+fn cleanup_leaked_server() {
+    let Ok(data) = std::fs::read_to_string(LEAKED_SERVER_FILE) else {
+        return;
+    };
+    let _ = std::fs::remove_file(LEAKED_SERVER_FILE);
+    if let Ok(info) = serde_json::from_str::<serde_json::Value>(&data) {
+        if let Some(pid) = info.get("pid").and_then(|v| v.as_u64()) {
+            eprintln!("  [server] cleaning up leaked server (pid={pid})");
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .output();
+        }
+    }
+}
+
 /// Start an ephemeral Temporal dev server, wrapped in a [`ServerGuard`]
-/// that kills it on drop.
+/// that kills it on drop.  Any previously leaked server is cleaned up
+/// first.
 async fn start_ephemeral_server() -> ServerGuard {
+    cleanup_leaked_server();
+
     let server_result = timeout(Duration::from_secs(60), async {
         let config = TemporalDevServerConfig::builder()
             .exe(default_cached_download())
@@ -85,7 +226,7 @@ async fn start_ephemeral_server() -> ServerGuard {
         Ok(Err(e)) => panic!("failed to start ephemeral server: {e}"),
         Err(_) => panic!("ephemeral server startup timed out (60s)"),
     };
-    ServerGuard(Some(server))
+    ServerGuard { server: Some(server), leaked: false }
 }
 
 /// Spawn a worker on a dedicated thread (Worker future is !Send).
@@ -1015,6 +1156,191 @@ async fn tui_tool_approval_inner() {
             "  [approval] WARNING: could not find agent workflow in list — \
              skipping history verification"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// apply_patch approval test
+// ---------------------------------------------------------------------------
+
+/// Verify `apply_patch` approval through the real TUI binary:
+///
+/// 1. Start ephemeral Temporal server + worker (with apply_patch enabled).
+/// 2. Spawn TUI via PTY with a prompt that triggers `apply_patch`.
+/// 3. Wait for the patch-approval overlay ("Would you like to make the
+///    following edits?").
+/// 4. Send 'y' to approve the patch.
+/// 5. Wait for the model to confirm completion (XPATCHDONE), then `/quit`.
+/// 6. Assert workflow history contains `patch_approval` signal and
+///    `apply_patch` tool call.
+#[tokio::test]
+async fn tui_apply_patch_approval() {
+    match timeout(
+        Duration::from_secs(90),
+        tui_apply_patch_approval_inner(),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!("tui_apply_patch_approval timed out after 90s"),
+    }
+}
+
+async fn tui_apply_patch_approval_inner() {
+    std::env::var("OPENAI_API_KEY")
+        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+
+    // --- Set up CODEX_HOME with apply_patch enabled ---
+    // The apply_patch tool is gated behind the ApplyPatchFreeform feature
+    // flag. Without it, the model never sees the tool and falls back to
+    // shell commands.
+    //
+    // CODEX_HOME must be set BEFORE spawning the worker because the
+    // `load_config` activity runs `ConfigBuilder::default()` which reads
+    // from `find_codex_home()` (respects the CODEX_HOME env var).
+    let codex_home = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "model = \"gpt-5.3-codex\"\n\
+         sandbox_mode = \"danger-full-access\"\n\
+         experimental_use_freeform_apply_patch = true\n",
+    )
+    .expect("failed to write config.toml");
+
+    // Set CODEX_HOME so the in-process worker's load_config reads our test config.
+    let prev_codex_home = std::env::var("CODEX_HOME").ok();
+    // SAFETY: this test runs in its own process (cargo test forks); no other
+    // threads are reading CODEX_HOME at this point (worker not yet spawned).
+    unsafe { std::env::set_var("CODEX_HOME", codex_home.path()) };
+
+    // --- Start ephemeral Temporal server + worker ---
+    let mut _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
+    spawn_worker(&server_target);
+
+    let env = tui_env(&server_target, codex_home.path());
+
+    // --- Spawn TUI with a prompt that triggers apply_patch ---
+    // The model should use apply_patch to create a file. The default
+    // approval policy (OnRequest) shows a patch-approval overlay with
+    // "Yes, proceed" as the first option. When we see "edits", we
+    // send 'y' to approve. After the patch is applied, the model
+    // responds with our marker word XPATCHDONE.
+    //
+    // We match "edits" (from "Would you like to make the following
+    // edits?") rather than "proceed" to distinguish the patch-approval
+    // overlay from the exec-approval overlay.
+    eprintln!("  [patch_approval] starting TUI with apply_patch prompt...");
+
+    let result = run_tui_reactive(
+        &env,
+        &[
+            "Create the file /tmp/xtestpatch.txt with content 'hello'. \
+             You MUST use the apply_patch tool, NOT shell commands. \
+             After it succeeds say XPATCHDONE"
+                .to_string(),
+        ],
+        vec![
+            // Stage 1: patch-approval overlay appears — press 'y' to approve.
+            ReactiveInput {
+                pattern: "edits".to_string(),
+                data: b"y".to_vec(),
+            },
+            // Stage 2: model confirms the patch was applied.
+            ReactiveInput {
+                pattern: "XPATCHDONE".to_string(),
+                data: b"/quit\r".to_vec(),
+            },
+        ],
+        Duration::from_secs(3),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    let result = result.expect("TUI binary failed to start");
+    eprintln!(
+        "  [patch_approval] TUI exited (code {}, reactions matched: {}/2)",
+        result.exit_code, result.reactions_matched,
+    );
+
+    // --- Verify reactions ---
+    assert_eq!(
+        result.reactions_matched, 2,
+        "Expected both reactive patterns to match (edits + XPATCHDONE), \
+         but only {}/2 matched. The apply_patch approval round-trip failed.",
+        result.reactions_matched,
+    );
+
+    // --- Verify workflow history contains patch_approval signal ---
+    eprintln!("  [patch_approval] verifying workflow history...");
+
+    // Find the agent workflow ID (ends with "/main").
+    let list_output = tokio::process::Command::new("temporal")
+        .args([
+            "workflow", "list",
+            "--address", &server_target,
+            "--limit", "20",
+            "-o", "json",
+        ])
+        .output()
+        .await
+        .expect("temporal workflow list failed");
+    let list_text = String::from_utf8_lossy(&list_output.stdout);
+
+    let mut agent_wf_id: Option<String> = None;
+    for line in list_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(pos) = line.find("codex-tui-") {
+            let id: String = line[pos..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ',')
+                .collect();
+            if id.contains("/main") {
+                agent_wf_id = Some(id);
+                break;
+            }
+        }
+    }
+
+    if let Some(ref wf_id) = agent_wf_id {
+        eprintln!("  [patch_approval] agent workflow: {wf_id}");
+
+        let found = search_workflow_history(
+            &server_target,
+            wf_id,
+            &["patch_approval", "apply_patch"],
+        )
+        .await;
+        let has_patch_approval = found[0];
+        let has_apply_patch = found[1];
+        eprintln!(
+            "  [patch_approval] history check: patch_approval={has_patch_approval}, \
+             apply_patch={has_apply_patch}"
+        );
+
+        if !(has_patch_approval || has_apply_patch) {
+            _server.leak();
+            panic!(
+                "BUG: workflow history contains no patch_approval signal and no apply_patch \
+                 tool reference.\nAgent workflow: {wf_id}",
+            );
+        }
+        eprintln!("  [patch_approval] PASSED — patch approval signal reached the workflow");
+    } else {
+        _server.leak();
+        panic!("could not find agent workflow in list");
+    }
+
+    // Restore CODEX_HOME.
+    // SAFETY: test cleanup — no concurrent env readers expected at this point.
+    unsafe {
+        match prev_codex_home {
+            Some(val) => std::env::set_var("CODEX_HOME", val),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
     }
 }
 
