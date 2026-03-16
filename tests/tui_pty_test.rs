@@ -845,13 +845,13 @@ async fn run_tui_reactive(
 #[tokio::test]
 async fn tui_tool_approval() {
     match timeout(
-        Duration::from_secs(300),
+        Duration::from_secs(90),
         tui_tool_approval_inner(),
     )
     .await
     {
         Ok(()) => {}
-        Err(_) => panic!("tui_tool_approval timed out after 300s"),
+        Err(_) => panic!("tui_tool_approval timed out after 90s"),
     }
 }
 
@@ -875,13 +875,12 @@ async fn tui_tool_approval_inner() {
     // After approval, the model completes the turn. We then Ctrl+C to exit.
     eprintln!("  [approval] starting TUI with tool-triggering prompt...");
 
-    // Three-stage sequential reactive flow (each trigger only matches
+    // Two-stage sequential reactive flow (each trigger only matches
     // output produced after the previous trigger fired):
     //
     // 1. "proceed" → press 'y' to approve the tool call.
-    // 2. "XTESTDONE" → tool executed (echo output appeared). Send empty
-    //    data — just advance to next trigger.
-    // 3. "context left" → TUI status bar after turn completes. Ctrl+C.
+    // 2. "XTESTDONE" → tool executed successfully. Send "/quit\r" to
+    //    exit cleanly without waiting for the model to respond.
     let result = run_tui_reactive(
         &env,
         &["Print XTESTDONE using the shell".to_string()],
@@ -892,15 +891,11 @@ async fn tui_tool_approval_inner() {
             },
             ReactiveInput {
                 pattern: "XTESTDONE".to_string(),
-                data: vec![], // no-op, advance to next trigger
-            },
-            ReactiveInput {
-                pattern: "context left".to_string(),
-                data: vec![3], // Ctrl+C after turn completes
+                data: b"/quit\r".to_vec(),
             },
         ],
         Duration::from_secs(3),
-        Duration::from_secs(120),
+        Duration::from_secs(60),
     )
     .await;
 
