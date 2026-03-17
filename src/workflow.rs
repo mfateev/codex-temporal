@@ -668,7 +668,7 @@ impl AgentWorkflow {
             features: &config.features,
             web_search_mode: input.web_search_mode,
             session_source: codex_protocol::protocol::SessionSource::Exec,
-            sandbox_policy: &sandbox_policy,
+            sandbox_policy,
             windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         })
         .with_agent_roles(config.agent_roles.clone());

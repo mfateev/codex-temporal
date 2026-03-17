@@ -58,6 +58,7 @@ codex-utils-pty = { git = "https://github.com/mfateev/codex.git", branch = "task
 crossterm = { version = "0.28", features = ["event-stream"] }
 ratatui = { version = "0.29", features = ["unstable-widget-ref"] }
 tempfile = "3"
+serial_test = "3"
 
 [[bin]]
 name = "codex-temporal-worker"

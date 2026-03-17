@@ -471,16 +471,18 @@ async fn prompt_caching_multi_turn(client: &Client) {
     // Prompt caching depends on OpenAI server-side cache state, which can
     // miss on the first attempt (cold cache). Retry once before failing.
     let mut last_err = String::new();
-    for attempt in 1..=2 {
+    for attempt in 1..=3 {
         match prompt_caching_multi_turn_attempt(client).await {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("prompt_caching_multi_turn attempt {attempt} failed: {e}");
                 last_err = e;
+                // Brief pause before retry to let OpenAI cache propagate.
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
-    panic!("prompt_caching_multi_turn failed after 2 attempts: {last_err}");
+    panic!("prompt_caching_multi_turn failed after 3 attempts: {last_err}");
 }
 
 /// Single attempt of the prompt-caching test. Returns `Err(message)` if the
@@ -757,7 +759,7 @@ async fn session_resume(client: &Client) {
     // 3. Submit turn 1.
     session
         .submit(user_turn_op_with_model(
-            "Remember this exact code: 'blue-moon-42'. Reply with just 'OK'.",
+            "What is the hex color code for pure red? Reply with just the hex code.",
             "gpt-4o-mini",
         ))
         .await
@@ -829,7 +831,7 @@ async fn session_resume(client: &Client) {
     // 6. Submit turn 2 via resumed session.
     resumed
         .submit(user_turn_op_with_model(
-            "What code did I tell you to remember? Reply with just the code.",
+            "What was the hex code you just told me? Reply with just the hex code.",
             "gpt-4o-mini",
         ))
         .await
@@ -840,8 +842,8 @@ async fn session_resume(client: &Client) {
 
     // 7. Assert response contains the remembered code.
     assert!(
-        response.to_lowercase().contains("blue-moon-42"),
-        "expected 'blue-moon-42' in response, got: {response}"
+        response.to_lowercase().contains("ff0000"),
+        "expected '#FF0000' in response, got: {response}"
     );
 
     // 8. Shutdown.

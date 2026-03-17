@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serial_test::serial;
 use tokio::select;
 use tokio::time::timeout;
 
@@ -440,6 +441,7 @@ fn setup_codex_home() -> tempfile::TempDir {
 /// the full binary lifecycle (connect to Temporal, initialize TUI, shutdown)
 /// works end-to-end through a real pseudo-terminal.
 #[tokio::test]
+#[serial]
 async fn tui_startup_and_shutdown() {
     match timeout(
         Duration::from_secs(300),
@@ -566,6 +568,7 @@ async fn find_session_workflow_id(server_target: &str) -> Option<String> {
 /// 4. Run TUI #2 via PTY with `--resume <session_id>` — verify it starts,
 ///    loads the previous session's messages, and exits cleanly under Ctrl+C.
 #[tokio::test]
+#[serial]
 async fn tui_session_reconnect() {
     match timeout(
         Duration::from_secs(300),
@@ -767,6 +770,7 @@ async fn run_tui_scripted(
 /// 8. Ctrl+C to exit.
 /// 9. Assert TUI produced output and exited cleanly.
 #[tokio::test]
+#[serial]
 async fn tui_session_switch() {
     match timeout(
         Duration::from_secs(300),
@@ -1024,6 +1028,7 @@ async fn run_tui_reactive(
 /// 5. Wait for the model to respond, then Ctrl+C to exit.
 /// 6. Assert the TUI output contains evidence of the approved command.
 #[tokio::test]
+#[serial]
 async fn tui_tool_approval() {
     match timeout(
         Duration::from_secs(90),
@@ -1174,6 +1179,7 @@ async fn tui_tool_approval_inner() {
 /// 6. Assert workflow history contains `patch_approval` signal and
 ///    `apply_patch` tool call.
 #[tokio::test]
+#[serial]
 async fn tui_apply_patch_approval() {
     match timeout(
         Duration::from_secs(90),
@@ -1357,6 +1363,7 @@ async fn tui_apply_patch_approval_inner() {
 /// 5. Wait for the model to respond with a completion marker, then `/quit`.
 /// 6. Assert the workflow history contains a `UserInputAnswer` signal.
 #[tokio::test]
+#[serial]
 async fn tui_request_user_input() {
     match timeout(
         Duration::from_secs(30),

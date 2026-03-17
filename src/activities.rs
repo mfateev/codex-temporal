@@ -616,7 +616,7 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
         features: &config.features,
         web_search_mode: None,
         session_source: SessionSource::Exec,
-        sandbox_policy: &sandbox_policy,
+        sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
     let router = ToolRouter::from_config(&tools_config, ToolRouterParams {
