@@ -1578,6 +1578,7 @@ async fn policy_amendment_mid_workflow(client: &Client) {
     session
         .submit(Op::OverrideTurnContext {
             cwd: None,
+            approvals_reviewer: None,
             approval_policy: Some(AskForApproval::Never),
             sandbox_policy: None,
             windows_sandbox_level: None,
@@ -1825,6 +1826,7 @@ async fn override_turn_context_flow(client: &Client) {
     session
         .submit(Op::OverrideTurnContext {
             cwd: None,
+            approvals_reviewer: None,
             approval_policy: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
@@ -2105,6 +2107,7 @@ async fn dynamic_tool_flow(client: &Client) {
                 },
                 "required": ["location"]
             }),
+            defer_loading: false,
         }],
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);

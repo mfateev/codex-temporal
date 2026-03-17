@@ -281,7 +281,7 @@ impl HarnessMcpManager {
 
         let rmcp_result = server
             .client
-            .call_tool(tool_name, arguments, server.tool_timeout)
+            .call_tool(tool_name, arguments, None, server.tool_timeout)
             .await
             .map_err(|e| anyhow!("MCP tool call failed: {}", e))?;
 

@@ -1094,13 +1094,22 @@ async fn dispatch_with_experimental_tools(
     // Inject experimental tools into model_info so ToolsConfig picks them up.
     model_info.experimental_supported_tools = extra_tools.iter().map(|s| s.to_string()).collect();
 
+    let sandbox_policy = config.permissions.sandbox_policy.get();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
+        available_models: &vec![],
         features: &config.features,
         web_search_mode: None,
         session_source: codex_protocol::protocol::SessionSource::Exec,
+        sandbox_policy: &sandbox_policy,
+        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
     });
-    let router = ToolRouter::from_config(&tools_config, None, None, &[]);
+    let router = ToolRouter::from_config(&tools_config, codex_core::tools::router::ToolRouterParams {
+        mcp_tools: None,
+        app_tools: None,
+        discoverable_tools: None,
+        dynamic_tools: &[],
+    });
 
     let conversation_id = ThreadId::new();
     let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new(4096, 0));
@@ -1124,6 +1133,7 @@ async fn dispatch_with_experimental_tools(
 
     let tool_call = ToolCall {
         tool_name: tool_name.to_string(),
+        tool_namespace: None,
         call_id: "test-call".to_string(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),
@@ -1792,7 +1802,7 @@ fn needs_approval(command: &[String], policy: AskForApproval) -> bool {
             AskForApproval::UnlessTrusted
             | AskForApproval::OnRequest
             | AskForApproval::OnFailure
-            | AskForApproval::Reject(_) => true,
+            | AskForApproval::Granular(_) => true,
         }
     }
 }

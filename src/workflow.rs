@@ -661,11 +661,15 @@ impl AgentWorkflow {
         // --- tools ---
         // Use codex-core's build_specs to get the full set of tool specs
         // (shell, apply_patch, read_file, list_dir, grep_files, etc.).
+        let sandbox_policy = config.permissions.sandbox_policy.get();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &vec![],
             features: &config.features,
             web_search_mode: input.web_search_mode,
             session_source: codex_protocol::protocol::SessionSource::Exec,
+            sandbox_policy: &sandbox_policy,
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         })
         .with_agent_roles(config.agent_roles.clone());
 

@@ -269,6 +269,7 @@ async fn run_tui_session(
         thread_name: None,
         model: model.clone(),
         model_provider_id: "openai".to_string(),
+        approvals_reviewer: Default::default(),
         approval_policy,
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         cwd: cwd.clone(),

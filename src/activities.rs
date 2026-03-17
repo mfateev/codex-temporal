@@ -15,7 +15,8 @@ use codex_core::{
     built_in_model_providers,
 };
 use codex_core::error::CodexErr;
-use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter};
+use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter, ToolRouterParams};
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_otel::SessionTelemetry;
 use codex_protocol::models::{BaseInstructions, ResponseItem};
 use codex_protocol::protocol::SessionSource;
@@ -41,7 +42,7 @@ use crate::types::{
 /// auth (`OPENAI_API_KEY` env var) instead of ChatGPT OAuth — activities run
 /// headless so there is no interactive login flow.
 fn resolve_provider() -> ModelProviderInfo {
-    let mut provider = built_in_model_providers()
+    let mut provider = built_in_model_providers(None)
         .remove("openai")
         .expect("built-in openai provider must exist");
 
@@ -608,13 +609,22 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
         ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
 
     // Build the tool router with all standard tools enabled.
+    let sandbox_policy = config.permissions.sandbox_policy.get();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
+        available_models: &vec![],
         features: &config.features,
         web_search_mode: None,
         session_source: SessionSource::Exec,
+        sandbox_policy: &sandbox_policy,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let router = ToolRouter::from_config(&tools_config, None, None, &[]);
+    let router = ToolRouter::from_config(&tools_config, ToolRouterParams {
+        mcp_tools: None,
+        app_tools: None,
+        discoverable_tools: None,
+        dynamic_tools: &[],
+    });
 
     // Construct minimal Session + TurnContext for the dispatch.
     let conversation_id = ThreadId::new();
@@ -640,6 +650,7 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     // Build a ToolCall for the router.
     let tool_call = ToolCall {
         tool_name: input.tool_name.clone(),
+        tool_namespace: None,
         call_id: input.call_id.clone(),
         payload: ToolPayload::Function {
             arguments: input.arguments.clone(),

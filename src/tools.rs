@@ -478,7 +478,7 @@ impl ToolCallHandler for TemporalToolHandler {
                     AskForApproval::UnlessTrusted
                     | AskForApproval::OnRequest
                     | AskForApproval::OnFailure
-                    | AskForApproval::Reject(_) => true,
+                    | AskForApproval::Granular(_) => true,
                 }
             };
 
