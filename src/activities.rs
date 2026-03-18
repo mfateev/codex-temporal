@@ -582,7 +582,8 @@ impl CodexActivities {
             .list_models(RefreshStrategy::OnlineIfUncached)
             .await;
 
-        let model_info = self.models_manager.get_model_info(&input.model, &config).await;
+        let mut model_info = self.models_manager.get_model_info(&input.model, &config).await;
+        backfill_experimental_tools(&mut model_info);
 
         tracing::debug!(
             model = %model_info.slug,
@@ -592,6 +593,32 @@ impl CodexActivities {
         );
 
         Ok(model_info)
+    }
+}
+
+/// Known file tools that codex models support.
+///
+/// The bundled `models.json` ships with `experimental_supported_tools: []`
+/// because the ChatGPT `/models` API is expected to populate them at runtime.
+/// That API is only available with ChatGPT OAuth — not API-key auth.  This
+/// constant lists the tools that all codex-class models support so the
+/// harness can inject them when the API isn't available.
+const CODEX_FILE_TOOLS: &[&str] = &["read_file", "list_dir", "grep_files"];
+
+/// Ensure `experimental_supported_tools` is populated for codex-class models.
+///
+/// If the model has `apply_patch_tool_type` set (indicating it's a
+/// codex-capable model) but `experimental_supported_tools` is empty (no
+/// ChatGPT API data), inject the standard file tools so that `build_specs`
+/// includes them in the tool list.
+pub fn backfill_experimental_tools(model_info: &mut ModelInfo) {
+    if model_info.apply_patch_tool_type.is_some()
+        && model_info.experimental_supported_tools.is_empty()
+    {
+        model_info.experimental_supported_tools = CODEX_FILE_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
     }
 }
 
@@ -665,7 +692,8 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
 
     // Resolve model info from the bundled catalog.
     let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
-    let model_info = ModelsManager::resolve_from_bundled_catalog(&model_slug, &config);
+    let mut model_info = ModelsManager::resolve_from_bundled_catalog(&model_slug, &config);
+    backfill_experimental_tools(&mut model_info);
 
     // Build the tool router with all standard tools enabled.
     let sandbox_policy = config.permissions.sandbox_policy.get();

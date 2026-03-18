@@ -611,7 +611,9 @@ impl AgentWorkflow {
 
         // --- model info ---
         // Resolve model metadata via activity (API-backed with bundled fallback).
-        let model_info = ctx
+        // The activity already calls backfill_experimental_tools, but the
+        // fallback path needs it too, so apply unconditionally.
+        let mut model_info = ctx
             .start_activity(
                 CodexActivities::resolve_model_info,
                 ResolveModelInfoInput {
@@ -628,6 +630,7 @@ impl AgentWorkflow {
                 tracing::warn!("resolve_model_info failed: {e} — falling back to bundled catalog");
                 ModelsManager::resolve_from_bundled_catalog(&input.model, &config)
             });
+        crate::activities::backfill_experimental_tools(&mut model_info);
 
         // --- session ---
         let conversation_id = ThreadId::new();
