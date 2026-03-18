@@ -31,8 +31,8 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 12. ~~**Policy amendment signals**~~ — ✅ `Op::OverrideTurnContext` updates `approval_policy_override` mid-workflow; persists across CAN; `effective_approval_policy()` helper; tool handler re-reads policy each iteration
 12b. ~~**`OverrideTurnContext` completion**~~ — ✅ `model`, `effort`, `summary`, `personality` overrides handled; persistent overrides applied as fallbacks (per-turn takes priority); all carried across CAN; `cwd`, `sandbox_policy`, `collaboration_mode` remain unhandled (not relevant to temporal harness)
 13. **Worker sandbox** — bubblewrap/container isolation for tool activities
-14. ~~**Command safety analysis**~~ — ✅ codex-core three-tier classification: safe (auto-approve), dangerous (always prompt), unknown (defer to policy); 8 unit tests
-14b. ~~**Patch approval flow**~~ — ✅ `apply_patch` tool calls intercepted with signal/wait pattern; emits `ApplyPatchApprovalRequestEvent` with patch text in `reason`; accepts `Op::PatchApproval` signal; `PendingPatchApproval` state type
+14. ~~**Command safety analysis**~~ — ⚠️ Partial: uses `is_known_safe_command`/`command_might_be_dangerous` but diverges from codex-core's full `exec_policy` pipeline — see "Known Gaps" section below; non-shell tools (file tools) correctly skip approval
+14b. ~~**Patch approval flow**~~ — ⚠️ Partial: signal/wait pattern works, but always prompts — codex-core auto-approves safe patches via `assess_patch_safety()` (see "Known Gaps")
 
 ## Phase 4: Configuration & Auth
 
@@ -98,18 +98,99 @@ Single/multi-turn conversation, full tool ecosystem via codex-core's ToolRegistr
 
 ---
 
+## Known Gaps: Approval Logic vs Codex-Core
+
+The `TemporalToolHandler` reimplements tool approval at the workflow level
+(needed for durable signal/wait), but the logic diverges from codex-core's
+`ToolOrchestrator` + `exec_policy` pipeline in several ways.
+
+### 1. Execpolicy rules are ignored
+
+Codex-core evaluates user-configured execpolicy rules (`~/.codex/rules/`)
+via `exec_policy.create_exec_approval_requirement_for_command()` before
+falling back to `is_known_safe_command` / `command_might_be_dangerous`.
+The harness skips execpolicy entirely and goes straight to the fallback.
+
+**Impact**: Users who have configured allow/prompt/forbidden prefix rules
+will not see them honored by the harness.
+
+### 2. `OnFailure` policy is implemented incorrectly
+
+In codex-core, `OnFailure` means "run the command first (in sandbox),
+only ask the user if it fails." The approval happens *after* a sandbox
+failure, not before. `render_decision_for_unmatched_command` returns
+`Decision::Allow` for `OnFailure`.
+
+The harness treats `OnFailure` the same as `OnRequest` — it prompts
+*before* execution for unknown commands. This contradicts the intended
+behavior of "run first, ask later."
+
+**Impact**: `OnFailure` users are prompted unnecessarily for every
+unknown command instead of relying on the sandbox.
+
+### 3. `OnRequest` with unrestricted sandbox auto-allows in codex but prompts in harness
+
+In codex-core, `render_decision_for_unmatched_command` returns
+`Decision::Allow` for `OnRequest` when `FileSystemSandboxKind` is
+`Unrestricted` or `ExternalSandbox` (the user opted into full access).
+The harness always prompts under `OnRequest` regardless of sandbox policy.
+
+**Impact**: Users with `sandbox_mode = "danger-full-access"` + `OnRequest`
+are prompted for every unknown command when codex would auto-allow.
+
+### 4. Dangerous commands under `Never` should be `Forbidden`, not silently allowed
+
+In codex-core, dangerous commands + `AskForApproval::Never` →
+`Decision::Forbidden` (the command is rejected outright since we can't
+prompt). The harness sets `needs_approval = false` and runs the command,
+relying solely on the sandbox. This is less safe — a dangerous command
+could execute without any warning.
+
+**Impact**: Dangerous commands may execute unsafely under `Never` policy
+when codex would have rejected them.
+
+### 5. `apply_patch` always prompts instead of auto-approving safe patches
+
+In codex-core, `assess_patch_safety()` auto-approves patches that are
+constrained to writable paths when a sandbox is available (most cases
+under `Never`/`OnFailure`/`OnRequest`/`Granular`). Only `UnlessTrusted`
+always asks. `DangerFullAccess` sandbox auto-approves unconditionally.
+
+The harness always emits `ApplyPatchApprovalRequestEvent` and waits for
+a signal, regardless of policy, sandbox, or patch content.
+
+**Impact**: apply_patch always requires manual approval in the harness,
+even when codex would auto-approve.
+
+### 6. `Granular` policy nuances are not handled
+
+Codex-core's `Granular` policy supports `allows_sandbox_approval()` which
+can reject commands that would otherwise prompt. The harness treats
+`Granular` the same as `OnRequest`.
+
+### Path to fix
+
+The cleanest fix would be to extract codex-core's approval decision into
+a reusable function that returns `Skip`/`NeedsApproval`/`Forbidden`
+without coupling to the orchestrator's execution model. The harness
+could then call it and map to its signal/wait pattern. This requires
+making `exec_policy.create_exec_approval_requirement_for_command()` and
+`assess_patch_safety()` (or wrappers) public in codex-core.
+
+---
+
 ## Suggested Priority
 
 | Order | Phase | Rationale |
 |-------|-------|-----------|
-| ~~1~~ | ~~3 — Approval policies~~ | ✅ Done (policy modes + command safety) |
+| ~~1~~ | ~~3 — Approval policies~~ | ⚠️ Partial (policy modes work, but approval logic diverges from codex-core — see Known Gaps) |
 | ~~2~~ | ~~2 — Tool ecosystem~~ | ✅ Done (ToolRegistry dispatch, web search); JS REPL remaining |
 | ~~3~~ | ~~1 — Model improvements~~ | ✅ Done (reasoning effort, prompt caching); multi-provider routing remaining |
 | ~~4~~ | ~~5 — Session persistence~~ | ✅ Done (resume, picker, harness); fork/new/export remaining |
 | ~~5~~ | ~~8 — Git/project context~~ | ✅ Done (git info, AGENTS.md); ghost commits, /diff remaining |
 | ~~6~~ | ~~4 — Config/auth~~ | ✅ Partial (config.toml done); real auth/models/credentials remaining |
 | ~~7~~ | ~~7 — MCP/skills~~ | ✅ Partial (MCP + elicitation done); resources, skills remaining |
-| ~~8~~ | ~~3b/9b — Patch approval, OverrideTurnContext, dynamic tools~~ | ✅ Done (all 4 signal/wait items) |
+| ~~8~~ | ~~3b/9b — Patch approval, OverrideTurnContext, dynamic tools~~ | ⚠️ Signal/wait items done, but patch auto-approve missing (see Known Gaps) |
 | 9 | 6 — Multi-agent | Power feature; requires child workflow architecture |
 | 10 | 9 — Advanced | Memory, code review, realtime |
 | 11 | 10 — Hardening | Before any real deployment |
