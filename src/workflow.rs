@@ -942,6 +942,7 @@ impl AgentWorkflow {
                             config_output.worker_token.clone(),
                             mcp_tool_names.clone(),
                             dynamic_tool_names.clone(),
+                            config.permissions.sandbox_policy.get().clone(),
                         );
 
                         // Rebuild prompt from accumulated session history,

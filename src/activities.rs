@@ -687,6 +687,117 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     // Approval is handled at the workflow level by TemporalToolHandler, so
     // the activity itself runs with no approval prompts. Sandbox policy comes
     // from the user's config.toml (or defaults to read-only).
+    // --- Activity-side approval gate ---
+    // When the workflow did NOT already obtain user approval, the activity
+    // acts as a second gate using the full execpolicy pipeline (which has
+    // access to .rules files on disk) and `assess_patch_safety` (which can
+    // do file I/O for path-constraint checking).
+    if !input.already_approved {
+        use codex_core::exec_policy::{ExecPolicyManager, ExecApprovalRequest};
+        use codex_core::ExecApprovalRequirement;
+        use codex_protocol::models::SandboxPermissions;
+        use codex_protocol::permissions::FileSystemSandboxPolicy;
+
+        let approval_policy = config.permissions.approval_policy.get().clone();
+        let sandbox_policy = config.permissions.sandbox_policy.get();
+        let fs_sandbox_policy = FileSystemSandboxPolicy::from(sandbox_policy);
+
+        let is_shell_tool = matches!(
+            input.tool_name.as_str(),
+            "shell" | "container.exec" | "local_shell" | "shell_command" | "unified_exec"
+        );
+
+        if is_shell_tool {
+            // Parse command from arguments.
+            let command: Vec<String> = serde_json::from_str::<serde_json::Value>(&input.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.get("command")?
+                        .as_array()?
+                        .iter()
+                        .map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![input.arguments.clone()]);
+
+            // Try to load execpolicy rules from config.
+            let exec_policy_mgr = ExecPolicyManager::load(&config.config_layer_stack)
+                .await
+                .unwrap_or_default();
+
+            let requirement = exec_policy_mgr
+                .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+                    command: &command,
+                    approval_policy: approval_policy.clone(),
+                    sandbox_policy,
+                    file_system_sandbox_policy: &fs_sandbox_policy,
+                    sandbox_permissions: SandboxPermissions::default(),
+                    prefix_rule: None,
+                })
+                .await;
+
+            match requirement {
+                ExecApprovalRequirement::NeedsApproval { reason, .. } => {
+                    anyhow::bail!(
+                        "APPROVAL_REQUIRED:{}",
+                        reason.unwrap_or_else(|| "execpolicy requires approval".to_string())
+                    );
+                }
+                ExecApprovalRequirement::Forbidden { reason } => {
+                    return Ok(ToolExecOutput {
+                        call_id: input.call_id,
+                        output: format!("Command forbidden: {reason}"),
+                        exit_code: 1,
+                    });
+                }
+                ExecApprovalRequirement::Skip { .. } => {
+                    // Allowed — proceed with execution.
+                }
+            }
+        }
+
+        if input.tool_name == "apply_patch" {
+            use codex_core::safety::assess_patch_safety;
+            use codex_apply_patch::{MaybeApplyPatchVerified, maybe_parse_apply_patch_verified};
+
+            // Parse and verify the patch (has file I/O for content verification).
+            let patch_text: String = serde_json::from_str::<serde_json::Value>(&input.arguments)
+                .ok()
+                .and_then(|v| v.get("patch")?.as_str().map(String::from))
+                .unwrap_or_else(|| input.arguments.clone());
+
+            let argv = vec!["apply_patch".to_string(), patch_text];
+            if let MaybeApplyPatchVerified::Body(action) =
+                maybe_parse_apply_patch_verified(&argv, &config.cwd)
+            {
+                let safety = assess_patch_safety(
+                    &action,
+                    approval_policy,
+                    sandbox_policy,
+                    &fs_sandbox_policy,
+                    &config.cwd,
+                    WindowsSandboxLevel::Disabled,
+                );
+                match safety {
+                    codex_core::safety::SafetyCheck::AskUser => {
+                        anyhow::bail!("APPROVAL_REQUIRED:patch requires user approval");
+                    }
+                    codex_core::safety::SafetyCheck::Reject { reason } => {
+                        return Ok(ToolExecOutput {
+                            call_id: input.call_id,
+                            output: format!("Patch rejected: {reason}"),
+                            exit_code: 1,
+                        });
+                    }
+                    codex_core::safety::SafetyCheck::AutoApprove { .. } => {
+                        // Allowed — proceed with execution.
+                    }
+                }
+            }
+            // If parsing failed, let the tool router handle the error naturally.
+        }
+    }
+
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
     let config = Arc::new(config);
 

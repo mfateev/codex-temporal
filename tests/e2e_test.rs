@@ -2909,6 +2909,9 @@ async fn e2e_tests_inner() {
     eprintln!("--- test: blocking_update_event_delivery ---");
     blocking_update_event_delivery(&client).await;
 
+    eprintln!("--- test: patch_auto_approve_full_access ---");
+    patch_auto_approve_full_access(&client).await;
+
     // --- teardown ---
     // Restore CODEX_HOME.
     // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
@@ -3170,4 +3173,74 @@ async fn session_switch_via_browser(client: &Client) {
     );
 
     drain_shutdown(&session_a).await;
+}
+
+/// Verify that `apply_patch` with `DangerFullAccess` sandbox policy
+/// auto-approves (no `ApplyPatchApprovalRequest` emitted) when the
+/// workflow-side policy pre-check determines it's safe.
+///
+/// Uses `OnFailure` + `DangerFullAccess` which should auto-approve patches.
+async fn patch_auto_approve_full_access(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Use OnFailure + DangerFullAccess — patches should auto-approve.
+    let op = Op::UserTurn {
+        items: vec![UserInput::Text {
+            text: "Create a file /tmp/codex-patch-test-e2e.txt with the content 'hello patch'. \
+                   Use the apply_patch tool to create this file."
+                .to_string(),
+            text_elements: vec![],
+        }],
+        cwd: std::env::current_dir().unwrap_or_else(|_| "/tmp".into()),
+        approval_policy: AskForApproval::OnFailure,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        model: "gpt-4o-mini".to_string(),
+        effort: None,
+        summary: Some(ReasoningSummary::Auto),
+        service_tier: None,
+        final_output_json_schema: None,
+        collaboration_mode: None,
+        personality: None,
+    };
+    session.submit(op).await.expect("submit failed");
+
+    // Wait for TurnComplete. If we get an ApplyPatchApprovalRequest, the
+    // auto-approve logic has a bug.
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!("timed out waiting for TurnComplete");
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ApplyPatchApprovalRequest(req) => {
+                panic!(
+                    "received ApplyPatchApprovalRequest for patch — \
+                     auto-approve should have kicked in with OnFailure + DangerFullAccess. \
+                     call_id={}, reason={:?}",
+                    req.call_id, req.reason,
+                );
+            }
+            EventMsg::ExecApprovalRequest(req) => {
+                // Model may decide to use shell instead of apply_patch.
+                // Auto-approve and continue.
+                eprintln!("  note: model used shell instead of apply_patch, approving: {:?}", req.command);
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("approval failed");
+            }
+            EventMsg::TurnComplete(_) => {
+                eprintln!("  patch_auto_approve_full_access: TurnComplete (no approval prompt)");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    drain_shutdown(&session).await;
 }

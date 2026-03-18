@@ -84,6 +84,11 @@ pub struct ToolExecInput {
     /// from rogue workflows on shared task queues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_token: Option<String>,
+    /// When true, the workflow has already obtained user approval for this
+    /// tool call. The activity should skip its own approval check and
+    /// execute directly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_approved: bool,
 }
 
 /// Output from the `tool_exec` activity.

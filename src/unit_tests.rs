@@ -881,6 +881,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
     }
 }
 
@@ -941,6 +942,7 @@ async fn dispatch_shell_with_cwd() {
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -975,6 +977,7 @@ sandbox_mode = "read-only"
         cwd: "/tmp".to_string(),
         config_toml: Some(toml_str.to_string()),
         worker_token: None,
+        already_approved: false,
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -1001,6 +1004,7 @@ async fn dispatch_tool_rejects_empty_tool_name() {
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
     };
 
     let result = dispatch_tool(input).await;
@@ -1022,6 +1026,7 @@ async fn dispatch_tool_rejects_nonexistent_cwd() {
         cwd: "/nonexistent/path/that/does/not/exist".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
     };
 
     let result = dispatch_tool(input).await;
@@ -1047,6 +1052,7 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
         cwd: file_path,
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
     };
 
     let result = dispatch_tool(input).await;
@@ -1706,6 +1712,7 @@ fn tool_exec_input_config_toml_roundtrip() {
         cwd: "/tmp".to_string(),
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
         worker_token: Some("tok-abc".to_string()),
+        already_approved: false,
     };
     let json_with = serde_json::to_string(&input_with).unwrap();
     assert!(
@@ -1729,6 +1736,7 @@ fn tool_exec_input_config_toml_roundtrip() {
         cwd: "/tmp".to_string(),
         config_toml: None,
         worker_token: None,
+        already_approved: false,
     };
     let json_none = serde_json::to_string(&input_none).unwrap();
     assert!(
@@ -3241,4 +3249,160 @@ fn state_update_response_defaults_empty() {
     assert!(resp.events.is_empty());
     assert_eq!(resp.watermark, 0);
     assert!(!resp.completed);
+}
+
+// ---------------------------------------------------------------------------
+// Tool approval gap tests (render_decision_for_unmatched_command)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod approval_gap_tests {
+    use codex_core::exec_policy::render_decision_for_unmatched_command;
+    use codex_core::ExecPolicyDecision as Decision;
+    use codex_protocol::models::SandboxPermissions;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::protocol::{AskForApproval, SandboxPolicy};
+
+    /// Gap 2: OnFailure should auto-allow unknown (non-dangerous) commands.
+    #[test]
+    fn workflow_shell_decision_onfailure_allows() {
+        let cmd = vec!["cargo".to_string(), "build".to_string()];
+        let sandbox = SandboxPolicy::ReadOnly {
+            access: Default::default(),
+            network_access: false,
+        };
+        let fs_sandbox = FileSystemSandboxPolicy::from(&sandbox);
+
+        let decision = render_decision_for_unmatched_command(
+            AskForApproval::OnFailure,
+            &sandbox,
+            &fs_sandbox,
+            &cmd,
+            SandboxPermissions::default(),
+            false,
+        );
+        assert_eq!(decision, Decision::Allow, "OnFailure should auto-allow non-dangerous commands");
+    }
+
+    /// Gap 3: OnRequest + unrestricted sandbox should auto-allow non-dangerous commands.
+    #[test]
+    fn workflow_shell_decision_onrequest_unrestricted_allows() {
+        let cmd = vec!["cargo".to_string(), "build".to_string()];
+        let sandbox = SandboxPolicy::DangerFullAccess;
+        let fs_sandbox = FileSystemSandboxPolicy::from(&sandbox);
+
+        let decision = render_decision_for_unmatched_command(
+            AskForApproval::OnRequest,
+            &sandbox,
+            &fs_sandbox,
+            &cmd,
+            SandboxPermissions::default(),
+            false,
+        );
+        assert_eq!(decision, Decision::Allow, "OnRequest + DangerFullAccess should auto-allow");
+    }
+
+    /// Gap 4: Dangerous command + Never policy should be Forbidden (not allowed).
+    #[test]
+    fn workflow_shell_decision_dangerous_never_forbidden() {
+        let cmd = vec!["rm".to_string(), "-rf".to_string(), "/".to_string()];
+        let sandbox = SandboxPolicy::ReadOnly {
+            access: Default::default(),
+            network_access: false,
+        };
+        let fs_sandbox = FileSystemSandboxPolicy::from(&sandbox);
+
+        let decision = render_decision_for_unmatched_command(
+            AskForApproval::Never,
+            &sandbox,
+            &fs_sandbox,
+            &cmd,
+            SandboxPermissions::default(),
+            false,
+        );
+        assert_eq!(decision, Decision::Forbidden, "dangerous + Never should be Forbidden");
+    }
+
+    /// Gap 5: Patch auto-approve with DangerFullAccess policy.
+    #[test]
+    fn workflow_patch_decision_onfailure_auto_approves() {
+        use crate::tools::PatchDecision;
+        use crate::tools::workflow_assess_patch_needs_approval;
+
+        let decision = workflow_assess_patch_needs_approval(
+            false, // not empty
+            AskForApproval::OnFailure,
+            &SandboxPolicy::DangerFullAccess,
+        );
+        assert_eq!(decision, PatchDecision::AutoApprove, "OnFailure + DangerFullAccess should auto-approve patch");
+    }
+
+    /// Gap 5: Patch with UnlessTrusted should always ask.
+    #[test]
+    fn workflow_patch_decision_unless_trusted_asks() {
+        use crate::tools::PatchDecision;
+        use crate::tools::workflow_assess_patch_needs_approval;
+
+        let decision = workflow_assess_patch_needs_approval(
+            false,
+            AskForApproval::UnlessTrusted,
+            &SandboxPolicy::DangerFullAccess,
+        );
+        assert_eq!(decision, PatchDecision::AskUser, "UnlessTrusted should always ask for patch approval");
+    }
+
+    /// Empty patch should be rejected.
+    #[test]
+    fn workflow_patch_decision_empty_rejects() {
+        use crate::tools::PatchDecision;
+        use crate::tools::workflow_assess_patch_needs_approval;
+
+        let decision = workflow_assess_patch_needs_approval(
+            true, // empty
+            AskForApproval::OnFailure,
+            &SandboxPolicy::DangerFullAccess,
+        );
+        assert_eq!(decision, PatchDecision::Reject("empty patch"), "empty patch should be rejected");
+    }
+
+    /// ToolExecInput.already_approved field serde roundtrip.
+    #[test]
+    fn tool_exec_input_already_approved_serde() {
+        use crate::types::ToolExecInput;
+
+        // When already_approved is true, it should be serialized.
+        let input = ToolExecInput {
+            tool_name: "shell".to_string(),
+            call_id: "c1".to_string(),
+            arguments: "{}".to_string(),
+            model: "gpt-4o".to_string(),
+            cwd: "/tmp".to_string(),
+            config_toml: None,
+            worker_token: None,
+            already_approved: true,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("already_approved"), "already_approved:true should be serialized");
+        let back: ToolExecInput = serde_json::from_str(&json).unwrap();
+        assert!(back.already_approved);
+
+        // When already_approved is false, it should be skipped.
+        let input_false = ToolExecInput {
+            tool_name: "shell".to_string(),
+            call_id: "c2".to_string(),
+            arguments: "{}".to_string(),
+            model: "gpt-4o".to_string(),
+            cwd: "/tmp".to_string(),
+            config_toml: None,
+            worker_token: None,
+            already_approved: false,
+        };
+        let json_false = serde_json::to_string(&input_false).unwrap();
+        assert!(!json_false.contains("already_approved"), "already_approved:false should be skipped");
+
+        // Old JSON without already_approved should default to false.
+        let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
+        let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
+        assert!(!back_old.already_approved, "missing already_approved should default to false");
+    }
 }
