@@ -459,12 +459,23 @@ impl ToolCallHandler for TemporalToolHandler {
                 return Ok(output.into_response_input_item());
             }
 
-            // Determine whether this call needs user approval based on a
-            // three-tier safety classification (mirrors codex-core exec_policy):
-            //   1. Safe (is_known_safe_command)  → auto-approve
-            //   2. Dangerous (command_might_be_dangerous) → always prompt
-            //   3. Unknown → defer to policy
-            let needs_approval = if is_known_safe_command(&command) {
+            // Determine whether this call needs user approval.
+            //
+            // In codex-core, only shell commands and apply_patch go through
+            // the approval orchestrator.  All other tools (read_file,
+            // list_dir, grep_files, etc.) execute directly with no approval.
+            // apply_patch is already handled above, so here we only apply the
+            // three-tier shell classification to shell-type tools.
+            let is_shell_tool = matches!(
+                tool_name.as_str(),
+                "shell" | "container.exec" | "local_shell" | "shell_command" | "unified_exec"
+            );
+
+            let needs_approval = if !is_shell_tool {
+                // Non-shell tools (file tools, etc.) never need approval —
+                // matches codex-core where handlers dispatch directly.
+                false
+            } else if is_known_safe_command(&command) {
                 // Known read-only command — safe under any policy.
                 false
             } else if command_might_be_dangerous(&command) {
@@ -472,7 +483,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 // which can't prompt, so the sandbox must handle it).
                 !matches!(approval_policy, AskForApproval::Never)
             } else {
-                // Unknown command — defer to policy.
+                // Unknown shell command — defer to policy.
                 match approval_policy {
                     AskForApproval::Never => false,
                     AskForApproval::UnlessTrusted
