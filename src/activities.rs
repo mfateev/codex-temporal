@@ -7,11 +7,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::config::ConfigBuilder;
-use codex_core::models_manager::manager::ModelsManager;
+use codex_core::models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::{
-    EventSink, ModelClient, ModelProviderInfo, Prompt, ResponseEvent, Session, StorageBackend,
-    ToolPayload, TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams,
+    AuthManager, EventSink, ModelClient, ModelProviderInfo, Prompt, ResponseEvent, Session,
+    StorageBackend, ToolPayload, TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams,
     built_in_model_providers,
 };
 use codex_core::error::CodexErr;
@@ -19,6 +21,7 @@ use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter, ToolRouter
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_otel::SessionTelemetry;
 use codex_protocol::models::{BaseInstructions, ResponseItem};
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::ThreadId;
 use futures::StreamExt;
@@ -32,8 +35,8 @@ use crate::sink::BufferEventSink;
 use crate::storage::InMemoryStorage;
 use crate::types::{
     ConfigOutput, McpDiscoverInput, McpDiscoverOutput, McpToolCallInput, McpToolCallOutput,
-    ModelCallInput, ModelCallOutput, ProjectContextOutput, ResolveRoleConfigInput,
-    ResolveRoleConfigOutput, ToolExecInput, ToolExecOutput,
+    ModelCallInput, ModelCallOutput, ProjectContextOutput, ResolveModelInfoInput,
+    ResolveRoleConfigInput, ResolveRoleConfigOutput, ToolExecInput, ToolExecOutput,
 };
 
 /// Resolve the model provider to use for the activity.
@@ -67,6 +70,11 @@ fn resolve_provider() -> ModelProviderInfo {
 /// Activity implementations for the codex workflow.
 pub struct CodexActivities {
     provider: ModelProviderInfo,
+    /// Auth manager for model API calls (uses API-key from env, ephemeral store).
+    /// Held here to keep the `Arc` alive for `ModelsManager`.
+    _auth_manager: Arc<AuthManager>,
+    /// Models manager backed by bundled catalog + API refresh.
+    models_manager: Arc<ModelsManager>,
     /// Persistent MCP server connections (initialized via `discover_mcp_tools`).
     mcp_manager: Arc<Mutex<HarnessMcpManager>>,
     /// Worker-issued token for activity-level authentication.
@@ -85,8 +93,25 @@ impl Default for CodexActivities {
 impl CodexActivities {
     /// Create a new `CodexActivities` with the provider resolved once.
     pub fn new() -> Self {
+        let provider = resolve_provider();
+        let codex_home = codex_core::config::find_codex_home()
+            .unwrap_or_else(|_| PathBuf::from("/tmp/codex-temporal"));
+        let auth_manager = Arc::new(AuthManager::new(
+            codex_home.clone(),
+            /* enable_codex_api_key_env */ true,
+            AuthCredentialsStoreMode::Ephemeral,
+        ));
+        let models_manager = Arc::new(ModelsManager::new_with_provider(
+            codex_home,
+            Arc::clone(&auth_manager),
+            /* model_catalog */ None,
+            CollaborationModesConfig::default(),
+            provider.clone(),
+        ));
         Self {
-            provider: resolve_provider(),
+            provider,
+            _auth_manager: auth_manager,
+            models_manager,
             mcp_manager: Arc::new(Mutex::new(HarnessMcpManager::new())),
             worker_token: uuid::Uuid::new_v4().to_string(),
         }
@@ -533,6 +558,41 @@ impl CodexActivities {
 
         Ok(output)
     }
+
+    /// Resolve model metadata from the API (with bundled catalog fallback).
+    ///
+    /// Refreshes the model catalog from the `/models` API (if not already
+    /// cached), then looks up the specified model. Returns full `ModelInfo`
+    /// with `apply_patch_tool_type`, `experimental_supported_tools`, etc.
+    #[activity]
+    pub async fn resolve_model_info(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: ResolveModelInfoInput,
+    ) -> Result<ModelInfo, ActivityError> {
+        tracing::debug!(model = %input.model, "resolve_model_info activity invoked");
+
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let config = config_from_toml(&input.config_toml, &cwd, None)
+            .map_err(|e| anyhow::anyhow!("config parse failed: {e}"))?;
+
+        // Refresh from API (uses bundled catalog as fallback on failure).
+        let _ = self
+            .models_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
+
+        let model_info = self.models_manager.get_model_info(&input.model, &config).await;
+
+        tracing::debug!(
+            model = %model_info.slug,
+            apply_patch = ?model_info.apply_patch_tool_type,
+            experimental_tools = model_info.experimental_supported_tools.len(),
+            "model info resolved"
+        );
+
+        Ok(model_info)
+    }
 }
 
 /// Convert a [`CodexErr`] into the appropriate [`ActivityError`] variant.
@@ -603,10 +663,9 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
     let config = Arc::new(config);
 
-    // Resolve model info.
-    let model_slug = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-    let model_info =
-        ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
+    // Resolve model info from the bundled catalog.
+    let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
+    let model_info = ModelsManager::resolve_from_bundled_catalog(&model_slug, &config);
 
     // Build the tool router with all standard tools enabled.
     let sandbox_policy = config.permissions.sandbox_policy.get();

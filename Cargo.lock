@@ -527,7 +527,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "unicode-ident",
- "winnow",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -1070,10 +1070,11 @@ dependencies = [
 
 [[package]]
 name = "borsh"
-version = "1.6.0"
+version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1da5ab77c1437701eeff7c88d968729e7766172279eab0676857b3d63af7a6f"
+checksum = "cfd1e3f8955a5d7de9fab72fc8373fade9fb8a703968cb200ae3dc6cf08e185a"
 dependencies = [
+ "bytes",
  "cfg_aliases 0.2.1",
 ]
 
@@ -1402,7 +1403,6 @@ checksum = "e9b18233253483ce2f65329a24072ec414db782531bdbb7d0bbc4bd2ce6b7e21"
 [[package]]
 name = "codex-ansi-escape"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "ansi-to-tui",
  "ratatui",
@@ -1412,7 +1412,6 @@ dependencies = [
 [[package]]
 name = "codex-api"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1437,7 +1436,6 @@ dependencies = [
 [[package]]
 name = "codex-app-server"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1462,7 +1460,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-cli",
  "codex-utils-json-to-toml",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0",
  "futures",
  "owo-colors",
  "serde",
@@ -1482,7 +1480,6 @@ dependencies = [
 [[package]]
 name = "codex-app-server-client"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-app-server",
  "codex-app-server-protocol",
@@ -1503,7 +1500,6 @@ dependencies = [
 [[package]]
 name = "codex-app-server-protocol"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "clap",
@@ -1527,7 +1523,6 @@ dependencies = [
 [[package]]
 name = "codex-apply-patch"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "similar",
@@ -1539,7 +1534,6 @@ dependencies = [
 [[package]]
 name = "codex-arg0"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
@@ -1554,7 +1548,6 @@ dependencies = [
 [[package]]
 name = "codex-artifacts"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-package-manager",
  "reqwest",
@@ -1570,7 +1563,6 @@ dependencies = [
 [[package]]
 name = "codex-async-utils"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1580,7 +1572,6 @@ dependencies = [
 [[package]]
 name = "codex-backend-client"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "codex-backend-openapi-models",
@@ -1595,7 +1586,6 @@ dependencies = [
 [[package]]
 name = "codex-backend-openapi-models"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "serde",
  "serde_json",
@@ -1605,7 +1595,6 @@ dependencies = [
 [[package]]
 name = "codex-chatgpt"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "clap",
@@ -1622,7 +1611,6 @@ dependencies = [
 [[package]]
 name = "codex-client"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1648,7 +1636,6 @@ dependencies = [
 [[package]]
 name = "codex-cloud-requirements"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1670,7 +1657,6 @@ dependencies = [
 [[package]]
 name = "codex-config"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-app-server-protocol",
  "codex-execpolicy",
@@ -1692,7 +1678,6 @@ dependencies = [
 [[package]]
 name = "codex-connectors"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "codex-app-server-protocol",
@@ -1703,7 +1688,6 @@ dependencies = [
 [[package]]
 name = "codex-core"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1741,7 +1725,7 @@ dependencies = [
  "codex-utils-cache",
  "codex-utils-home-dir",
  "codex-utils-image",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0",
  "codex-utils-readiness",
  "codex-utils-stream-parser",
  "codex-utils-string",
@@ -1799,7 +1783,6 @@ dependencies = [
 [[package]]
 name = "codex-execpolicy"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "clap",
@@ -1815,7 +1798,6 @@ dependencies = [
 [[package]]
 name = "codex-experimental-api-macros"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1825,7 +1807,6 @@ dependencies = [
 [[package]]
 name = "codex-feedback"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "codex-protocol",
@@ -1837,7 +1818,6 @@ dependencies = [
 [[package]]
 name = "codex-file-search"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "clap",
@@ -1852,7 +1832,6 @@ dependencies = [
 [[package]]
 name = "codex-git"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "once_cell",
  "regex",
@@ -1867,7 +1846,6 @@ dependencies = [
 [[package]]
 name = "codex-hooks"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1884,7 +1862,6 @@ dependencies = [
 [[package]]
 name = "codex-keyring-store"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "keyring",
  "tracing",
@@ -1893,7 +1870,6 @@ dependencies = [
 [[package]]
 name = "codex-linux-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "cc",
  "clap",
@@ -1912,7 +1888,6 @@ dependencies = [
 [[package]]
 name = "codex-lmstudio"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-core",
  "reqwest",
@@ -1925,7 +1900,6 @@ dependencies = [
 [[package]]
 name = "codex-login"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1948,7 +1922,6 @@ dependencies = [
 [[package]]
 name = "codex-network-proxy"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1978,7 +1951,6 @@ dependencies = [
 [[package]]
 name = "codex-ollama"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "async-stream",
  "bytes",
@@ -1995,7 +1967,6 @@ dependencies = [
 [[package]]
 name = "codex-otel"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "chrono",
  "codex-api",
@@ -2026,7 +1997,6 @@ dependencies = [
 [[package]]
 name = "codex-package-manager"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "fd-lock",
  "flate2",
@@ -2044,7 +2014,6 @@ dependencies = [
 [[package]]
 name = "codex-protocol"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-execpolicy",
  "codex-git",
@@ -2069,7 +2038,6 @@ dependencies = [
 [[package]]
 name = "codex-rmcp-client"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "axum",
@@ -2077,7 +2045,7 @@ dependencies = [
  "codex-keyring-store",
  "codex-protocol",
  "codex-utils-home-dir",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0",
  "futures",
  "keyring",
  "oauth2",
@@ -2100,7 +2068,6 @@ dependencies = [
 [[package]]
 name = "codex-secrets"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "age",
  "anyhow",
@@ -2118,7 +2085,6 @@ dependencies = [
 [[package]]
 name = "codex-shell-command"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "base64 0.22.1",
  "codex-protocol",
@@ -2137,7 +2103,6 @@ dependencies = [
 [[package]]
 name = "codex-shell-escalation"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2157,7 +2122,6 @@ dependencies = [
 [[package]]
 name = "codex-skills"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-utils-absolute-path",
  "include_dir",
@@ -2167,7 +2131,6 @@ dependencies = [
 [[package]]
 name = "codex-state"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2200,7 +2163,7 @@ dependencies = [
  "codex-rmcp-client",
  "codex-shell-command",
  "codex-tui",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0 (git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal)",
  "color-eyre",
  "crossterm",
  "futures",
@@ -2228,7 +2191,6 @@ dependencies = [
 [[package]]
 name = "codex-tui"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2314,7 +2276,6 @@ dependencies = [
 [[package]]
 name = "codex-tui-app-server"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2397,7 +2358,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-absolute-path"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "dirs",
  "path-absolutize",
@@ -2409,7 +2369,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-approval-presets"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-protocol",
 ]
@@ -2417,7 +2376,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-cache"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "lru 0.16.3",
  "sha1",
@@ -2427,7 +2385,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-cargo-bin"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "assert_cmd",
  "runfiles",
@@ -2437,7 +2394,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-cli"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "clap",
  "codex-protocol",
@@ -2448,17 +2404,14 @@ dependencies = [
 [[package]]
 name = "codex-utils-elapsed"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 
 [[package]]
 name = "codex-utils-fuzzy-match"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 
 [[package]]
 name = "codex-utils-home-dir"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "dirs",
 ]
@@ -2466,7 +2419,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-image"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "base64 0.22.1",
  "codex-utils-cache",
@@ -2478,7 +2430,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-json-to-toml"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -2487,7 +2438,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-oss"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-core",
  "codex-lmstudio",
@@ -2497,7 +2447,22 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
+dependencies = [
+ "anyhow",
+ "filedescriptor",
+ "lazy_static",
+ "libc",
+ "log",
+ "portable-pty",
+ "shared_library",
+ "tokio",
+ "winapi",
+]
+
+[[package]]
+name = "codex-utils-pty"
+version = "0.0.0"
+source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#199e5adebbc82c04cdf210574ddb9aae6808745a"
 dependencies = [
  "anyhow",
  "filedescriptor",
@@ -2513,7 +2478,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-readiness"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -2524,7 +2488,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-rustls-provider"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "rustls",
 ]
@@ -2532,7 +2495,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-sandbox-summary"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "codex-core",
  "codex-protocol",
@@ -2541,7 +2503,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-sleep-inhibitor"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "core-foundation 0.9.4",
  "libc",
@@ -2552,12 +2513,10 @@ dependencies = [
 [[package]]
 name = "codex-utils-stream-parser"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 
 [[package]]
 name = "codex-utils-string"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "regex-lite",
 ]
@@ -2565,14 +2524,13 @@ dependencies = [
 [[package]]
 name = "codex-windows-sandbox"
 version = "0.0.0"
-source = "git+https://github.com/mfateev/codex.git?branch=task%2Fcodex-temporal#ab69497833863993810df8ea4188303360b6ce61"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "codex-protocol",
  "codex-utils-absolute-path",
- "codex-utils-pty",
+ "codex-utils-pty 0.0.0",
  "codex-utils-string",
  "dirs-next",
  "dunce",
@@ -6934,7 +6892,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit 0.25.4+spec-1.1.0",
+ "toml_edit 0.25.5+spec-1.1.0",
 ]
 
 [[package]]
@@ -10116,7 +10074,7 @@ dependencies = [
  "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
- "winnow",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -10139,9 +10097,9 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "1.0.0+spec-1.1.0"
+version = "1.0.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32c2555c699578a4f59f0cc68e5116c8d7cabbd45e1409b989d4be085b53f13e"
+checksum = "9b320e741db58cac564e26c607d3cc1fdc4a88fd36c879568c07856ed83ff3e9"
 dependencies = [
  "serde_core",
 ]
@@ -10157,7 +10115,7 @@ dependencies = [
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
  "toml_write",
- "winnow",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -10170,28 +10128,28 @@ dependencies = [
  "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
- "winnow",
+ "winnow 0.7.15",
 ]
 
 [[package]]
 name = "toml_edit"
-version = "0.25.4+spec-1.1.0"
+version = "0.25.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7193cbd0ce53dc966037f54351dbbcf0d5a642c7f0038c382ef9e677ce8c13f2"
+checksum = "8ca1a40644a28bce036923f6a431df0b34236949d111cc07cb6dca830c9ef2e1"
 dependencies = [
  "indexmap 2.13.0",
- "toml_datetime 1.0.0+spec-1.1.0",
+ "toml_datetime 1.0.1+spec-1.1.0",
  "toml_parser",
- "winnow",
+ "winnow 1.0.0",
 ]
 
 [[package]]
 name = "toml_parser"
-version = "1.0.9+spec-1.1.0"
+version = "1.0.10+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "702d4415e08923e7e1ef96cd5727c0dfed80b4d2fa25db9647fe5eb6f7c5a4c4"
+checksum = "7df25b4befd31c4816df190124375d5a20c6b6921e2cad937316de3fccd63420"
 dependencies = [
- "winnow",
+ "winnow 1.0.0",
 ]
 
 [[package]]
@@ -10202,9 +10160,9 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
-version = "1.0.6+spec-1.1.0"
+version = "1.0.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab16f14aed21ee8bfd8ec22513f7287cd4a91aa92e44edfe2c17ddd004e92607"
+checksum = "f17aaa1c6e3dc22b1da4b6bba97d066e354c7945cac2f7852d4e4e7ca7a6b56d"
 
 [[package]]
 name = "tonic"
@@ -11809,6 +11767,15 @@ name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a90e88e4667264a994d34e6d1ab2d26d398dcdca8b7f52bec8668957517fc7d8"
 dependencies = [
  "memchr",
 ]

@@ -230,10 +230,8 @@ async fn turn_context_new_minimal_creates_usable_context() {
         .expect("config");
     let config = Arc::new(config);
 
-    let model_slug = codex_core::models_manager::manager::ModelsManager::get_model_offline_for_tests(
-        config.model.as_deref(),
-    );
-    let model_info = codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+    let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
+    let model_info = codex_core::models_manager::manager::ModelsManager::resolve_from_bundled_catalog(
         &model_slug,
         &config,
     );
@@ -1087,9 +1085,9 @@ async fn dispatch_with_experimental_tools(
     config.cwd = std::path::PathBuf::from("/tmp");
     let config = Arc::new(config);
 
-    let model_slug = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
+    let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
     let mut model_info =
-        ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
+        ModelsManager::resolve_from_bundled_catalog(&model_slug, &config);
 
     // Inject experimental tools into model_info so ToolsConfig picks them up.
     model_info.experimental_supported_tools = extra_tools.iter().map(|s| s.to_string()).collect();
@@ -1622,7 +1620,7 @@ fn model_call_input_provider_roundtrips() {
         tools: vec![],
         parallel_tool_calls: false,
         instructions: "test".to_string(),
-        model_info: codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+        model_info: codex_core::models_manager::manager::ModelsManager::resolve_from_bundled_catalog(
             "gpt-4o",
             &codex_core::config::Config::for_harness(std::path::PathBuf::from("/tmp/codex-test")).unwrap(),
         ),
@@ -1651,7 +1649,7 @@ fn model_call_input_provider_defaults_to_none() {
         tools: vec![],
         parallel_tool_calls: false,
         instructions: "t".to_string(),
-        model_info: codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+        model_info: codex_core::models_manager::manager::ModelsManager::resolve_from_bundled_catalog(
             "gpt-4o",
             &codex_core::config::Config::for_harness(std::path::PathBuf::from("/tmp/codex-test")).unwrap(),
         ),

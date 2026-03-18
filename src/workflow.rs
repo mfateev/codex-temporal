@@ -53,8 +53,8 @@ use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
-    PendingPatchApproval, PendingUserInput, ProjectContextOutput, StateUpdateRequest,
-    StateUpdateResponse, UserTurnInput,
+    PendingPatchApproval, PendingUserInput, ProjectContextOutput, ResolveModelInfoInput,
+    StateUpdateRequest, StateUpdateResponse, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -610,9 +610,24 @@ impl AgentWorkflow {
         let config = Arc::new(config);
 
         // --- model info ---
-        let model_slug = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-        let model_info =
-            ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
+        // Resolve model metadata via activity (API-backed with bundled fallback).
+        let model_info = ctx
+            .start_activity(
+                CodexActivities::resolve_model_info,
+                ResolveModelInfoInput {
+                    model: input.model.clone(),
+                    config_toml: config_output.config_toml.clone(),
+                },
+                ActivityOptions {
+                    schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("resolve_model_info failed: {e} — falling back to bundled catalog");
+                ModelsManager::resolve_from_bundled_catalog(&input.model, &config)
+            });
 
         // --- session ---
         let conversation_id = ThreadId::new();

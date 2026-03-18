@@ -162,6 +162,19 @@ pub struct ConfigOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Model info resolution activity I/O
+// ---------------------------------------------------------------------------
+
+/// Input to the `resolve_model_info` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveModelInfoInput {
+    /// Model slug to resolve (e.g. "gpt-4o").
+    pub model: String,
+    /// Merged config TOML string (needed for config-based overrides).
+    pub config_toml: String,
+}
+
+// ---------------------------------------------------------------------------
 // MCP discovery activity I/O
 // ---------------------------------------------------------------------------
 
