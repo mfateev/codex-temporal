@@ -799,7 +799,15 @@ impl codex_core::AgentSession for TemporalAgentSession {
             }
 
             // Wait for the watcher or submit logic to push events.
-            self.event_notify.notified().await;
+            // Use a 1-second timeout so that callers whose own timeout
+            // deadline is checked outside of this function (e.g. the e2e
+            // test loops that call `next_event` in a loop with a manual
+            // `Instant::now() > deadline` guard) are not blocked forever
+            // when the watcher is in a persistent error-stall state.
+            tokio::select! {
+                _ = self.event_notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
         }
     }
 }

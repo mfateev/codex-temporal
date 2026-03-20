@@ -684,9 +684,17 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
         c
     };
     config.model = Some(input.model.clone());
-    // Approval is handled at the workflow level by TemporalToolHandler, so
-    // the activity itself runs with no approval prompts. Sandbox policy comes
-    // from the user's config.toml (or defaults to read-only).
+    // When the workflow already obtained user approval, override the config's
+    // approval_policy to OnRequest so codex-core tool handlers (e.g.
+    // exec_command with sandbox_permissions=require_escalated) don't re-check
+    // and reject the command.  Approval was already granted at the workflow
+    // level by TemporalToolHandler.
+    if input.already_approved {
+        let _ = config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::OnRequest);
+    }
     // --- Activity-side approval gate ---
     // When the workflow did NOT already obtain user approval, the activity
     // acts as a second gate using the full execpolicy pipeline (which has

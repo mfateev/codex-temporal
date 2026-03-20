@@ -455,8 +455,10 @@ async fn tui_startup_and_shutdown() {
 }
 
 async fn tui_startup_and_shutdown_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping PTY TUI test");
+        return;
+    }
 
     // --- Start ephemeral Temporal server + worker ---
     let _server = start_ephemeral_server().await;
@@ -582,8 +584,10 @@ async fn tui_session_reconnect() {
 }
 
 async fn tui_session_reconnect_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping PTY TUI test");
+        return;
+    }
 
     // --- Start ephemeral Temporal server + worker ---
     let _server = start_ephemeral_server().await;
@@ -784,8 +788,10 @@ async fn tui_session_switch() {
 }
 
 async fn tui_session_switch_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping PTY TUI test");
+        return;
+    }
 
     // --- Start ephemeral Temporal server + worker ---
     let _server = start_ephemeral_server().await;
@@ -1042,8 +1048,10 @@ async fn tui_tool_approval() {
 }
 
 async fn tui_tool_approval_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping PTY TUI test");
+        return;
+    }
 
     // --- Start ephemeral Temporal server + worker ---
     let _server = start_ephemeral_server().await;
@@ -1193,8 +1201,10 @@ async fn tui_apply_patch_approval() {
 }
 
 async fn tui_apply_patch_approval_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping PTY TUI test");
+        return;
+    }
 
     // --- Set up CODEX_HOME with apply_patch enabled ---
     // The apply_patch tool is gated behind the ApplyPatchFreeform feature
@@ -1377,8 +1387,10 @@ async fn tui_request_user_input() {
 }
 
 async fn tui_request_user_input_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping PTY TUI test");
+        return;
+    }
 
     // --- Start ephemeral Temporal server + worker ---
     let _server = start_ephemeral_server().await;

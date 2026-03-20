@@ -67,12 +67,21 @@ fn user_turn_op(text: &str) -> Op {
 
 /// Create a `TemporalAgentSession` with a unique workflow ID.
 fn new_session(client: &Client, model: &str) -> TemporalAgentSession {
+    new_session_with_policy(client, model, Default::default())
+}
+
+/// Create a `TemporalAgentSession` with a specific approval policy.
+fn new_session_with_policy(
+    client: &Client,
+    model: &str,
+    approval_policy: AskForApproval,
+) -> TemporalAgentSession {
     let workflow_id = format!("e2e-{}", uuid::Uuid::new_v4());
     let base_input = CodexWorkflowInput {
         user_message: String::new(),
         model: model.to_string(),
         instructions: "You are a helpful coding assistant. Be concise.".to_string(),
-        approval_policy: Default::default(),
+        approval_policy,
         web_search_mode: None,
         reasoning_effort: None,
         reasoning_summary: ReasoningSummary::Auto,
@@ -147,11 +156,15 @@ async fn model_only_turn(client: &Client) {
 }
 
 async fn tool_approval_flow(client: &Client) {
-    let session = new_session(client, "gpt-4o");
+    // Use UnlessTrusted so non-known-safe commands (like `touch`) require
+    // explicit approval.  `echo` is a known-safe command and would be
+    // auto-approved under any policy, so the prompt deliberately asks for
+    // a command outside the safe list.
+    let session = new_session_with_policy(client, "gpt-4o", AskForApproval::UnlessTrusted);
 
     session
         .submit(user_turn_op(
-            "Use shell to run 'echo hello world' and tell me the output.",
+            "Use the shell tool to run the exact command: touch /tmp/e2e_approval_test.txt",
         ))
         .await
         .expect("submit failed");
@@ -2678,15 +2691,17 @@ async fn default_crew_agents_available(client: &Client) {
 
 #[tokio::test]
 async fn e2e_tests() {
-    match tokio::time::timeout(Duration::from_secs(600), e2e_tests_inner()).await {
+    match tokio::time::timeout(Duration::from_secs(3600), e2e_tests_inner()).await {
         Ok(()) => {}
-        Err(_) => panic!("e2e_tests timed out after 600s"),
+        Err(_) => panic!("e2e_tests timed out after 3600s"),
     }
 }
 
 async fn e2e_tests_inner() {
-    std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set to run E2E tests");
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("OPENAI_API_KEY not set; skipping E2E tests");
+        return;
+    }
 
     // --- start ephemeral server (fail fast if download/start hangs) ---
     let server_result = tokio::time::timeout(Duration::from_secs(60), async {

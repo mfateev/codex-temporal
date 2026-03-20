@@ -138,14 +138,24 @@ impl ToolCallHandler for TemporalToolHandler {
         let is_dynamic_tool = self.dynamic_tool_names.contains(&tool_name);
 
         // Parse command from arguments for the approval request event.
+        // Handles both `shell`-style {"command": [...]} and
+        // `exec_command`-style {"cmd": "..."} argument formats.
         let command: Vec<String> = serde_json::from_str(&arguments)
             .ok()
             .and_then(|v: serde_json::Value| {
-                v.get("command")?
-                    .as_array()?
-                    .iter()
-                    .map(|v| v.as_str().map(String::from))
-                    .collect()
+                // `shell` tool uses {"command": ["cmd", "arg", ...]}
+                if let Some(arr) = v.get("command").and_then(|c| c.as_array()) {
+                    let items: Option<Vec<String>> = arr
+                        .iter()
+                        .map(|v| v.as_str().map(String::from))
+                        .collect();
+                    return items;
+                }
+                // `exec_command` uses {"cmd": "cmd arg ..."}
+                if let Some(cmd_str) = v.get("cmd").and_then(|c| c.as_str()) {
+                    return Some(cmd_str.split_whitespace().map(String::from).collect());
+                }
+                None
             })
             .unwrap_or_else(|| vec![arguments.clone()]);
 
@@ -510,7 +520,12 @@ impl ToolCallHandler for TemporalToolHandler {
             // three-tier shell classification to shell-type tools.
             let is_shell_tool = matches!(
                 tool_name.as_str(),
-                "shell" | "container.exec" | "local_shell" | "shell_command" | "unified_exec"
+                "shell"
+                    | "container.exec"
+                    | "local_shell"
+                    | "shell_command"
+                    | "unified_exec"
+                    | "exec_command"
             );
 
             // Determine approval requirement using codex-core's
