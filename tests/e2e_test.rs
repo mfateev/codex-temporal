@@ -2698,10 +2698,7 @@ async fn e2e_tests() {
 }
 
 async fn e2e_tests_inner() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping E2E tests");
-        return;
-    }
+    std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set to run E2E tests");
 
     // --- start ephemeral server (fail fast if download/start hangs) ---
     let server_result = tokio::time::timeout(Duration::from_secs(60), async {

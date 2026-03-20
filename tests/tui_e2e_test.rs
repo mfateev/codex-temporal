@@ -107,10 +107,7 @@ async fn tui_session_smoke_test() {
 }
 
 async fn tui_session_smoke_test_inner() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("OPENAI_API_KEY not set; skipping TUI E2E test");
-        return;
-    }
+    std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set to run TUI E2E tests");
 
     // --- Start ephemeral Temporal server ---
     let server_result = tokio::time::timeout(Duration::from_secs(60), async {
