@@ -33,6 +33,40 @@ use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 const TASK_QUEUE: &str = "codex-temporal";
 
+/// Return the path to the temporal CLI binary that the SDK downloads to temp_dir.
+fn temporal_cli() -> std::path::PathBuf {
+    std::env::temp_dir().join("temporal-sdk-rust-0.1.0")
+}
+
+/// Kill **all** orphaned ephemeral Temporal server processes by walking `/proc`.
+fn cleanup_all_leaked_servers() {
+    let temporal_exe = temporal_cli();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut killed = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let exe_link = entry.path().join("exe");
+        if let Ok(exe) = std::fs::read_link(&exe_link) {
+            if exe == temporal_exe {
+                let pid_str = name_str.to_string();
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid_str])
+                    .output();
+                killed += 1;
+            }
+        }
+    }
+    if killed > 0 {
+        eprintln!("  [server] killed {killed} orphaned ephemeral Temporal server(s)");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Infrastructure
 // ---------------------------------------------------------------------------
@@ -100,14 +134,14 @@ async fn drain_shutdown(session: &TemporalAgentSession) {
 
 #[tokio::test]
 async fn tui_session_smoke_test() {
-    match tokio::time::timeout(Duration::from_secs(300), tui_session_smoke_test_inner()).await {
-        Ok(()) => {}
-        Err(_) => panic!("tui_session_smoke_test timed out after 300s"),
-    }
+    tokio::time::timeout(Duration::from_secs(20), tui_session_smoke_test_inner())
+        .await
+        .expect("tui_session_smoke_test timed out after 20s");
 }
 
 async fn tui_session_smoke_test_inner() {
     std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set to run TUI E2E tests");
+    cleanup_all_leaked_servers();
 
     // --- Start ephemeral Temporal server ---
     let server_result = tokio::time::timeout(Duration::from_secs(60), async {

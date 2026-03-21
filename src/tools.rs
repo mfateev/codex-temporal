@@ -123,9 +123,22 @@ impl ToolCallHandler for TemporalToolHandler {
         let sandbox_policy = self.sandbox_policy.clone();
         let file_system_sandbox_policy = self.file_system_sandbox_policy.clone();
 
-        let arguments = match &call.payload {
-            codex_core::ToolPayload::Function { arguments } => arguments.clone(),
-            other => format!("{other:?}"),
+        let (arguments, payload_kind) = match &call.payload {
+            codex_core::ToolPayload::Function { arguments } => {
+                (arguments.clone(), "function".to_string())
+            }
+            codex_core::ToolPayload::Custom { input } => {
+                (input.clone(), "custom".to_string())
+            }
+            codex_core::ToolPayload::Mcp { raw_arguments, .. } => {
+                (raw_arguments.clone(), "mcp".to_string())
+            }
+            codex_core::ToolPayload::LocalShell { params } => {
+                (params.command.join(" "), "local_shell".to_string())
+            }
+            codex_core::ToolPayload::ToolSearch { arguments } => {
+                (arguments.query.clone(), "tool_search".to_string())
+            }
         };
 
         let call_id = call.call_id.clone();
@@ -485,6 +498,7 @@ impl ToolCallHandler for TemporalToolHandler {
                     config_toml,
                     worker_token,
                     already_approved,
+                    payload_kind: payload_kind.clone(),
                 };
 
                 let opts = ActivityOptions {
@@ -646,6 +660,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 config_toml,
                 worker_token,
                 already_approved: needs_approval,
+                payload_kind: payload_kind.clone(),
             };
 
             let opts = ActivityOptions {

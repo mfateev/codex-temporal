@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use serial_test::serial;
 use tokio::select;
 use tokio::time::timeout;
 
@@ -33,6 +32,16 @@ use temporalio_sdk_core::ephemeral_server::{TemporalDevServerConfig, default_cac
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 
 const TASK_QUEUE: &str = "codex-temporal";
+
+/// Return the path to the temporal CLI binary that the SDK downloads to temp_dir.
+///
+/// The SDK (temporalio_sdk_core::ephemeral_server::default_cached_download) downloads
+/// the Temporal CLI to `{temp_dir}/temporal-sdk-rust-{sdk_version}`.  The binary is
+/// NOT added to PATH, so callers must use the full path.
+fn temporal_cli() -> std::path::PathBuf {
+    // Keep in sync with the sdk_name/sdk_version in default_cached_download().
+    std::env::temp_dir().join("temporal-sdk-rust-0.1.0")
+}
 
 /// Connect a Temporal client and search the decoded payload data of a
 /// workflow's history events for the given needle strings.
@@ -208,11 +217,46 @@ fn cleanup_leaked_server() {
     }
 }
 
+/// Kill **all** orphaned ephemeral Temporal server processes.
+///
+/// The SDK's `EphemeralServer` has no `Drop` impl, so if tests panic, time
+/// out, or are killed, the server processes accumulate.  This function walks
+/// `/proc` and kills every process whose exe is the temporal CLI binary that
+/// the SDK downloads.
+fn cleanup_all_leaked_servers() {
+    let temporal_exe = temporal_cli();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut killed = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let exe_link = entry.path().join("exe");
+        if let Ok(exe) = std::fs::read_link(&exe_link) {
+            if exe == temporal_exe {
+                let pid_str = name_str.to_string();
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid_str])
+                    .output();
+                killed += 1;
+            }
+        }
+    }
+    if killed > 0 {
+        eprintln!("  [server] killed {killed} orphaned ephemeral Temporal server(s)");
+    }
+}
+
 /// Start an ephemeral Temporal dev server, wrapped in a [`ServerGuard`]
 /// that kills it on drop.  Any previously leaked server is cleaned up
 /// first.
 async fn start_ephemeral_server() -> ServerGuard {
     std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set to run PTY TUI tests");
+    cleanup_all_leaked_servers();
     cleanup_leaked_server();
 
     let server_result = timeout(Duration::from_secs(60), async {
@@ -435,24 +479,37 @@ fn setup_codex_home() -> tempfile::TempDir {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Verify that the `codex-temporal-tui` binary starts up, renders its TUI,
-/// and exits cleanly when interrupted with Ctrl+C.
-///
-/// This is the equivalent of codex's `no_panic_on_startup` test — it confirms
-/// the full binary lifecycle (connect to Temporal, initialize TUI, shutdown)
-/// works end-to-end through a real pseudo-terminal.
 #[tokio::test]
-#[serial]
-async fn tui_startup_and_shutdown() {
-    match timeout(
-        Duration::from_secs(300),
-        tui_startup_and_shutdown_inner(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => panic!("tui_startup_and_shutdown timed out after 300s"),
-    }
+async fn tui_pty_tests() {
+    eprintln!("--- test: tui_startup_and_shutdown ---");
+    timeout(Duration::from_secs(20), tui_startup_and_shutdown_inner())
+        .await
+        .expect("tui_startup_and_shutdown timed out after 20s");
+
+    eprintln!("--- test: tui_session_reconnect ---");
+    timeout(Duration::from_secs(30), tui_session_reconnect_inner())
+        .await
+        .expect("tui_session_reconnect timed out after 30s");
+
+    eprintln!("--- test: tui_session_switch ---");
+    timeout(Duration::from_secs(30), tui_session_switch_inner())
+        .await
+        .expect("tui_session_switch timed out after 30s");
+
+    eprintln!("--- test: tui_tool_approval ---");
+    timeout(Duration::from_secs(20), tui_tool_approval_inner())
+        .await
+        .expect("tui_tool_approval timed out after 20s");
+
+    eprintln!("--- test: tui_apply_patch_approval ---");
+    timeout(Duration::from_secs(150), tui_apply_patch_approval_inner())
+        .await
+        .expect("tui_apply_patch_approval timed out after 150s");
+
+    eprintln!("--- test: tui_request_user_input ---");
+    timeout(Duration::from_secs(30), tui_request_user_input_inner())
+        .await
+        .expect("tui_request_user_input timed out after 30s");
 }
 
 async fn tui_startup_and_shutdown_inner() {
@@ -499,60 +556,63 @@ async fn tui_startup_and_shutdown_inner() {
 // Session reconnect test
 // ---------------------------------------------------------------------------
 
-/// Use the `temporal` CLI to list SessionWorkflow executions and extract
+/// Use the `temporal` CLI to list all workflow executions and extract
 /// a workflow ID matching the `codex-tui-` prefix.
 ///
-/// Uses JSON output (`-o json`) for reliable parsing.
+/// Retries up to 5 times with 500 ms between attempts to account for
+/// Temporal visibility lag (the workflow start gRPC call may still be
+/// in-flight when the TUI exits).
 async fn find_session_workflow_id(server_target: &str) -> Option<String> {
-    let output = tokio::process::Command::new("temporal")
-        .args([
-            "workflow",
-            "list",
-            "--address",
-            server_target,
-            "--query",
-            "WorkflowType='SessionWorkflow'",
-            "--limit",
-            "10",
-            "-o",
-            "json",
-        ])
-        .output()
-        .await
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    // Each line is a JSON object with a "workflowExecutionInfo" containing
-    // "execution.workflowId". Parse line by line (jsonl format).
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    for attempt in 0..5u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            // Try nested path: workflowExecutionInfo.execution.workflowId
-            let wf_id = val
-                .pointer("/workflowExecutionInfo/execution/workflowId")
-                .or_else(|| val.pointer("/execution/workflowId"))
-                .or_else(|| val.get("workflowId"))
-                .and_then(|v| v.as_str());
-            if let Some(id) = wf_id
-                && id.starts_with("codex-tui-")
-            {
-                return Some(id.to_string());
+        let output = tokio::process::Command::new(temporal_cli())
+            .args([
+                "workflow",
+                "list",
+                "--address",
+                server_target,
+                "--limit",
+                "20",
+                "-o",
+                "json",
+            ])
+            .output()
+            .await
+            .ok();
+
+        let Some(output) = output else { continue };
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        // Each line is a JSON object; search for a codex-tui-* workflowId.
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-        }
-    }
-    // Fallback: search raw text for the pattern.
-    for line in text.lines() {
-        if let Some(pos) = line.find("codex-tui-") {
-            let rest = &line[pos..];
-            // Extract until a non-ID character (whitespace, quote, comma).
-            let id: String = rest
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ',')
-                .collect();
-            if !id.is_empty() {
-                return Some(id);
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                let wf_id = val
+                    .pointer("/workflowExecutionInfo/execution/workflowId")
+                    .or_else(|| val.pointer("/execution/workflowId"))
+                    .or_else(|| val.get("workflowId"))
+                    .and_then(|v| v.as_str());
+                if let Some(id) = wf_id
+                    && id.starts_with("codex-tui-")
+                    && !id.contains('/') // skip child workflows like codex-tui-xxx/main
+                {
+                    return Some(id.to_string());
+                }
+            }
+            // Fallback: raw text scan.
+            if let Some(pos) = line.find("codex-tui-") {
+                let id: String = line[pos..]
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && *c != '"' && *c != ',' && *c != '/')
+                    .collect();
+                if !id.is_empty() {
+                    return Some(id);
+                }
             }
         }
     }
@@ -566,20 +626,6 @@ async fn find_session_workflow_id(server_target: &str) -> Option<String> {
 /// 3. Discover the session workflow ID via `temporal workflow list` CLI.
 /// 4. Run TUI #2 via PTY with `--resume <session_id>` — verify it starts,
 ///    loads the previous session's messages, and exits cleanly under Ctrl+C.
-#[tokio::test]
-#[serial]
-async fn tui_session_reconnect() {
-    match timeout(
-        Duration::from_secs(300),
-        tui_session_reconnect_inner(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => panic!("tui_session_reconnect timed out after 300s"),
-    }
-}
-
 async fn tui_session_reconnect_inner() {
 
     // --- Start ephemeral Temporal server + worker ---
@@ -591,15 +637,15 @@ async fn tui_session_reconnect_inner() {
     let codex_home = setup_codex_home();
     let env = tui_env(&server_target, codex_home.path());
 
-    // --- Run TUI #1: start a new session with a prompt ---
-    // Give the TUI 20 seconds to connect, process the model turn, and render,
-    // then send Ctrl+C.  Allow 60 seconds total for the process to exit.
+    // --- Run TUI #1: start a new session (workflow just needs to be created) ---
+    // 7 seconds gives the TUI time to connect, ensure-harness, and submit
+    // the initial UserTurn (which starts the SessionWorkflow).
     eprintln!("  [reconnect] starting TUI #1 with prompt...");
     let result1 = run_tui_binary(
         &env,
-        &["Say hello in one word".to_string()],
-        Duration::from_secs(20),
-        Duration::from_secs(60),
+        &["hi".to_string()],
+        Duration::from_secs(7),
+        Duration::from_secs(10),
     )
     .await
     .expect("failed to run TUI #1");
@@ -626,14 +672,12 @@ async fn tui_session_reconnect_inner() {
     eprintln!("  [reconnect] found session: {session_id}");
 
     // --- Run TUI #2: resume the previous session ---
-    // Give the TUI 10 seconds to connect, fetch initial_messages, and render,
-    // then send Ctrl+C.  Allow 45 seconds total.
     eprintln!("  [reconnect] starting TUI #2 with --resume {session_id}...");
     let result2 = run_tui_binary(
         &env,
         &["--resume".to_string(), session_id],
+        Duration::from_secs(3),
         Duration::from_secs(10),
-        Duration::from_secs(45),
     )
     .await
     .expect("failed to run TUI #2 with --resume");
@@ -766,20 +810,6 @@ async fn run_tui_scripted(
 /// 7. Press Down arrow + Enter → switch back to session B.
 /// 8. Ctrl+C to exit.
 /// 9. Assert TUI produced output and exited cleanly.
-#[tokio::test]
-#[serial]
-async fn tui_session_switch() {
-    match timeout(
-        Duration::from_secs(300),
-        tui_session_switch_inner(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => panic!("tui_session_switch timed out after 300s"),
-    }
-}
-
 async fn tui_session_switch_inner() {
 
     // --- Start ephemeral Temporal server + worker ---
@@ -791,13 +821,13 @@ async fn tui_session_switch_inner() {
     let codex_home = setup_codex_home();
     let env = tui_env(&server_target, codex_home.path());
 
-    // --- Run TUI #1: create session A ---
+    // --- Run TUI #1: create session A (just need workflow registered) ---
     eprintln!("  [switch] creating session A...");
     let result1 = run_tui_binary(
         &env,
-        &["Say hello in one word".to_string()],
-        Duration::from_secs(20),
-        Duration::from_secs(60),
+        &["hi".to_string()],
+        Duration::from_secs(7),
+        Duration::from_secs(8),
     )
     .await
     .expect("failed to run TUI #1");
@@ -811,12 +841,12 @@ async fn tui_session_switch_inner() {
 
     // --- Run TUI #2: create session B, then switch sessions via /session ---
     // Timeline:
-    //  0s   — TUI starts with prompt "Say goodbye in one word"
-    // 20s   — type "/session\r" (open picker — both sessions visible)
-    // 23s   — press Down arrow then Enter (switch to session A)
-    // 28s   — type "/session\r" again (open picker)
-    // 31s   — press Down arrow then Enter (switch back to session B)
-    // 34s+  — Ctrl+C
+    //  0s — TUI starts with prompt "hi" (creates session B)
+    //  5s — type "/session\r" (open picker — both sessions visible)
+    //  6s — press Down arrow then Enter (switch to session A)
+    //  8s — type "/session\r" again (open picker)
+    //  9s — press Down arrow then Enter (switch back to session B)
+    // 10s — Ctrl+C
     eprintln!("  [switch] creating session B and testing /session switching...");
 
     // ESC[B is the Down arrow key sequence.
@@ -824,36 +854,34 @@ async fn tui_session_switch_inner() {
     let enter: Vec<u8> = b"\r".to_vec();
 
     let script = vec![
-        // Wait for the model to respond, then open the session picker.
+        // Open the session picker once both sessions are registered in Temporal.
         ScriptedInput {
-            delay: Duration::from_secs(20),
+            delay: Duration::from_secs(5),
             data: b"/session\r".to_vec(),
         },
-        // Give the picker time to load sessions from harness and render.
-        // The current session (B) is pre-selected, so press Down to select
-        // session A, then Enter to switch.
+        // Current session (B) is pre-selected; press Down to select A, then Enter.
         ScriptedInput {
-            delay: Duration::from_secs(23),
+            delay: Duration::from_secs(6),
             data: [down_arrow.clone(), enter.clone()].concat(),
         },
-        // Wait for the switch to complete, then open the picker again.
+        // Open the picker again.
         ScriptedInput {
-            delay: Duration::from_secs(28),
+            delay: Duration::from_secs(8),
             data: b"/session\r".to_vec(),
         },
-        // Now session A is current. Press Down to select session B, then Enter.
+        // Session A is now current; press Down to select B, then Enter.
         ScriptedInput {
-            delay: Duration::from_secs(31),
+            delay: Duration::from_secs(9),
             data: [down_arrow, enter].concat(),
         },
     ];
 
     let result2 = run_tui_scripted(
         &env,
-        &["Say goodbye in one word".to_string()],
+        &["hi".to_string()],
         script,
-        Duration::from_secs(3), // Ctrl+C 3s after last scripted input
-        Duration::from_secs(90),
+        Duration::from_secs(1), // Ctrl+C 1s after last scripted input
+        Duration::from_secs(15),
     )
     .await
     .expect("failed to run TUI #2 with /session switching");
@@ -1022,20 +1050,6 @@ async fn run_tui_reactive(
 /// 4. Send 'y' to approve the tool call.
 /// 5. Wait for the model to respond, then Ctrl+C to exit.
 /// 6. Assert the TUI output contains evidence of the approved command.
-#[tokio::test]
-#[serial]
-async fn tui_tool_approval() {
-    match timeout(
-        Duration::from_secs(90),
-        tui_tool_approval_inner(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => panic!("tui_tool_approval timed out after 90s"),
-    }
-}
-
 async fn tui_tool_approval_inner() {
 
     // --- Start ephemeral Temporal server + worker ---
@@ -1073,8 +1087,8 @@ async fn tui_tool_approval_inner() {
                 data: b"/quit\r".to_vec(),
             },
         ],
-        Duration::from_secs(3),
-        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_secs(15),
     )
     .await;
 
@@ -1088,7 +1102,7 @@ async fn tui_tool_approval_inner() {
     // Query workflow history to confirm the ExecApproval op was delivered.
     eprintln!("  [approval] verifying workflow history...");
 
-    let list_output = tokio::process::Command::new("temporal")
+    let list_output = tokio::process::Command::new(temporal_cli())
         .args([
             "workflow", "list",
             "--address", &server_target,
@@ -1123,7 +1137,7 @@ async fn tui_tool_approval_inner() {
     if let Some(ref wf_id) = agent_wf_id {
         eprintln!("  [approval] agent workflow: {wf_id}");
 
-        let history_output = tokio::process::Command::new("temporal")
+        let history_output = tokio::process::Command::new(temporal_cli())
             .args([
                 "workflow", "show",
                 "--workflow-id", wf_id,
@@ -1171,20 +1185,6 @@ async fn tui_tool_approval_inner() {
 /// 5. Wait for the model to confirm completion (XPATCHDONE), then `/quit`.
 /// 6. Assert workflow history contains `patch_approval` signal and
 ///    `apply_patch` tool call.
-#[tokio::test]
-#[serial]
-async fn tui_apply_patch_approval() {
-    match timeout(
-        Duration::from_secs(90),
-        tui_apply_patch_approval_inner(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => panic!("tui_apply_patch_approval timed out after 90s"),
-    }
-}
-
 async fn tui_apply_patch_approval_inner() {
 
     // --- Set up CODEX_HOME with apply_patch enabled ---
@@ -1200,6 +1200,7 @@ async fn tui_apply_patch_approval_inner() {
         codex_home.path().join("config.toml"),
         "model = \"gpt-5.3-codex\"\n\
          sandbox_mode = \"danger-full-access\"\n\
+         approval_policy = \"untrusted\"\n\
          experimental_use_freeform_apply_patch = true\n",
     )
     .expect("failed to write config.toml");
@@ -1218,11 +1219,10 @@ async fn tui_apply_patch_approval_inner() {
     let env = tui_env(&server_target, codex_home.path());
 
     // --- Spawn TUI with a prompt that triggers apply_patch ---
-    // The model should use apply_patch to create a file. The default
-    // approval policy (OnRequest) shows a patch-approval overlay with
-    // "Yes, proceed" as the first option. When we see "edits", we
-    // send 'y' to approve. After the patch is applied, the model
-    // responds with our marker word XPATCHDONE.
+    // The model should use apply_patch to create a file. The "untrusted"
+    // approval policy forces every patch through the approval overlay.
+    // When we see "edits", we send 'y' to approve. After the patch is
+    // applied, the model responds with our marker word XPATCHDONE.
     //
     // We match "edits" (from "Would you like to make the following
     // edits?") rather than "proceed" to distinguish the patch-approval
@@ -1249,8 +1249,8 @@ async fn tui_apply_patch_approval_inner() {
                 data: b"/quit\r".to_vec(),
             },
         ],
-        Duration::from_secs(3),
-        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_secs(120),
     )
     .await;
 
@@ -1272,7 +1272,7 @@ async fn tui_apply_patch_approval_inner() {
     eprintln!("  [patch_approval] verifying workflow history...");
 
     // Find the agent workflow ID (ends with "/main").
-    let list_output = tokio::process::Command::new("temporal")
+    let list_output = tokio::process::Command::new(temporal_cli())
         .args([
             "workflow", "list",
             "--address", &server_target,
@@ -1353,20 +1353,6 @@ async fn tui_apply_patch_approval_inner() {
 /// 4. Press Enter to submit the default answer.
 /// 5. Wait for the model to respond with a completion marker, then `/quit`.
 /// 6. Assert the workflow history contains a `UserInputAnswer` signal.
-#[tokio::test]
-#[serial]
-async fn tui_request_user_input() {
-    match timeout(
-        Duration::from_secs(30),
-        tui_request_user_input_inner(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(_) => panic!("tui_request_user_input timed out after 30s"),
-    }
-}
-
 async fn tui_request_user_input_inner() {
 
     // --- Start ephemeral Temporal server + worker ---
@@ -1408,7 +1394,7 @@ async fn tui_request_user_input_inner() {
             },
         ],
         Duration::from_secs(1),
-        Duration::from_secs(20),
+        Duration::from_secs(25),
     )
     .await;
 

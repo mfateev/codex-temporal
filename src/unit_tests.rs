@@ -882,6 +882,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     }
 }
 
@@ -943,6 +944,7 @@ async fn dispatch_shell_with_cwd() {
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -978,6 +980,7 @@ sandbox_mode = "read-only"
         config_toml: Some(toml_str.to_string()),
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -1005,6 +1008,7 @@ async fn dispatch_tool_rejects_empty_tool_name() {
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let result = dispatch_tool(input).await;
@@ -1027,6 +1031,7 @@ async fn dispatch_tool_rejects_nonexistent_cwd() {
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let result = dispatch_tool(input).await;
@@ -1053,6 +1058,7 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let result = dispatch_tool(input).await;
@@ -1713,6 +1719,7 @@ fn tool_exec_input_config_toml_roundtrip() {
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
         worker_token: Some("tok-abc".to_string()),
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
     let json_with = serde_json::to_string(&input_with).unwrap();
     assert!(
@@ -1737,6 +1744,7 @@ fn tool_exec_input_config_toml_roundtrip() {
         config_toml: None,
         worker_token: None,
         already_approved: false,
+        payload_kind: "function".to_string(),
     };
     let json_none = serde_json::to_string(&input_none).unwrap();
     assert!(
@@ -3380,6 +3388,7 @@ mod approval_gap_tests {
             config_toml: None,
             worker_token: None,
             already_approved: true,
+            payload_kind: "function".to_string(),
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("already_approved"), "already_approved:true should be serialized");
@@ -3396,6 +3405,7 @@ mod approval_gap_tests {
             config_toml: None,
             worker_token: None,
             already_approved: false,
+            payload_kind: "function".to_string(),
         };
         let json_false = serde_json::to_string(&input_false).unwrap();
         assert!(!json_false.contains("already_approved"), "already_approved:false should be skipped");

@@ -807,6 +807,32 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
     }
 
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+
+    // The apply_patch tool handler spawns a subprocess using
+    // `codex_linux_sandbox_exe` (falling back to `current_exe()`).  In the
+    // worker binary this works because it handles `--codex-run-as-apply-patch`.
+    // In the test harness however, `current_exe()` is the test binary which
+    // does NOT handle that flag.  Point to the worker binary instead.
+    if config.codex_linux_sandbox_exe.is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            // The worker binary may be a sibling (same dir) or one level up
+            // (test binaries live in target/debug/deps/, worker in target/debug/).
+            let candidates = [
+                exe.with_file_name("codex-temporal-worker"),
+                exe.parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("codex-temporal-worker"))
+                    .unwrap_or_default(),
+            ];
+            for candidate in &candidates {
+                if candidate.exists() {
+                    config.codex_linux_sandbox_exe = Some(candidate.clone());
+                    break;
+                }
+            }
+        }
+    }
+
     let config = Arc::new(config);
 
     // Resolve model info from the bundled catalog.
@@ -853,14 +879,21 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
 
     let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
 
-    // Build a ToolCall for the router.
+    // Build a ToolCall for the router, reconstructing the correct payload
+    // variant from the serialized payload_kind.
+    let payload = match input.payload_kind.as_str() {
+        "custom" => ToolPayload::Custom {
+            input: input.arguments.clone(),
+        },
+        _ => ToolPayload::Function {
+            arguments: input.arguments.clone(),
+        },
+    };
     let tool_call = ToolCall {
         tool_name: input.tool_name.clone(),
         tool_namespace: None,
         call_id: input.call_id.clone(),
-        payload: ToolPayload::Function {
-            arguments: input.arguments.clone(),
-        },
+        payload,
     };
 
     // Dispatch via the router.

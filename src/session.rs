@@ -349,7 +349,7 @@ impl TemporalAgentSession {
             .client
             .get_workflow_handle::<AgentWorkflowRun>(&agent_id);
 
-        let resp = handle
+        let resp = match handle
             .execute_update(
                 AgentWorkflow::get_state_update,
                 StateUpdateRequest {
@@ -358,7 +358,19 @@ impl TemporalAgentSession {
                 WorkflowExecuteUpdateOptions::default(),
             )
             .await
-            .map_err(|e| CodexErr::Fatal(format!("failed to fetch initial events: {e}")))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Workflow may have already completed (e.g. reconnecting to a
+                // session that was shut down).  Return empty history so the TUI
+                // starts fresh rather than crashing.
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("not found") || msg.contains("already completed") {
+                    return Ok(vec![]);
+                }
+                return Err(CodexErr::Fatal(format!("failed to fetch initial events: {e}")));
+            }
+        };
 
         let events: Vec<Event> = resp
             .events

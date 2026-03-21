@@ -89,6 +89,22 @@ pub struct ToolExecInput {
     /// execute directly.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub already_approved: bool,
+    /// The kind of tool payload: "function" (default), "custom", "local_shell",
+    /// "mcp", or "tool_search". Used to reconstruct the correct `ToolPayload`
+    /// variant on the activity side.
+    #[serde(default = "ToolExecInput::default_payload_kind")]
+    #[serde(skip_serializing_if = "ToolExecInput::is_function_kind")]
+    pub payload_kind: String,
+}
+
+impl ToolExecInput {
+    fn default_payload_kind() -> String {
+        "function".to_string()
+    }
+
+    fn is_function_kind(kind: &str) -> bool {
+        kind == "function"
+    }
 }
 
 /// Output from the `tool_exec` activity.
