@@ -9,7 +9,7 @@
 //! - **`receive_op` signal**: Generic signal that dispatches all client
 //!   operations (user turns, approvals, shutdown, compact, etc.).
 //! - **`get_state_update` update**: Blocking handler that returns new events
-//!   when `state_version` changes.  Replaces the old query-based polling.
+//!   when the event watermark advances.  Replaces the old query-based polling.
 //!
 //! The `#[run]` method loops: wait for a user turn → run the agentic loop →
 //! emit `TurnComplete` → repeat, until shutdown is requested.
@@ -53,8 +53,8 @@ use crate::activities::CodexActivities;
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
-    PendingPatchApproval, PendingUserInput, ProjectContextOutput, StateUpdateRequest,
-    StateUpdateResponse, UserTurnInput,
+    PendingPatchApproval, PendingUserInput, ProjectContextOutput, ResolveModelInfoInput,
+    StateUpdateRequest, StateUpdateResponse, UserTurnInput,
 };
 
 /// Maximum number of model→tool loop iterations per turn.
@@ -101,9 +101,11 @@ pub struct AgentWorkflow {
     /// Set by `Op::Interrupt`; checked between loop iterations and during
     /// approval waits.
     pub(crate) interrupt_requested: bool,
+    /// Cancellation token for the current in-flight turn.  Cancelled by
+    /// `Op::Interrupt` to abort in-flight activities immediately.
+    current_turn_cancellation: Option<CancellationToken>,
     /// Monotonically increasing counter bumped on every mutation visible to
-    /// external observers.  Used by `get_state_update` to detect changes
-    /// without polling.
+    /// external observers.
     state_version: u64,
 }
 
@@ -179,6 +181,7 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
 
 /// Build `ContinueAsNewState` from the current workflow state and return
 /// `Err(WorkflowTermination::ContinueAsNew(...))` to trigger CAN.
+#[allow(clippy::too_many_arguments)]
 fn do_continue_as_new(
     input: &AgentWorkflowInput,
     storage: &InMemoryStorage,
@@ -252,6 +255,7 @@ impl AgentWorkflow {
                 summary_override: state.summary_override,
                 personality_override: state.personality_override,
                 interrupt_requested: false,
+                current_turn_cancellation: None,
                 state_version: 0,
                 input,
             };
@@ -292,6 +296,7 @@ impl AgentWorkflow {
             summary_override: None,
             personality_override: None,
             interrupt_requested: false,
+            current_turn_cancellation: None,
             state_version: 0,
         }
     }
@@ -333,25 +338,25 @@ impl AgentWorkflow {
                 self.bump_version();
             }
             Op::ExecApproval { id, decision, .. } => {
-                if let Some(ref mut pa) = self.pending_approval {
-                    if pa.call_id == id {
-                        let approved = matches!(
-                            decision,
-                            ReviewDecision::Approved
-                                | ReviewDecision::ApprovedForSession
-                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                        );
-                        pa.decision = Some(approved);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pa) = self.pending_approval
+                    && pa.call_id == id
+                {
+                    let approved = matches!(
+                        decision,
+                        ReviewDecision::Approved
+                            | ReviewDecision::ApprovedForSession
+                            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                    );
+                    pa.decision = Some(approved);
+                    self.bump_version();
                 }
             }
             Op::UserInputAnswer { id, response, .. } => {
-                if let Some(ref mut pui) = self.pending_user_input {
-                    if pui.call_id == id {
-                        pui.response = Some(response);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pui) = self.pending_user_input
+                    && (pui.turn_id == id || pui.call_id == id)
+                {
+                    pui.response = Some(response);
+                    self.bump_version();
                 }
             }
             Op::Shutdown => {
@@ -363,17 +368,17 @@ impl AgentWorkflow {
                 self.bump_version();
             }
             Op::PatchApproval { id, decision, .. } => {
-                if let Some(ref mut pa) = self.pending_patch_approval {
-                    if pa.call_id == id {
-                        let approved = matches!(
-                            decision,
-                            ReviewDecision::Approved
-                                | ReviewDecision::ApprovedForSession
-                                | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                        );
-                        pa.decision = Some(approved);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pa) = self.pending_patch_approval
+                    && pa.call_id == id
+                {
+                    let approved = matches!(
+                        decision,
+                        ReviewDecision::Approved
+                            | ReviewDecision::ApprovedForSession
+                            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                    );
+                    pa.decision = Some(approved);
+                    self.bump_version();
                 }
             }
             Op::OverrideTurnContext {
@@ -402,27 +407,31 @@ impl AgentWorkflow {
                 self.bump_version();
             }
             Op::DynamicToolResponse { id, response } => {
-                if let Some(ref mut pdt) = self.pending_dynamic_tool {
-                    if pdt.call_id == id {
-                        pdt.response = Some(response);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pdt) = self.pending_dynamic_tool
+                    && pdt.call_id == id
+                {
+                    pdt.response = Some(response);
+                    self.bump_version();
                 }
             }
             Op::ResolveElicitation {
                 server_name,
                 request_id,
                 decision,
+                ..
             } => {
-                if let Some(ref mut pe) = self.pending_elicitation {
-                    if pe.server_name == server_name && pe.request_id == request_id {
-                        pe.response = Some(decision);
-                        self.bump_version();
-                    }
+                if let Some(ref mut pe) = self.pending_elicitation
+                    && pe.server_name == server_name && pe.request_id == request_id
+                {
+                    pe.response = Some(decision);
+                    self.bump_version();
                 }
             }
             Op::Interrupt => {
                 self.interrupt_requested = true;
+                if let Some(ref token) = self.current_turn_cancellation {
+                    token.cancel();
+                }
                 self.bump_version();
             }
             _ => {
@@ -441,34 +450,30 @@ impl AgentWorkflow {
         ctx: &mut WorkflowContext<Self>,
         req: StateUpdateRequest,
     ) -> Result<StateUpdateResponse, Box<dyn std::error::Error + Send + Sync>> {
-        // Snapshot version at entry.
-        let entry_version = ctx.state(|s| s.state_version);
-
         // Check if data is immediately available.
         let (events, watermark) = ctx.state(|s| s.events.events_since(req.since_index));
         let shutdown = ctx.state(|s| s.shutdown_requested);
-        if !events.is_empty() || entry_version != req.since_version || shutdown {
-            let version = ctx.state(|s| s.state_version);
+        if !events.is_empty() || shutdown {
             return Ok(StateUpdateResponse {
                 events,
                 watermark,
-                state_version: version,
                 completed: shutdown,
             });
         }
 
-        // Block until state changes.
-        ctx.wait_condition(|s| s.state_version != entry_version || s.shutdown_requested)
-            .await;
+        // Block until new events arrive (watermark advances) or shutdown.
+        let entry_watermark = watermark;
+        ctx.wait_condition(|s| {
+            s.events.watermark() != entry_watermark || s.shutdown_requested
+        })
+        .await;
 
         // Re-read after wakeup.
         let (events, watermark) = ctx.state(|s| s.events.events_since(req.since_index));
-        let version = ctx.state(|s| s.state_version);
         let shutdown = ctx.state(|s| s.shutdown_requested);
         Ok(StateUpdateResponse {
             events,
             watermark,
-            state_version: version,
             completed: shutdown,
         })
     }
@@ -515,7 +520,7 @@ impl AgentWorkflow {
                 };
                 let project_context = input.project_context.clone().unwrap();
                 let mcp_tools = input.mcp_tools.clone();
-                tracing::info!("using pre-resolved config/context from parent workflow");
+                tracing::debug!("using pre-resolved config/context from parent workflow");
                 (config_output, project_context, mcp_tools)
             } else {
                 // Launch load_config and collect_project_context concurrently.
@@ -548,7 +553,7 @@ impl AgentWorkflow {
                 let mcp_tools: HashMap<String, serde_json::Value> =
                     if let Some(ref state) = input.continued_state {
                         if !state.mcp_tools.is_empty() {
-                            tracing::info!(
+                            tracing::debug!(
                                 tools = state.mcp_tools.len(),
                                 "reusing MCP tools from continue-as-new state"
                             );
@@ -586,7 +591,7 @@ impl AgentWorkflow {
         let context_items = build_context_items(&project_context);
 
         if !mcp_tools.is_empty() {
-            tracing::info!(tools = mcp_tools.len(), "MCP tools available");
+            tracing::debug!(tools = mcp_tools.len(), "MCP tools available");
         }
 
         // --- config ---
@@ -605,9 +610,27 @@ impl AgentWorkflow {
         let config = Arc::new(config);
 
         // --- model info ---
-        let model_slug = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
-        let model_info =
-            ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
+        // Resolve model metadata via activity (API-backed with bundled fallback).
+        // The activity already calls backfill_experimental_tools, but the
+        // fallback path needs it too, so apply unconditionally.
+        let mut model_info = ctx
+            .start_activity(
+                CodexActivities::resolve_model_info,
+                ResolveModelInfoInput {
+                    model: input.model.clone(),
+                    config_toml: config_output.config_toml.clone(),
+                },
+                ActivityOptions {
+                    schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("resolve_model_info failed: {e} — falling back to bundled catalog");
+                ModelsManager::resolve_from_bundled_catalog(&input.model, &config)
+            });
+        crate::activities::backfill_experimental_tools(&mut model_info);
 
         // --- session ---
         let conversation_id = ThreadId::new();
@@ -656,11 +679,15 @@ impl AgentWorkflow {
         // --- tools ---
         // Use codex-core's build_specs to get the full set of tool specs
         // (shell, apply_patch, read_file, list_dir, grep_files, etc.).
+        let sandbox_policy = config.permissions.sandbox_policy.get();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
+            available_models: &vec![],
             features: &config.features,
             web_search_mode: input.web_search_mode,
             session_source: codex_protocol::protocol::SessionSource::Exec,
+            sandbox_policy,
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         })
         .with_agent_roles(config.agent_roles.clone());
 
@@ -860,16 +887,22 @@ impl AgentWorkflow {
                     sess.record_items(&turn_context, &[user_item]).await;
 
                     // --- run the agentic loop for this turn ---
+                    let cancellation_token = CancellationToken::new();
+                    ctx.state_mut(|s| {
+                        s.current_turn_cancellation = Some(cancellation_token.clone());
+                    });
+
                     let mut streamer = TemporalModelStreamer::new(
                         ctx.clone(),
                         conversation_id.to_string(),
                         input.model_provider.clone(),
+                        cancellation_token.clone(),
                     );
 
                     let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-                    let cancellation_token = CancellationToken::new();
                     let mut iterations = 0u32;
                     let mut turn_aborted = false;
+                    let mut turn_error: Option<codex_core::error::CodexErr> = None;
 
                     // Reset interrupt flag at the start of each turn.
                     ctx.state_mut(|s| s.interrupt_requested = false);
@@ -909,6 +942,7 @@ impl AgentWorkflow {
                             config_output.worker_token.clone(),
                             mcp_tool_names.clone(),
                             dynamic_tool_names.clone(),
+                            config.permissions.sandbox_policy.get().clone(),
                         );
 
                         // Rebuild prompt from accumulated session history,
@@ -966,17 +1000,27 @@ impl AgentWorkflow {
                                 if !outcome.needs_follow_up {
                                     break;
                                 }
-                                tracing::info!(
+                                tracing::debug!(
                                     iteration = iterations,
                                     "follow-up needed, continuing loop"
                                 );
                             }
+                            Err(codex_core::error::CodexErr::TurnAborted) => {
+                                tracing::debug!("try_run_sampling_request returned TurnAborted");
+                                turn_aborted = true;
+                                ctx.state_mut(|s| s.interrupt_requested = false);
+                                break;
+                            }
                             Err(e) => {
                                 tracing::error!(error = %e, "try_run_sampling_request failed");
+                                turn_error = Some(e);
                                 break;
                             }
                         }
                     }
+
+                    // Clear the turn cancellation token now that the loop is done.
+                    ctx.state_mut(|s| s.current_turn_cancellation = None);
 
                     if turn_aborted {
                         // Emit TurnAborted event.
@@ -989,6 +1033,18 @@ impl AgentWorkflow {
                         });
                         ctx.state_mut(|s| s.bump_version());
                     } else {
+                        // If the turn ended with an error, emit an Error
+                        // event so the user sees what went wrong (e.g.
+                        // "Quota exceeded").
+                        if let Some(ref err) = turn_error {
+                            let error_event = err.to_error_event(None);
+                            events.emit_event_sync(Event {
+                                id: turn_id.clone(),
+                                msg: EventMsg::Error(error_event),
+                            });
+                            ctx.state_mut(|s| s.bump_version());
+                        }
+
                         // Emit TurnComplete
                         events.emit_event_sync(Event {
                             id: turn_id.clone(),

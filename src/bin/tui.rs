@@ -130,12 +130,23 @@ use codex_temporal::session::filter_initial_events;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Log to file to avoid corrupting the TUI terminal.
+    let log_dir = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".codex-temporal").join("logs"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/codex-temporal"));
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("tui.log"))
+        .expect("failed to open log file");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".parse().unwrap()),
+                .unwrap_or_else(|_| "warn".parse().unwrap()),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false)
         .init();
 
     let (resume_arg, initial_prompt) = parse_resume_arg();
@@ -175,11 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production, configure credentials on the worker directly or use a
     // secrets manager (e.g. HashiCorp Vault).
     let needs_token = !query_credentials_available(&client).await.unwrap_or(true);
-    if needs_token {
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            provider.experimental_bearer_token = Some(api_key);
-            provider.env_key = None; // Worker won't have this env var
-        }
+    if needs_token
+        && let Ok(api_key) = std::env::var("OPENAI_API_KEY")
+    {
+        provider.experimental_bearer_token = Some(api_key);
+        provider.env_key = None; // Worker won't have this env var
     }
     base_input.model_provider = Some(provider);
 
@@ -258,6 +269,7 @@ async fn run_tui_session(
         thread_name: None,
         model: model.clone(),
         model_provider_id: "openai".to_string(),
+        approvals_reviewer: Default::default(),
         approval_policy,
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         cwd: cwd.clone(),
@@ -267,6 +279,7 @@ async fn run_tui_session(
         initial_messages,
         network_proxy: None,
         rollout_path: None,
+        service_tier: None,
     };
 
     // --- Build Config ---

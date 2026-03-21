@@ -122,32 +122,30 @@ impl CodexHarness {
             ctx.state_mut(|s| s.credentials_available = Some(cred_result.unwrap_or(false)));
         }
 
-        loop {
-            // Wait until the server suggests CAN (history too large).
-            ctx.wait_condition(|_s| ctx.continue_as_new_suggested())
-                .await;
+        // Wait until the server suggests CAN (history too large).
+        ctx.wait_condition(|_s| ctx.continue_as_new_suggested())
+            .await;
 
-            // Carry sessions and credentials forward.
-            let (sessions, credentials_available) =
-                ctx.state(|s| (s.sessions.clone(), s.credentials_available));
-            let can_input = HarnessInput {
-                continued_state: Some(HarnessState {
-                    sessions,
-                    credentials_available,
-                }),
-            };
+        // Carry sessions and credentials forward.
+        let (sessions, credentials_available) =
+            ctx.state(|s| (s.sessions.clone(), s.credentials_available));
+        let can_input = HarnessInput {
+            continued_state: Some(HarnessState {
+                sessions,
+                credentials_available,
+            }),
+        };
 
-            return Err(WorkflowTermination::continue_as_new(
-                ContinueAsNewWorkflowExecution {
-                    arguments: vec![can_input.as_json_payload().map_err(|e| {
-                        WorkflowTermination::failed(anyhow::anyhow!(
-                            "failed to serialize CAN input: {e}"
-                        ))
-                    })?],
-                    ..Default::default()
-                },
-            ));
-        }
+        Err(WorkflowTermination::continue_as_new(
+            ContinueAsNewWorkflowExecution {
+                arguments: vec![can_input.as_json_payload().map_err(|e| {
+                    WorkflowTermination::failed(anyhow::anyhow!(
+                        "failed to serialize CAN input: {e}"
+                    ))
+                })?],
+                ..Default::default()
+            },
+        ))
     }
 }
 

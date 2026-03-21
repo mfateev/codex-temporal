@@ -22,12 +22,36 @@ const TASK_QUEUE: &str = "codex-temporal";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The apply_patch tool handler spawns a subprocess using the current
-    // binary with `--codex-run-as-apply-patch` as the first argument.
-    // Detect that and delegate immediately.
-    // TODO: consider creating a slimmed-down binary for just the patch tool.
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|a| a.as_str()) == Some(codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1) {
-        codex_apply_patch::main(); // diverges (-> !)
+    // binary with `--codex-run-as-apply-patch <patch>` as arguments.
+    // Detect that and delegate immediately, matching the pattern from
+    // codex-rs/arg0: consume the flag, take the next arg as the patch
+    // text, and call `apply_patch()` directly.
+    {
+        let mut args = std::env::args_os();
+        let _argv0 = args.next();
+        if let Some(arg1) = args.next() {
+            if arg1.to_str() == Some(codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1) {
+                let exit_code = match args.next().and_then(|s| s.into_string().ok()) {
+                    Some(patch_arg) => {
+                        let mut stdout = std::io::stdout();
+                        let mut stderr = std::io::stderr();
+                        match codex_apply_patch::apply_patch(&patch_arg, &mut stdout, &mut stderr)
+                        {
+                            Ok(()) => 0,
+                            Err(_) => 1,
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "Error: {} requires a UTF-8 PATCH argument.",
+                            codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1
+                        );
+                        1
+                    }
+                };
+                std::process::exit(exit_code);
+            }
+        }
     }
 
     if std::env::var("OPENAI_API_KEY").map_or(true, |v| v.is_empty()) {

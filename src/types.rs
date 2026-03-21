@@ -84,6 +84,27 @@ pub struct ToolExecInput {
     /// from rogue workflows on shared task queues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_token: Option<String>,
+    /// When true, the workflow has already obtained user approval for this
+    /// tool call. The activity should skip its own approval check and
+    /// execute directly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_approved: bool,
+    /// The kind of tool payload: "function" (default), "custom", "local_shell",
+    /// "mcp", or "tool_search". Used to reconstruct the correct `ToolPayload`
+    /// variant on the activity side.
+    #[serde(default = "ToolExecInput::default_payload_kind")]
+    #[serde(skip_serializing_if = "ToolExecInput::is_function_kind")]
+    pub payload_kind: String,
+}
+
+impl ToolExecInput {
+    fn default_payload_kind() -> String {
+        "function".to_string()
+    }
+
+    fn is_function_kind(kind: &str) -> bool {
+        kind == "function"
+    }
 }
 
 /// Output from the `tool_exec` activity.
@@ -162,6 +183,19 @@ pub struct ConfigOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Model info resolution activity I/O
+// ---------------------------------------------------------------------------
+
+/// Input to the `resolve_model_info` activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveModelInfoInput {
+    /// Model slug to resolve (e.g. "gpt-4o").
+    pub model: String,
+    /// Merged config TOML string (needed for config-based overrides).
+    pub config_toml: String,
+}
+
+// ---------------------------------------------------------------------------
 // MCP discovery activity I/O
 // ---------------------------------------------------------------------------
 
@@ -223,9 +257,11 @@ pub struct CapturedElicitation {
 impl McpToolCallOutput {
     /// Convert this output into a `ResponseInputItem::McpToolCallOutput`.
     pub fn into_response_input_item(self) -> ResponseInputItem {
+        use codex_protocol::mcp::CallToolResult;
+
         let result = match self.result {
             Ok(value) => {
-                match serde_json::from_value::<codex_protocol::mcp::CallToolResult>(value) {
+                match serde_json::from_value::<CallToolResult>(value) {
                     Ok(ctr) => Ok(ctr),
                     Err(e) => Err(format!("failed to deserialize CallToolResult: {e}")),
                 }
@@ -235,7 +271,7 @@ impl McpToolCallOutput {
 
         ResponseInputItem::McpToolCallOutput {
             call_id: self.call_id,
-            result,
+            output: CallToolResult::from_result(result),
         }
     }
 }
@@ -285,6 +321,9 @@ pub struct PendingApproval {
 pub struct PendingUserInput {
     /// The call_id for the `request_user_input` tool call.
     pub call_id: String,
+    /// The turn_id used by the TUI overlay as the `id` in `Op::UserInputAnswer`.
+    /// Upstream codex-core matches by turn_id (sub_id), not call_id.
+    pub turn_id: String,
     /// Set to `Some(...)` when the client responds via `Op::UserInputAnswer`.
     pub response: Option<codex_protocol::request_user_input::RequestUserInputResponse>,
 }
@@ -717,9 +756,6 @@ pub struct ResolveRoleConfigOutput {
 pub struct StateUpdateRequest {
     /// Last watermark received (same semantics as `get_events_since` index).
     pub since_index: usize,
-    /// Last `state_version` the client saw.  The handler returns immediately
-    /// if the current version differs.
-    pub since_version: u64,
 }
 
 /// Response from the blocking `get_state_update` update handler.
@@ -729,8 +765,6 @@ pub struct StateUpdateResponse {
     pub events: Vec<String>,
     /// New watermark for the next call.
     pub watermark: usize,
-    /// Current state version.
-    pub state_version: u64,
     /// True when the workflow is shutting down — client should stop watching.
     pub completed: bool,
 }

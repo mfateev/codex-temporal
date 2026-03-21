@@ -97,7 +97,7 @@ async fn in_memory_storage_saves_and_reads() {
         message: "test".to_string(),
         replacement_history: None,
     });
-    storage.save(&[item.clone()]).await;
+    storage.save(std::slice::from_ref(&item)).await;
 
     assert_eq!(storage.items().len(), 1);
 
@@ -230,10 +230,8 @@ async fn turn_context_new_minimal_creates_usable_context() {
         .expect("config");
     let config = Arc::new(config);
 
-    let model_slug = codex_core::models_manager::manager::ModelsManager::get_model_offline_for_tests(
-        config.model.as_deref(),
-    );
-    let model_info = codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+    let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
+    let model_info = codex_core::models_manager::manager::ModelsManager::resolve_from_bundled_catalog(
         &model_slug,
         &config,
     );
@@ -883,6 +881,8 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     }
 }
 
@@ -943,6 +943,8 @@ async fn dispatch_shell_with_cwd() {
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -977,6 +979,8 @@ sandbox_mode = "read-only"
         cwd: "/tmp".to_string(),
         config_toml: Some(toml_str.to_string()),
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let output = dispatch_tool(input).await.expect("dispatch_tool failed");
@@ -1003,6 +1007,8 @@ async fn dispatch_tool_rejects_empty_tool_name() {
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let result = dispatch_tool(input).await;
@@ -1024,6 +1030,8 @@ async fn dispatch_tool_rejects_nonexistent_cwd() {
         cwd: "/nonexistent/path/that/does/not/exist".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let result = dispatch_tool(input).await;
@@ -1049,6 +1057,8 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
         cwd: file_path,
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
 
     let result = dispatch_tool(input).await;
@@ -1066,8 +1076,9 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
 
 use codex_core::{
     Session, TurnContext, TurnDiffTracker,
-    ToolInvocation, ToolPayload, ToolsConfig, ToolsConfigParams, build_specs,
+    ToolPayload, ToolsConfig, ToolsConfigParams,
 };
+use codex_core::tools::router::{ToolCall, ToolCallSource, ToolRouter};
 use codex_core::models_manager::manager::ModelsManager;
 use codex_protocol::ThreadId;
 use tokio::sync::Mutex;
@@ -1086,21 +1097,29 @@ async fn dispatch_with_experimental_tools(
     config.cwd = std::path::PathBuf::from("/tmp");
     let config = Arc::new(config);
 
-    let model_slug = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
+    let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
     let mut model_info =
-        ModelsManager::construct_model_info_offline_for_tests(&model_slug, &config);
+        ModelsManager::resolve_from_bundled_catalog(&model_slug, &config);
 
     // Inject experimental tools into model_info so ToolsConfig picks them up.
     model_info.experimental_supported_tools = extra_tools.iter().map(|s| s.to_string()).collect();
 
+    let sandbox_policy = config.permissions.sandbox_policy.get();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
+        available_models: &vec![],
         features: &config.features,
         web_search_mode: None,
         session_source: codex_protocol::protocol::SessionSource::Exec,
+        sandbox_policy: &sandbox_policy,
+        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
     });
-    let builder = build_specs(&tools_config, None, None, &[]);
-    let (_specs, registry) = builder.build();
+    let router = ToolRouter::from_config(&tools_config, codex_core::tools::router::ToolRouterParams {
+        mcp_tools: None,
+        app_tools: None,
+        discoverable_tools: None,
+        dynamic_tools: &[],
+    });
 
     let conversation_id = ThreadId::new();
     let event_sink: Arc<dyn codex_core::EventSink> = Arc::new(BufferEventSink::new(4096, 0));
@@ -1122,18 +1141,19 @@ async fn dispatch_with_experimental_tools(
 
     let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
 
-    let invocation = ToolInvocation {
-        session,
-        turn: turn_context,
-        tracker,
-        call_id: "test-call".to_string(),
+    let tool_call = ToolCall {
         tool_name: tool_name.to_string(),
+        tool_namespace: None,
+        call_id: "test-call".to_string(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),
         },
     };
 
-    match registry.dispatch(invocation).await {
+    match router
+        .dispatch_tool_call(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
+        .await
+    {
         Ok(item) => {
             // Extract text from the response item.
             match &item {
@@ -1612,7 +1632,7 @@ fn model_call_input_provider_roundtrips() {
         tools: vec![],
         parallel_tool_calls: false,
         instructions: "test".to_string(),
-        model_info: codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+        model_info: codex_core::models_manager::manager::ModelsManager::resolve_from_bundled_catalog(
             "gpt-4o",
             &codex_core::config::Config::for_harness(std::path::PathBuf::from("/tmp/codex-test")).unwrap(),
         ),
@@ -1641,7 +1661,7 @@ fn model_call_input_provider_defaults_to_none() {
         tools: vec![],
         parallel_tool_calls: false,
         instructions: "t".to_string(),
-        model_info: codex_core::models_manager::manager::ModelsManager::construct_model_info_offline_for_tests(
+        model_info: codex_core::models_manager::manager::ModelsManager::resolve_from_bundled_catalog(
             "gpt-4o",
             &codex_core::config::Config::for_harness(std::path::PathBuf::from("/tmp/codex-test")).unwrap(),
         ),
@@ -1698,6 +1718,8 @@ fn tool_exec_input_config_toml_roundtrip() {
         cwd: "/tmp".to_string(),
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
         worker_token: Some("tok-abc".to_string()),
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
     let json_with = serde_json::to_string(&input_with).unwrap();
     assert!(
@@ -1721,6 +1743,8 @@ fn tool_exec_input_config_toml_roundtrip() {
         cwd: "/tmp".to_string(),
         config_toml: None,
         worker_token: None,
+        already_approved: false,
+        payload_kind: "function".to_string(),
     };
     let json_none = serde_json::to_string(&input_none).unwrap();
     assert!(
@@ -1792,7 +1816,7 @@ fn needs_approval(command: &[String], policy: AskForApproval) -> bool {
             AskForApproval::UnlessTrusted
             | AskForApproval::OnRequest
             | AskForApproval::OnFailure
-            | AskForApproval::Reject(_) => true,
+            | AskForApproval::Granular(_) => true,
         }
     }
 }
@@ -1930,11 +1954,10 @@ fn mcp_tool_call_output_into_response_item_ok() {
 
     let item = output.into_response_input_item();
     match item {
-        ResponseInputItem::McpToolCallOutput { call_id, result } => {
+        ResponseInputItem::McpToolCallOutput { call_id, output } => {
             assert_eq!(call_id, "call-resp");
-            assert!(result.is_ok());
-            let ctr = result.unwrap();
-            assert_eq!(ctr.content.len(), 1);
+            assert!(output.success());
+            assert_eq!(output.content.len(), 1);
         }
         other => panic!("expected McpToolCallOutput, got {:?}", other),
     }
@@ -1953,10 +1976,9 @@ fn mcp_tool_call_output_into_response_item_err() {
 
     let item = output.into_response_input_item();
     match item {
-        ResponseInputItem::McpToolCallOutput { call_id, result } => {
+        ResponseInputItem::McpToolCallOutput { call_id, output } => {
             assert_eq!(call_id, "call-err");
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "server crashed");
+            assert!(!output.success());
         }
         other => panic!("expected McpToolCallOutput, got {:?}", other),
     }
@@ -3207,12 +3229,10 @@ async fn load_harness_config_populates_default_crew_agents() {
 fn state_update_request_roundtrips() {
     let req = StateUpdateRequest {
         since_index: 42,
-        since_version: 7,
     };
     let json = serde_json::to_string(&req).unwrap();
     let back: StateUpdateRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(back.since_index, 42);
-    assert_eq!(back.since_version, 7);
 }
 
 #[test]
@@ -3220,24 +3240,179 @@ fn state_update_response_roundtrips() {
     let resp = StateUpdateResponse {
         events: vec![r#"{"id":"e1","msg":"ShutdownComplete"}"#.to_string()],
         watermark: 10,
-        state_version: 5,
         completed: true,
     };
     let json = serde_json::to_string(&resp).unwrap();
     let back: StateUpdateResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(back.events.len(), 1);
     assert_eq!(back.watermark, 10);
-    assert_eq!(back.state_version, 5);
     assert!(back.completed);
 }
 
 #[test]
 fn state_update_response_defaults_empty() {
     // Minimal JSON should deserialize correctly.
-    let json = r#"{"events":[],"watermark":0,"state_version":0,"completed":false}"#;
+    let json = r#"{"events":[],"watermark":0,"completed":false}"#;
     let resp: StateUpdateResponse = serde_json::from_str(json).unwrap();
     assert!(resp.events.is_empty());
     assert_eq!(resp.watermark, 0);
-    assert_eq!(resp.state_version, 0);
     assert!(!resp.completed);
+}
+
+// ---------------------------------------------------------------------------
+// Tool approval gap tests (render_decision_for_unmatched_command)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod approval_gap_tests {
+    use codex_core::exec_policy::render_decision_for_unmatched_command;
+    use codex_core::ExecPolicyDecision as Decision;
+    use codex_protocol::models::SandboxPermissions;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::protocol::{AskForApproval, SandboxPolicy};
+
+    /// Gap 2: OnFailure should auto-allow unknown (non-dangerous) commands.
+    #[test]
+    fn workflow_shell_decision_onfailure_allows() {
+        let cmd = vec!["cargo".to_string(), "build".to_string()];
+        let sandbox = SandboxPolicy::ReadOnly {
+            access: Default::default(),
+            network_access: false,
+        };
+        let fs_sandbox = FileSystemSandboxPolicy::from(&sandbox);
+
+        let decision = render_decision_for_unmatched_command(
+            AskForApproval::OnFailure,
+            &sandbox,
+            &fs_sandbox,
+            &cmd,
+            SandboxPermissions::default(),
+            false,
+        );
+        assert_eq!(decision, Decision::Allow, "OnFailure should auto-allow non-dangerous commands");
+    }
+
+    /// Gap 3: OnRequest + unrestricted sandbox should auto-allow non-dangerous commands.
+    #[test]
+    fn workflow_shell_decision_onrequest_unrestricted_allows() {
+        let cmd = vec!["cargo".to_string(), "build".to_string()];
+        let sandbox = SandboxPolicy::DangerFullAccess;
+        let fs_sandbox = FileSystemSandboxPolicy::from(&sandbox);
+
+        let decision = render_decision_for_unmatched_command(
+            AskForApproval::OnRequest,
+            &sandbox,
+            &fs_sandbox,
+            &cmd,
+            SandboxPermissions::default(),
+            false,
+        );
+        assert_eq!(decision, Decision::Allow, "OnRequest + DangerFullAccess should auto-allow");
+    }
+
+    /// Gap 4: Dangerous command + Never policy should be Forbidden (not allowed).
+    #[test]
+    fn workflow_shell_decision_dangerous_never_forbidden() {
+        let cmd = vec!["rm".to_string(), "-rf".to_string(), "/".to_string()];
+        let sandbox = SandboxPolicy::ReadOnly {
+            access: Default::default(),
+            network_access: false,
+        };
+        let fs_sandbox = FileSystemSandboxPolicy::from(&sandbox);
+
+        let decision = render_decision_for_unmatched_command(
+            AskForApproval::Never,
+            &sandbox,
+            &fs_sandbox,
+            &cmd,
+            SandboxPermissions::default(),
+            false,
+        );
+        assert_eq!(decision, Decision::Forbidden, "dangerous + Never should be Forbidden");
+    }
+
+    /// Gap 5: Patch auto-approve with DangerFullAccess policy.
+    #[test]
+    fn workflow_patch_decision_onfailure_auto_approves() {
+        use crate::tools::PatchDecision;
+        use crate::tools::workflow_assess_patch_needs_approval;
+
+        let decision = workflow_assess_patch_needs_approval(
+            false, // not empty
+            AskForApproval::OnFailure,
+            &SandboxPolicy::DangerFullAccess,
+        );
+        assert_eq!(decision, PatchDecision::AutoApprove, "OnFailure + DangerFullAccess should auto-approve patch");
+    }
+
+    /// Gap 5: Patch with UnlessTrusted should always ask.
+    #[test]
+    fn workflow_patch_decision_unless_trusted_asks() {
+        use crate::tools::PatchDecision;
+        use crate::tools::workflow_assess_patch_needs_approval;
+
+        let decision = workflow_assess_patch_needs_approval(
+            false,
+            AskForApproval::UnlessTrusted,
+            &SandboxPolicy::DangerFullAccess,
+        );
+        assert_eq!(decision, PatchDecision::AskUser, "UnlessTrusted should always ask for patch approval");
+    }
+
+    /// Empty patch should be rejected.
+    #[test]
+    fn workflow_patch_decision_empty_rejects() {
+        use crate::tools::PatchDecision;
+        use crate::tools::workflow_assess_patch_needs_approval;
+
+        let decision = workflow_assess_patch_needs_approval(
+            true, // empty
+            AskForApproval::OnFailure,
+            &SandboxPolicy::DangerFullAccess,
+        );
+        assert_eq!(decision, PatchDecision::Reject("empty patch"), "empty patch should be rejected");
+    }
+
+    /// ToolExecInput.already_approved field serde roundtrip.
+    #[test]
+    fn tool_exec_input_already_approved_serde() {
+        use crate::types::ToolExecInput;
+
+        // When already_approved is true, it should be serialized.
+        let input = ToolExecInput {
+            tool_name: "shell".to_string(),
+            call_id: "c1".to_string(),
+            arguments: "{}".to_string(),
+            model: "gpt-4o".to_string(),
+            cwd: "/tmp".to_string(),
+            config_toml: None,
+            worker_token: None,
+            already_approved: true,
+            payload_kind: "function".to_string(),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("already_approved"), "already_approved:true should be serialized");
+        let back: ToolExecInput = serde_json::from_str(&json).unwrap();
+        assert!(back.already_approved);
+
+        // When already_approved is false, it should be skipped.
+        let input_false = ToolExecInput {
+            tool_name: "shell".to_string(),
+            call_id: "c2".to_string(),
+            arguments: "{}".to_string(),
+            model: "gpt-4o".to_string(),
+            cwd: "/tmp".to_string(),
+            config_toml: None,
+            worker_token: None,
+            already_approved: false,
+            payload_kind: "function".to_string(),
+        };
+        let json_false = serde_json::to_string(&input_false).unwrap();
+        assert!(!json_false.contains("already_approved"), "already_approved:false should be skipped");
+
+        // Old JSON without already_approved should default to false.
+        let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
+        let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
+        assert!(!back_old.already_approved, "missing already_approved should default to false");
+    }
 }
