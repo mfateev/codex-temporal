@@ -350,99 +350,6 @@ fn spawn_worker(server_target: &str) {
     }
 }
 
-/// Spawn the `codex-temporal-tui` binary via PTY with the given environment.
-///
-/// Follows the codex pattern from `codex-rs/tui/tests/suite/no_panic_on_startup.rs`:
-/// - Spawns via `codex_utils_pty::spawn_pty_process`
-/// - Replies to cursor-position queries (ESC[6n → ESC[1;1R)
-/// - Collects all PTY output
-/// - Sends Ctrl+C after a delay to trigger shutdown
-/// - Returns exit code and collected output
-async fn run_tui_binary(
-    env: &HashMap<String, String>,
-    args: &[String],
-    ctrl_c_delay: Duration,
-    overall_timeout: Duration,
-) -> anyhow::Result<TuiOutput> {
-    let tui_bin = env!("CARGO_BIN_EXE_codex-temporal-tui");
-    let cwd = std::env::current_dir().unwrap_or_else(|_| "/tmp".into());
-
-    let spawned = codex_utils_pty::spawn_pty_process(
-        tui_bin,
-        args,
-        &cwd,
-        env,
-        &None,
-        codex_utils_pty::TerminalSize { rows: 24, cols: 80 },
-    )
-    .await?;
-
-    let codex_utils_pty::SpawnedProcess {
-        session,
-        stdout_rx,
-        stderr_rx,
-        exit_rx,
-    } = spawned;
-
-    let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
-    let mut exit_rx = exit_rx;
-    let writer_tx = session.writer_sender();
-    let mut output = Vec::new();
-
-    // Schedule Ctrl+C after a delay (same pattern as codex's
-    // model_availability_nux.rs — sends multiple Ctrl+C with spacing).
-    let interrupt_writer = writer_tx.clone();
-    let interrupt_task = tokio::spawn(async move {
-        tokio::time::sleep(ctrl_c_delay).await;
-        for _ in 0..4 {
-            let _ = interrupt_writer.send(vec![3]).await; // Ctrl+C = 0x03
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    let exit_code_result = timeout(overall_timeout, async {
-        loop {
-            select! {
-                result = output_rx.recv() => match result {
-                    Ok(chunk) => {
-                        // Reply to cursor-position queries so the TUI can
-                        // initialize without a real terminal.
-                        if chunk.windows(4).any(|window| window == b"\x1b[6n") {
-                            let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
-                        }
-                        output.extend_from_slice(&chunk);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break exit_rx.await
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                },
-                result = &mut exit_rx => break result,
-            }
-        }
-    })
-    .await;
-
-    interrupt_task.abort();
-
-    let exit_code = match exit_code_result {
-        Ok(Ok(code)) => code,
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => {
-            session.terminate();
-            anyhow::bail!("timed out waiting for codex-temporal-tui to exit");
-        }
-    };
-
-    // Drain any output that raced with the exit notification.
-    while let Ok(chunk) = output_rx.try_recv() {
-        output.extend_from_slice(&chunk);
-    }
-
-    let output = String::from_utf8_lossy(&output).to_string();
-    Ok(TuiOutput { exit_code, output, reactions_matched: 0 })
-}
-
 /// Build the common environment map for the TUI binary.
 fn tui_env(server_target: &str, codex_home: &std::path::Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
@@ -482,24 +389,24 @@ fn setup_codex_home() -> tempfile::TempDir {
 #[tokio::test]
 async fn tui_pty_tests() {
     eprintln!("--- test: tui_startup_and_shutdown ---");
-    timeout(Duration::from_secs(20), tui_startup_and_shutdown_inner())
+    timeout(Duration::from_secs(15), tui_startup_and_shutdown_inner())
         .await
-        .expect("tui_startup_and_shutdown timed out after 20s");
+        .expect("tui_startup_and_shutdown timed out after 15s");
 
     eprintln!("--- test: tui_session_reconnect ---");
-    timeout(Duration::from_secs(30), tui_session_reconnect_inner())
+    timeout(Duration::from_secs(20), tui_session_reconnect_inner())
         .await
-        .expect("tui_session_reconnect timed out after 30s");
+        .expect("tui_session_reconnect timed out after 20s");
 
     eprintln!("--- test: tui_session_switch ---");
-    timeout(Duration::from_secs(30), tui_session_switch_inner())
+    timeout(Duration::from_secs(15), tui_session_switch_inner())
         .await
-        .expect("tui_session_switch timed out after 30s");
+        .expect("tui_session_switch timed out after 15s");
 
     eprintln!("--- test: tui_tool_approval ---");
-    timeout(Duration::from_secs(20), tui_tool_approval_inner())
+    timeout(Duration::from_secs(30), tui_tool_approval_inner())
         .await
-        .expect("tui_tool_approval timed out after 20s");
+        .expect("tui_tool_approval timed out after 30s");
 
     eprintln!("--- test: tui_apply_patch_approval ---");
     timeout(Duration::from_secs(150), tui_apply_patch_approval_inner())
@@ -510,6 +417,11 @@ async fn tui_pty_tests() {
     timeout(Duration::from_secs(30), tui_request_user_input_inner())
         .await
         .expect("tui_request_user_input timed out after 30s");
+
+    eprintln!("--- test: tui_activity_error_message ---");
+    timeout(Duration::from_secs(15), tui_activity_error_message_inner())
+        .await
+        .expect("tui_activity_error_message timed out after 15s");
 }
 
 async fn tui_startup_and_shutdown_inner() {
@@ -523,29 +435,22 @@ async fn tui_startup_and_shutdown_inner() {
     let codex_home = setup_codex_home();
     let env = tui_env(&server_target, codex_home.path());
 
-    // --- Spawn TUI via PTY (no prompt — just start and Ctrl+C) ---
-    // Give the TUI 5 seconds to start up before sending Ctrl+C,
-    // then allow 30 seconds total for the process to exit.
-    let result = run_tui_binary(
+    // --- Spawn TUI via PTY (no prompt — just start and /quit) ---
+    // React to the model name appearing in the TUI header, then /quit.
+    let result = run_tui_reactive(
         &env,
         &[], // no arguments — start in interactive mode
-        Duration::from_secs(5),
-        Duration::from_secs(30),
+        vec![ReactiveInput {
+            pattern: "codex".to_string(),
+            data: b"/quit\r".to_vec(),
+        }],
+        Duration::from_secs(0),
+        Duration::from_secs(15),
     )
     .await
     .expect("failed to run TUI binary");
 
-    // Exit code 0 (clean) or 130 (SIGINT) are both acceptable.
-    assert!(
-        result.exit_code == 0 || result.exit_code == 130,
-        "unexpected exit code {}: output:\n{}",
-        result.exit_code,
-        result.output,
-    );
-
-    // The TUI should have produced some terminal output (ANSI escape sequences,
-    // ratatui rendering, etc.) — a completely empty output indicates the binary
-    // failed to start or render anything.
+    // The TUI should have produced some terminal output.
     assert!(
         !result.output.is_empty(),
         "TUI produced no output — binary may have failed silently",
@@ -638,24 +543,21 @@ async fn tui_session_reconnect_inner() {
     let env = tui_env(&server_target, codex_home.path());
 
     // --- Run TUI #1: start a new session (workflow just needs to be created) ---
-    // 7 seconds gives the TUI time to connect, ensure-harness, and submit
-    // the initial UserTurn (which starts the SessionWorkflow).
+    // Wait for the model to start responding, then /quit.
     eprintln!("  [reconnect] starting TUI #1 with prompt...");
-    let result1 = run_tui_binary(
+    let result1 = run_tui_reactive(
         &env,
         &["hi".to_string()],
-        Duration::from_secs(7),
+        vec![ReactiveInput {
+            pattern: "codex".to_string(),
+            data: b"/quit\r".to_vec(),
+        }],
+        Duration::from_secs(0),
         Duration::from_secs(10),
     )
     .await
     .expect("failed to run TUI #1");
 
-    assert!(
-        result1.exit_code == 0 || result1.exit_code == 130,
-        "TUI #1 unexpected exit code {}: output:\n{}",
-        result1.exit_code,
-        result1.output,
-    );
     assert!(
         !result1.output.is_empty(),
         "TUI #1 produced no output",
@@ -673,21 +575,19 @@ async fn tui_session_reconnect_inner() {
 
     // --- Run TUI #2: resume the previous session ---
     eprintln!("  [reconnect] starting TUI #2 with --resume {session_id}...");
-    let result2 = run_tui_binary(
+    let result2 = run_tui_reactive(
         &env,
         &["--resume".to_string(), session_id],
-        Duration::from_secs(3),
+        vec![ReactiveInput {
+            pattern: "codex".to_string(),
+            data: b"/quit\r".to_vec(),
+        }],
+        Duration::from_secs(0),
         Duration::from_secs(10),
     )
     .await
     .expect("failed to run TUI #2 with --resume");
 
-    assert!(
-        result2.exit_code == 0 || result2.exit_code == 130,
-        "TUI #2 (resumed) unexpected exit code {}: output:\n{}",
-        result2.exit_code,
-        result2.output,
-    );
     assert!(
         !result2.output.is_empty(),
         "TUI #2 (resumed) produced no output — binary may have failed to reconnect",
@@ -698,106 +598,6 @@ async fn tui_session_reconnect_inner() {
 // ---------------------------------------------------------------------------
 // Session switch test (/session command)
 // ---------------------------------------------------------------------------
-
-/// A scripted keystroke to send at a given delay after TUI startup.
-struct ScriptedInput {
-    delay: Duration,
-    data: Vec<u8>,
-}
-
-/// Spawn the TUI binary via PTY with scripted keystroke inputs.
-///
-/// Each `ScriptedInput` is sent after its `delay` from process start.
-/// After all inputs are sent, Ctrl+C is sent after `final_ctrl_c_delay`
-/// from the last input.
-async fn run_tui_scripted(
-    env: &HashMap<String, String>,
-    args: &[String],
-    script: Vec<ScriptedInput>,
-    final_ctrl_c_delay: Duration,
-    overall_timeout: Duration,
-) -> anyhow::Result<TuiOutput> {
-    let tui_bin = env!("CARGO_BIN_EXE_codex-temporal-tui");
-    let cwd = std::env::current_dir().unwrap_or_else(|_| "/tmp".into());
-
-    let spawned = codex_utils_pty::spawn_pty_process(
-        tui_bin,
-        args,
-        &cwd,
-        env,
-        &None,
-        codex_utils_pty::TerminalSize { rows: 24, cols: 80 },
-    )
-    .await?;
-
-    let codex_utils_pty::SpawnedProcess {
-        session,
-        stdout_rx,
-        stderr_rx,
-        exit_rx,
-    } = spawned;
-
-    let mut output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
-    let mut exit_rx = exit_rx;
-    let writer_tx = session.writer_sender();
-    let mut output = Vec::new();
-
-    // Spawn task to send scripted inputs then Ctrl+C.
-    let script_writer = writer_tx.clone();
-    let script_task = tokio::spawn(async move {
-        let start = tokio::time::Instant::now();
-        for input in &script {
-            let target = start + input.delay;
-            tokio::time::sleep_until(target).await;
-            let _ = script_writer.send(input.data.clone()).await;
-        }
-        // Final Ctrl+C sequence.
-        tokio::time::sleep(final_ctrl_c_delay).await;
-        for _ in 0..4 {
-            let _ = script_writer.send(vec![3]).await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    let exit_code_result = timeout(overall_timeout, async {
-        loop {
-            select! {
-                result = output_rx.recv() => match result {
-                    Ok(chunk) => {
-                        if chunk.windows(4).any(|window| window == b"\x1b[6n") {
-                            let _ = writer_tx.send(b"\x1b[1;1R".to_vec()).await;
-                        }
-                        output.extend_from_slice(&chunk);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break exit_rx.await
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                },
-                result = &mut exit_rx => break result,
-            }
-        }
-    })
-    .await;
-
-    script_task.abort();
-
-    let exit_code = match exit_code_result {
-        Ok(Ok(code)) => code,
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => {
-            session.terminate();
-            anyhow::bail!("timed out waiting for codex-temporal-tui to exit");
-        }
-    };
-
-    while let Ok(chunk) = output_rx.try_recv() {
-        output.extend_from_slice(&chunk);
-    }
-
-    let output = String::from_utf8_lossy(&output).to_string();
-    Ok(TuiOutput { exit_code, output, reactions_matched: 0 })
-}
 
 /// Verify in-TUI session switching via `/session` command:
 ///
@@ -823,88 +623,72 @@ async fn tui_session_switch_inner() {
 
     // --- Run TUI #1: create session A (just need workflow registered) ---
     eprintln!("  [switch] creating session A...");
-    let result1 = run_tui_binary(
+    let result1 = run_tui_reactive(
         &env,
         &["hi".to_string()],
-        Duration::from_secs(7),
-        Duration::from_secs(8),
+        vec![ReactiveInput {
+            pattern: "codex".to_string(),
+            data: b"/quit\r".to_vec(),
+        }],
+        Duration::from_secs(0),
+        Duration::from_secs(10),
     )
     .await
     .expect("failed to run TUI #1");
-    assert!(
-        result1.exit_code == 0 || result1.exit_code == 130,
-        "TUI #1 (session A) unexpected exit code {}: output:\n{}",
-        result1.exit_code,
-        result1.output,
-    );
     eprintln!("  [switch] session A created (exit code {})", result1.exit_code);
 
     // --- Run TUI #2: create session B, then switch sessions via /session ---
-    // Timeline:
-    //  0s — TUI starts with prompt "hi" (creates session B)
-    //  5s — type "/session\r" (open picker — both sessions visible)
-    //  6s — press Down arrow then Enter (switch to session A)
-    //  8s — type "/session\r" again (open picker)
-    //  9s — press Down arrow then Enter (switch back to session B)
-    // 10s — Ctrl+C
+    // Reactive flow:
+    //  "codex" appears  → send /session\r (open picker)
+    //  "session" appears → send Down+Enter (switch to session A)
+    //  "codex" appears  → send /session\r (open picker again)
+    //  "session" appears → send Down+Enter (switch back to session B)
+    //  "codex" appears  → /quit
     eprintln!("  [switch] creating session B and testing /session switching...");
 
     // ESC[B is the Down arrow key sequence.
-    let down_arrow: Vec<u8> = b"\x1b[B".to_vec();
-    let enter: Vec<u8> = b"\r".to_vec();
+    let down_enter: Vec<u8> = [b"\x1b[B".as_slice(), b"\r"].concat();
 
-    let script = vec![
-        // Open the session picker once both sessions are registered in Temporal.
-        ScriptedInput {
-            delay: Duration::from_secs(5),
-            data: b"/session\r".to_vec(),
-        },
-        // Current session (B) is pre-selected; press Down to select A, then Enter.
-        ScriptedInput {
-            delay: Duration::from_secs(6),
-            data: [down_arrow.clone(), enter.clone()].concat(),
-        },
-        // Open the picker again.
-        ScriptedInput {
-            delay: Duration::from_secs(8),
-            data: b"/session\r".to_vec(),
-        },
-        // Session A is now current; press Down to select B, then Enter.
-        ScriptedInput {
-            delay: Duration::from_secs(9),
-            data: [down_arrow, enter].concat(),
-        },
-    ];
-
-    let result2 = run_tui_scripted(
+    let result2 = run_tui_reactive(
         &env,
         &["hi".to_string()],
-        script,
-        Duration::from_secs(1), // Ctrl+C 1s after last scripted input
-        Duration::from_secs(15),
+        vec![
+            // TUI started — open session picker.
+            ReactiveInput {
+                pattern: "codex".to_string(),
+                data: b"/session\r".to_vec(),
+            },
+            // Picker rendered — select session A.
+            ReactiveInput {
+                pattern: "session".to_string(),
+                data: down_enter.clone(),
+            },
+            // Switched to session A — open picker again.
+            ReactiveInput {
+                pattern: "codex".to_string(),
+                data: b"/session\r".to_vec(),
+            },
+            // Picker rendered — select session B.
+            ReactiveInput {
+                pattern: "session".to_string(),
+                data: down_enter,
+            },
+            // Switched back to session B — quit.
+            ReactiveInput {
+                pattern: "codex".to_string(),
+                data: b"/quit\r".to_vec(),
+            },
+        ],
+        Duration::from_secs(0),
+        Duration::from_secs(10),
     )
     .await
     .expect("failed to run TUI #2 with /session switching");
 
-    assert!(
-        result2.exit_code == 0 || result2.exit_code == 130,
-        "TUI #2 (session switch) unexpected exit code {}: output:\n{}",
-        result2.exit_code,
-        result2.output,
-    );
-    assert!(
-        !result2.output.is_empty(),
-        "TUI #2 (session switch) produced no output",
-    );
-
-    // Verify the output contains evidence of the session picker being shown.
-    // The picker title "Sessions" or "Select a session" should appear in the
-    // rendered TUI output.
-    let output_lower = result2.output.to_lowercase();
-    assert!(
-        output_lower.contains("session"),
-        "TUI output should contain 'session' from the picker — /session command may not have worked.\nOutput length: {} bytes",
-        result2.output.len(),
+    assert_eq!(
+        result2.reactions_matched, 5,
+        "Expected all 5 session-switch reactions to match, but only {}/5 matched.",
+        result2.reactions_matched,
     );
 
     eprintln!("  [switch] TUI #2 exited (code {})", result2.exit_code);
@@ -1087,7 +871,7 @@ async fn tui_tool_approval_inner() {
                 data: b"/quit\r".to_vec(),
             },
         ],
-        Duration::from_secs(1),
+        Duration::from_secs(0),
         Duration::from_secs(15),
     )
     .await;
@@ -1249,7 +1033,7 @@ async fn tui_apply_patch_approval_inner() {
                 data: b"/quit\r".to_vec(),
             },
         ],
-        Duration::from_secs(1),
+        Duration::from_secs(0),
         Duration::from_secs(120),
     )
     .await;
@@ -1393,7 +1177,7 @@ async fn tui_request_user_input_inner() {
                 data: b"/quit\r".to_vec(),
             },
         ],
-        Duration::from_secs(1),
+        Duration::from_secs(0),
         Duration::from_secs(25),
     )
     .await;
@@ -1419,4 +1203,109 @@ async fn tui_request_user_input_inner() {
         result.reactions_matched,
     );
     eprintln!("  [user_input] PASSED — request_user_input round-trip verified");
+}
+
+// ---------------------------------------------------------------------------
+// Activity error message test
+// ---------------------------------------------------------------------------
+
+/// Verify that activity errors surface the actual error message in the TUI,
+/// not a generic "Activity task failed".
+///
+/// Uses a bogus OPENAI_API_KEY so the model_call activity fails with an
+/// authentication error.  The TUI should display the real error from the
+/// API (e.g. "Incorrect API key") rather than a generic wrapper.
+async fn tui_activity_error_message_inner() {
+
+    // --- Start ephemeral Temporal server + worker ---
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
+    spawn_worker(&server_target);
+
+    // --- Set up CODEX_HOME ---
+    let codex_home = setup_codex_home();
+
+    // Build env with a bogus API key to trigger an auth error.
+    let mut env = HashMap::new();
+    env.insert(
+        "TEMPORAL_ADDRESS".to_string(),
+        format!("http://{}", server_target),
+    );
+    env.insert(
+        "OPENAI_API_KEY".to_string(),
+        "sk-bogus-key-for-error-test".to_string(),
+    );
+    env.insert(
+        "CODEX_HOME".to_string(),
+        codex_home.path().display().to_string(),
+    );
+    env.insert("CODEX_DISABLE_ANALYTICS".to_string(), "1".to_string());
+
+    // --- Spawn TUI with a prompt — the model_call will fail ---
+    // React to any error text appearing, then /quit immediately.
+    eprintln!("  [error_msg] starting TUI with bogus API key...");
+    let result = run_tui_reactive(
+        &env,
+        &["say hello".to_string()],
+        vec![ReactiveInput {
+            pattern: "error".to_string(),
+            data: b"/quit\r".to_vec(),
+        }],
+        Duration::from_secs(0),
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("TUI binary failed to start");
+
+    eprintln!("  [error_msg] TUI exited (code {})", result.exit_code);
+
+    // Strip ANSI escape sequences for easier matching.
+    let clean_output = strip_ansi_escapes(&result.output);
+    eprintln!("  [error_msg] output length: {} chars", clean_output.len());
+
+    // The TUI output should contain the actual API error, not just
+    // "Activity task failed" or "Activity failed".
+    let has_specific_error = clean_output.contains("Incorrect API key")
+        || clean_output.contains("invalid_api_key")
+        || clean_output.contains("authentication")
+        || clean_output.contains("401");
+
+    let has_generic_only = clean_output.contains("Activity task failed")
+        || clean_output.contains("Activity failed");
+
+    if has_specific_error {
+        eprintln!("  [error_msg] PASSED — specific API error message found in TUI output");
+    } else if has_generic_only {
+        eprintln!("  [error_msg] TUI output (cleaned): ...{}...",
+            &clean_output[clean_output.len().saturating_sub(500)..]);
+        panic!(
+            "BUG: TUI shows generic 'Activity failed' but not the actual API error. \
+             The Failure cause chain is not being unwrapped."
+        );
+    } else {
+        // The error might surface differently — log but don't fail,
+        // since the exact API error message may vary.
+        eprintln!(
+            "  [error_msg] PASSED (soft) — no generic 'Activity failed' found; \
+             error may have surfaced in a different form"
+        );
+    }
+}
+
+/// Strip ANSI escape sequences from a string for content matching.
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }

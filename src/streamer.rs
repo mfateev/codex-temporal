@@ -122,52 +122,16 @@ impl ModelStreamer for TemporalModelStreamer {
 
 /// Extract the full error message chain from an [`ActivityExecutionError`].
 ///
-/// `ActivityExecutionError::Failed` wraps a Temporal `Failure` proto whose
-/// `Display` only prints the top-level `message` (often a generic
-/// "Activity task failed").  The original error (e.g. "Quota exceeded.")
-/// is in the `cause` chain.  This function walks the chain and joins all
-/// non-empty messages with `: `, mirroring how `anyhow`/`std::error::Error`
-/// chains are typically rendered.  If any `Failure` in the chain has a
-/// non-empty `stack_trace` (common with non-Rust activities/child
-/// workflows), it is appended.
+/// Delegates to [`format_temporal_failure`] for the `Failure` proto inside
+/// `Failed` and `Cancelled` variants.
 fn unwrap_activity_error_message(
     e: &temporalio_sdk::ActivityExecutionError,
 ) -> String {
     use temporalio_sdk::ActivityExecutionError;
-    let failure = match e {
-        ActivityExecutionError::Failed(f) | ActivityExecutionError::Cancelled(f) => f,
-        other => return format!("{other}"),
-    };
-
-    let mut parts = Vec::new();
-    let mut stack_trace: Option<&str> = None;
-
-    if !failure.message.is_empty() {
-        parts.push(failure.message.as_str());
-    }
-    if !failure.stack_trace.is_empty() {
-        stack_trace = Some(&failure.stack_trace);
-    }
-
-    let mut current = failure.cause.as_deref();
-    while let Some(cause) = current {
-        if !cause.message.is_empty() {
-            parts.push(&cause.message);
+    match e {
+        ActivityExecutionError::Failed(f) | ActivityExecutionError::Cancelled(f) => {
+            crate::types::format_temporal_failure(f)
         }
-        if stack_trace.is_none() && !cause.stack_trace.is_empty() {
-            stack_trace = Some(&cause.stack_trace);
-        }
-        current = cause.cause.as_deref();
+        other => format!("{other}"),
     }
-
-    if parts.is_empty() {
-        return format!("{e}");
-    }
-
-    let mut msg = parts.join(": ");
-    if let Some(trace) = stack_trace {
-        msg.push_str("\n");
-        msg.push_str(trace);
-    }
-    msg
 }

@@ -812,3 +812,53 @@ pub struct ContinueAsNewState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_snapshot: Vec<Event>,
 }
+
+// ---------------------------------------------------------------------------
+// Temporal Failure formatting
+// ---------------------------------------------------------------------------
+
+use temporalio_common::protos::temporal::api::failure::v1::Failure;
+
+/// Format a Temporal [`Failure`] as a human-readable error string.
+///
+/// Temporal wraps errors in a `Failure` proto chain where the top-level
+/// `message` is often generic (e.g. "Activity task failed") and the actual
+/// error is in the `cause` chain.  This function walks the full chain and
+/// joins all non-empty messages with `: `, mirroring how
+/// `anyhow`/`std::error::Error` chains are typically rendered.
+///
+/// If any `Failure` in the chain has a non-empty `stack_trace` (common
+/// with non-Rust activities and child workflows), it is appended.
+pub fn format_temporal_failure(failure: &Failure) -> String {
+    let mut parts = Vec::new();
+    let mut stack_trace: Option<&str> = None;
+
+    if !failure.message.is_empty() {
+        parts.push(failure.message.as_str());
+    }
+    if !failure.stack_trace.is_empty() {
+        stack_trace = Some(&failure.stack_trace);
+    }
+
+    let mut current = failure.cause.as_deref();
+    while let Some(cause) = current {
+        if !cause.message.is_empty() {
+            parts.push(&cause.message);
+        }
+        if stack_trace.is_none() && !cause.stack_trace.is_empty() {
+            stack_trace = Some(&cause.stack_trace);
+        }
+        current = cause.cause.as_deref();
+    }
+
+    if parts.is_empty() {
+        return failure.message.clone();
+    }
+
+    let mut msg = parts.join(": ");
+    if let Some(trace) = stack_trace {
+        msg.push('\n');
+        msg.push_str(trace);
+    }
+    msg
+}
