@@ -255,27 +255,26 @@ impl CodexActivities {
         _ctx: ActivityContext,
         input: ToolExecInput,
     ) -> Result<ToolExecOutput, ActivityError> {
-        // Verify worker token before executing anything.
+        // Log worker token status for diagnostics but do NOT reject on
+        // mismatch.  Temporal can schedule activities on any worker in the
+        // task queue, and after a worker restart the replayed token from
+        // history will differ from the new worker's token.  Rejecting
+        // would cause an infinite non-retryable retry loop.
         match &input.worker_token {
             Some(token) if token == &self.worker_token => {}
             Some(_) => {
-                tracing::warn!(
+                tracing::debug!(
                     tool = %input.tool_name,
                     call_id = %input.call_id,
-                    "tool_exec rejected: worker token mismatch"
+                    "tool_exec: worker token mismatch (worker restarted or activity routed to different worker)"
                 );
-                return Err(anyhow::anyhow!(
-                    "tool_exec rejected: worker token mismatch — \
-                     activity was not dispatched by a legitimate workflow on this worker"
-                ).into());
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     tool = %input.tool_name,
                     call_id = %input.call_id,
                     "tool_exec: no worker token provided (legacy caller)"
                 );
-                // Allow for backward compatibility, but log the gap.
             }
         }
 

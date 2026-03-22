@@ -3293,6 +3293,186 @@ async fn patch_auto_approve_full_access(client: &Client) {
     drain_shutdown(&session).await;
 }
 
+/// Test: tool_exec succeeds after worker restart despite worker token mismatch.
+///
+/// Regression test for the "tool_exec rejected: worker token mismatch" bug.
+/// The worker token is generated at startup and stored in workflow history via
+/// the `get_worker_token` activity. After a worker restart, the new worker has
+/// a different token, but the workflow replays the old token from history.
+/// Before the fix, `tool_exec` rejected calls with mismatched tokens, causing
+/// an infinite retry loop. After the fix, the mismatch is logged but allowed.
+///
+/// 1. Start ephemeral server + worker 1.
+/// 2. Create a session, submit a tool-using turn (establishes worker 1's token).
+/// 3. Shut down worker 1, start worker 2 (fresh CodexActivities = new token).
+/// 4. Submit another tool-using turn on the same session.
+/// 5. Assert the turn completes (would have failed before the fix).
+#[tokio::test]
+async fn tool_exec_survives_worker_restart() {
+    std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+
+    // --- ephemeral server ---
+    let server_result = tokio::time::timeout(Duration::from_secs(60), async {
+        let config = TemporalDevServerConfig::builder()
+            .exe(default_cached_download())
+            .build();
+        config.start_server().await
+    })
+    .await;
+    let mut server = match server_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => panic!("failed to start ephemeral server: {e}"),
+        Err(_) => panic!("ephemeral server startup timed out (60s)"),
+    };
+    let server_target = server.target.clone();
+
+    // --- client ---
+    let conn_opts = ConnectionOptions::new(
+        Url::from_str(&format!("http://{}", server_target)).expect("bad URL"),
+    )
+    .identity("restart-test-client")
+    .build();
+    let tel = TelemetryOptions::builder().build();
+    let rt_opts = RuntimeOptions::builder()
+        .telemetry_options(tel)
+        .build()
+        .expect("runtime options");
+    let runtime = CoreRuntime::new_assume_tokio(rt_opts).expect("runtime");
+    let connection = tokio::time::timeout(Duration::from_secs(10), Connection::connect(conn_opts))
+        .await
+        .expect("connection timed out")
+        .expect("connection failed");
+    let client = Client::new(connection, ClientOptions::new("default").build())
+        .expect("client");
+
+    // Helper: start a worker on a dedicated thread, return shutdown handle + join handle.
+    fn start_worker(
+        target: String,
+    ) -> (Box<dyn Fn() + Send>, std::thread::JoinHandle<()>) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Box<dyn Fn() + Send>, String>>();
+        let join = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime");
+            rt.block_on(async move {
+                let tel = TelemetryOptions::builder().build();
+                let rt_opts = RuntimeOptions::builder()
+                    .telemetry_options(tel)
+                    .build()
+                    .expect("worker runtime options");
+                let worker_runtime =
+                    CoreRuntime::new_assume_tokio(rt_opts).expect("worker CoreRuntime");
+                let conn = ConnectionOptions::new(
+                    Url::from_str(&format!("http://{}", target)).expect("bad URL"),
+                )
+                .identity("restart-test-worker")
+                .build();
+                let connection = match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    Connection::connect(conn),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        let _ = ready_tx.send(Err(format!("connect failed: {e}")));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = ready_tx.send(Err("connect timed out".into()));
+                        return;
+                    }
+                };
+                let worker_client =
+                    Client::new(connection, ClientOptions::new("default").build())
+                        .expect("worker client");
+                let opts = WorkerOptions::new(TASK_QUEUE)
+                    .task_types(WorkerTaskTypes::all())
+                    .register_workflow::<SessionWorkflow>()
+                    .register_workflow::<CodexWorkflow>()
+                    .register_workflow::<CodexHarness>()
+                    .register_activities(CodexActivities::new())
+                    .build();
+                let mut worker =
+                    Worker::new(&worker_runtime, worker_client, opts).expect("create worker");
+                let shutdown = worker.shutdown_handle();
+                // Send shutdown handle back — wrap in Box<dyn Fn() + Send>.
+                let _ = ready_tx.send(Ok(Box::new(shutdown)));
+                if let Err(e) = worker.run().await {
+                    eprintln!("worker stopped: {e}");
+                }
+            });
+        });
+        let shutdown = match ready_rx.recv() {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => panic!("worker failed to start: {e}"),
+            Err(_) => panic!("worker thread died"),
+        };
+        (shutdown, join)
+    }
+
+    // --- worker 1 ---
+    let (shutdown1, join1) = start_worker(server_target.clone());
+
+    // Create session and do a tool-using turn.
+    let session = new_session(&client, "gpt-4o-mini");
+    session
+        .submit(user_turn_op_with_model(
+            "Use shell to run 'echo restart-before' and tell me the output.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 1 failed");
+
+    let msg1 = wait_for_turn_complete(&session).await;
+    assert!(
+        msg1.is_some(),
+        "expected agent message from turn 1 (before restart)"
+    );
+    let text1 = msg1.unwrap().to_lowercase();
+    assert!(
+        text1.contains("restart-before"),
+        "turn 1 should contain tool output, got: {text1}"
+    );
+
+    // --- shut down worker 1, start worker 2 ---
+    eprintln!("  shutting down worker 1...");
+    shutdown1();
+    join1.join().expect("worker 1 thread panicked");
+    eprintln!("  worker 1 stopped, starting worker 2...");
+
+    let (shutdown2, _join2) = start_worker(server_target.clone());
+
+    // --- turn 2 on the same session with worker 2 (different token) ---
+    session
+        .submit(user_turn_op_with_model(
+            "Use shell to run 'echo restart-after' and tell me the output.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 2 failed");
+
+    let msg2 = wait_for_turn_complete(&session).await;
+    assert!(
+        msg2.is_some(),
+        "expected agent message from turn 2 (after restart) — \
+         before the fix this would fail with worker token mismatch"
+    );
+    let text2 = msg2.unwrap().to_lowercase();
+    assert!(
+        text2.contains("restart-after"),
+        "turn 2 should contain tool output after worker restart, got: {text2}"
+    );
+
+    // --- cleanup ---
+    drain_shutdown(&session).await;
+    shutdown2();
+    drop(client);
+    drop(runtime);
+    let _ = server.shutdown().await;
+}
+
 /// Test: Session::new_minimal resolves model metadata from the bundled catalog,
 /// not the fallback path, for known models like gpt-5.3-codex.
 ///
