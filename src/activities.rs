@@ -77,11 +77,6 @@ pub struct CodexActivities {
     models_manager: Arc<ModelsManager>,
     /// Persistent MCP server connections (initialized via `discover_mcp_tools`).
     mcp_manager: Arc<Mutex<HarnessMcpManager>>,
-    /// Worker-issued token for activity-level authentication.
-    /// Generated once at worker startup; verified by `tool_exec` before
-    /// executing any tool. Prevents unauthorized activity dispatch from
-    /// rogue workflows on shared task queues.
-    worker_token: String,
 }
 
 impl Default for CodexActivities {
@@ -113,7 +108,6 @@ impl CodexActivities {
             _auth_manager: auth_manager,
             models_manager,
             mcp_manager: Arc::new(Mutex::new(HarnessMcpManager::new())),
-            worker_token: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -245,39 +239,12 @@ impl CodexActivities {
     ///
     /// Supports all tools registered by `build_specs`: shell, apply_patch,
     /// read_file, list_dir, grep_files, etc.
-    ///
-    /// Verifies the `worker_token` in the input matches this worker's token
-    /// before executing. This prevents unauthorized activity dispatch from
-    /// rogue workflows on shared Temporal task queues.
     #[activity]
     pub async fn tool_exec(
         self: Arc<Self>,
         _ctx: ActivityContext,
         input: ToolExecInput,
     ) -> Result<ToolExecOutput, ActivityError> {
-        // Log worker token status for diagnostics but do NOT reject on
-        // mismatch.  Temporal can schedule activities on any worker in the
-        // task queue, and after a worker restart the replayed token from
-        // history will differ from the new worker's token.  Rejecting
-        // would cause an infinite non-retryable retry loop.
-        match &input.worker_token {
-            Some(token) if token == &self.worker_token => {}
-            Some(_) => {
-                tracing::debug!(
-                    tool = %input.tool_name,
-                    call_id = %input.call_id,
-                    "tool_exec: worker token mismatch (worker restarted or activity routed to different worker)"
-                );
-            }
-            None => {
-                tracing::debug!(
-                    tool = %input.tool_name,
-                    call_id = %input.call_id,
-                    "tool_exec: no worker token provided (legacy caller)"
-                );
-            }
-        }
-
         tracing::debug!(
             tool = %input.tool_name,
             call_id = %input.call_id,
@@ -320,7 +287,6 @@ impl CodexActivities {
 
         Ok(ConfigOutput {
             config_toml: toml_string,
-            worker_token: Some(self.worker_token.clone()),
         })
     }
 
@@ -475,21 +441,6 @@ impl CodexActivities {
             user_instructions,
             git_info,
         })
-    }
-
-    /// Return this worker's activity token.
-    ///
-    /// Lightweight activity called at workflow startup so the workflow can
-    /// include the token in subsequent `ToolExecInput` calls. This is
-    /// always called — even after continue-as-new or when config is
-    /// pre-resolved — to ensure the token matches the current worker.
-    #[activity]
-    pub async fn get_worker_token(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        _input: (),
-    ) -> Result<String, ActivityError> {
-        Ok(self.worker_token.clone())
     }
 
     /// Check if the worker has API credentials available.

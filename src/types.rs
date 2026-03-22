@@ -78,12 +78,6 @@ pub struct ToolExecInput {
     /// sandbox policy, etc. When absent, falls back to Config::for_harness().
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_toml: Option<String>,
-    /// Worker-issued token for activity-level authentication.
-    /// When set, the activity verifies this matches the worker's own token
-    /// before executing the tool. Prevents unauthorized activity dispatch
-    /// from rogue workflows on shared task queues.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_token: Option<String>,
     /// When true, the workflow has already obtained user approval for this
     /// tool call. The activity should skip its own approval check and
     /// execute directly.
@@ -175,11 +169,6 @@ pub struct ProjectContextOutput {
 pub struct ConfigOutput {
     /// Merged config.toml content as a TOML string.
     pub config_toml: String,
-    /// Worker-issued token for activity-level authentication.
-    /// Workflows include this token in subsequent `ToolExecInput` calls;
-    /// the `tool_exec` activity verifies it before executing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

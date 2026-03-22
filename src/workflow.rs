@@ -491,24 +491,6 @@ impl AgentWorkflow {
             random: Arc::new(TemporalRandomSource::new(seed)),
         };
 
-        // --- startup: fetch worker token (always, even after CAN) ---
-        // The worker token ties activity dispatch to this worker, preventing
-        // unauthorized tool execution from rogue workflows on shared task queues.
-        let worker_token: String = ctx
-            .start_activity(
-                CodexActivities::get_worker_token,
-                (),
-                ActivityOptions {
-                    schedule_to_close_timeout: Some(std::time::Duration::from_secs(5)),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("get_worker_token failed: {e} — proceeding without token");
-                String::new()
-            });
-
         // --- startup: load config, project context, MCP tools ---
         // If pre-resolved by SessionWorkflow, use directly; otherwise fall
         // back to activities (backward compat for standalone tests).
@@ -516,7 +498,6 @@ impl AgentWorkflow {
             if input.config_toml.is_some() && input.project_context.is_some() {
                 let config_output = ConfigOutput {
                     config_toml: input.config_toml.clone().unwrap(),
-                    worker_token: Some(worker_token.clone()),
                 };
                 let project_context = input.project_context.clone().unwrap();
                 let mcp_tools = input.mcp_tools.clone();
@@ -939,7 +920,6 @@ impl AgentWorkflow {
                             effective_model,
                             config.cwd.to_string_lossy().to_string(),
                             Some(config_output.config_toml.clone()),
-                            config_output.worker_token.clone(),
                             mcp_tool_names.clone(),
                             dynamic_tool_names.clone(),
                             config.permissions.sandbox_policy.get().clone(),

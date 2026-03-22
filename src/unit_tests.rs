@@ -880,7 +880,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     }
@@ -942,7 +942,7 @@ async fn dispatch_shell_with_cwd() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -978,7 +978,7 @@ sandbox_mode = "read-only"
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(toml_str.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1006,7 +1006,7 @@ async fn dispatch_tool_rejects_empty_tool_name() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1029,7 +1029,7 @@ async fn dispatch_tool_rejects_nonexistent_cwd() {
         model: "gpt-4o".to_string(),
         cwd: "/nonexistent/path/that/does/not/exist".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1056,7 +1056,7 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
         model: "gpt-4o".to_string(),
         cwd: file_path,
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1694,22 +1694,15 @@ fn model_call_input_provider_defaults_to_none() {
 fn config_output_roundtrips() {
     let original = ConfigOutput {
         config_toml: "model = \"gpt-4o\"\napproval_policy = \"on-request\"\n".to_string(),
-        worker_token: Some("test-token-123".to_string()),
     };
     let json = serde_json::to_string(&original).unwrap();
     let back: ConfigOutput = serde_json::from_str(&json).unwrap();
     assert_eq!(back.config_toml, original.config_toml);
-    assert_eq!(back.worker_token, original.worker_token);
-
-    // Backward compat: old JSON without worker_token should default to None.
-    let old_json = r#"{"config_toml":"model = \"gpt-4o\"\n"}"#;
-    let back_old: ConfigOutput = serde_json::from_str(old_json).unwrap();
-    assert!(back_old.worker_token.is_none(), "missing worker_token should default to None");
 }
 
 #[test]
 fn tool_exec_input_config_toml_roundtrip() {
-    // With config_toml and worker_token present.
+    // With config_toml present.
     let input_with = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c1".to_string(),
@@ -1717,7 +1710,6 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
-        worker_token: Some("tok-abc".to_string()),
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1726,15 +1718,10 @@ fn tool_exec_input_config_toml_roundtrip() {
         json_with.contains("config_toml"),
         "config_toml should be serialized when Some"
     );
-    assert!(
-        json_with.contains("worker_token"),
-        "worker_token should be serialized when Some"
-    );
     let back_with: ToolExecInput = serde_json::from_str(&json_with).unwrap();
     assert_eq!(back_with.config_toml, input_with.config_toml);
-    assert_eq!(back_with.worker_token, input_with.worker_token);
 
-    // With config_toml and worker_token absent (backward compat).
+    // With config_toml absent (backward compat).
     let input_none = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c2".to_string(),
@@ -1742,7 +1729,6 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: None,
-        worker_token: None,
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1751,21 +1737,13 @@ fn tool_exec_input_config_toml_roundtrip() {
         !json_none.contains("config_toml"),
         "config_toml:None should be skipped in serialization"
     );
-    assert!(
-        !json_none.contains("worker_token"),
-        "worker_token:None should be skipped in serialization"
-    );
 
-    // Deserializing old-format JSON without config_toml/worker_token should default to None.
+    // Deserializing old-format JSON without config_toml should default to None.
     let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
     let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
     assert!(
         back_old.config_toml.is_none(),
         "missing config_toml should default to None"
-    );
-    assert!(
-        back_old.worker_token.is_none(),
-        "missing worker_token should default to None"
     );
 }
 
@@ -3386,7 +3364,7 @@ mod approval_gap_tests {
             model: "gpt-4o".to_string(),
             cwd: "/tmp".to_string(),
             config_toml: None,
-            worker_token: None,
+    
             already_approved: true,
             payload_kind: "function".to_string(),
         };
@@ -3403,7 +3381,7 @@ mod approval_gap_tests {
             model: "gpt-4o".to_string(),
             cwd: "/tmp".to_string(),
             config_toml: None,
-            worker_token: None,
+    
             already_approved: false,
             payload_kind: "function".to_string(),
         };

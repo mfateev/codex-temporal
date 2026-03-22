@@ -60,9 +60,6 @@ pub struct TemporalToolHandler {
     cwd: String,
     /// Merged config TOML string to forward to tool-execution activities.
     config_toml: Option<String>,
-    /// Worker-issued token forwarded to `tool_exec` activities for
-    /// activity-level authentication.
-    worker_token: Option<String>,
     /// Set of qualified MCP tool names (e.g. "mcp__echo__echo").
     /// Tool calls matching these names bypass approval and route to MCP.
     mcp_tool_names: HashSet<String>,
@@ -85,7 +82,6 @@ impl TemporalToolHandler {
         model: String,
         cwd: String,
         config_toml: Option<String>,
-        worker_token: Option<String>,
         mcp_tool_names: HashSet<String>,
         dynamic_tool_names: HashSet<String>,
         sandbox_policy: SandboxPolicy,
@@ -99,7 +95,6 @@ impl TemporalToolHandler {
             model,
             cwd,
             config_toml,
-            worker_token,
             mcp_tool_names,
             dynamic_tool_names,
             sandbox_policy,
@@ -146,7 +141,6 @@ impl ToolCallHandler for TemporalToolHandler {
         let model = self.model.clone();
         let cwd = self.cwd.clone();
         let config_toml = self.config_toml.clone();
-        let worker_token = self.worker_token.clone();
         let is_mcp_tool = self.mcp_tool_names.contains(&tool_name);
         let is_dynamic_tool = self.dynamic_tool_names.contains(&tool_name);
 
@@ -496,7 +490,6 @@ impl ToolCallHandler for TemporalToolHandler {
                     model,
                     cwd,
                     config_toml,
-                    worker_token,
                     already_approved,
                     payload_kind: payload_kind.clone(),
                 };
@@ -658,7 +651,6 @@ impl ToolCallHandler for TemporalToolHandler {
                 model,
                 cwd,
                 config_toml,
-                worker_token,
                 already_approved: needs_approval,
                 payload_kind: payload_kind.clone(),
             };

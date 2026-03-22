@@ -3295,12 +3295,10 @@ async fn patch_auto_approve_full_access(client: &Client) {
 
 /// Test: tool_exec succeeds after worker restart despite worker token mismatch.
 ///
-/// Regression test for the "tool_exec rejected: worker token mismatch" bug.
-/// The worker token is generated at startup and stored in workflow history via
-/// the `get_worker_token` activity. After a worker restart, the new worker has
-/// a different token, but the workflow replays the old token from history.
-/// Before the fix, `tool_exec` rejected calls with mismatched tokens, causing
-/// an infinite retry loop. After the fix, the mismatch is logged but allowed.
+/// Regression test: verifies that tool execution works across worker restarts.
+/// Previously, a worker token mechanism caused tool_exec to reject calls after
+/// a restart (the replayed token from history wouldn't match the new worker's
+/// token). The worker token has been removed entirely.
 ///
 /// 1. Start ephemeral server + worker 1.
 /// 2. Create a session, submit a tool-using turn (establishes worker 1's token).
