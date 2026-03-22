@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use codex_core::AgentSession;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
@@ -3290,4 +3291,66 @@ async fn patch_auto_approve_full_access(client: &Client) {
     }
 
     drain_shutdown(&session).await;
+}
+
+/// Test: Session::new_minimal resolves model metadata from the bundled catalog,
+/// not the fallback path, for known models like gpt-5.3-codex.
+///
+/// Regression test for the "Unknown model gpt-5.3-codex" warning. The bug was
+/// that `Session::new_minimal` used `construct_model_info_offline_for_tests`
+/// which passes empty candidates when `config.model_catalog` is None, causing
+/// every known model to hit the fallback path. This loses model_messages
+/// (personality support), correct base_instructions, and other metadata.
+#[tokio::test]
+async fn session_new_minimal_resolves_bundled_model_info() {
+    use codex_core::config::ConfigBuilder;
+    use codex_core::Session;
+    use codex_protocol::ThreadId;
+    use std::sync::Arc;
+
+    use codex_temporal::sink::{BufferEventSink, DEFAULT_EVENT_BUFFER_CAPACITY};
+    use codex_temporal::storage::InMemoryStorage;
+
+    // Build a Config the same way the harness does — no model_catalog.
+    let mut config = ConfigBuilder::default().build().await.unwrap();
+    config.model = Some("gpt-5.3-codex".to_string());
+    config.personality = Some(Personality::Pragmatic);
+    let config = Arc::new(config);
+
+    // Verify the bundled catalog finds gpt-5.3-codex (sanity check).
+    let bundled = ModelsManager::resolve_from_bundled_catalog("gpt-5.3-codex", &config);
+    assert!(
+        !bundled.used_fallback_model_metadata,
+        "bundled catalog should find gpt-5.3-codex without fallback"
+    );
+    assert!(
+        bundled.model_messages.is_some(),
+        "bundled gpt-5.3-codex should have model_messages for personality support"
+    );
+
+    // Now test Session::new_minimal — this is what the workflow actually uses.
+    let conversation_id = ThreadId::new();
+    let event_sink: Arc<dyn codex_core::EventSink> =
+        Arc::new(BufferEventSink::new(DEFAULT_EVENT_BUFFER_CAPACITY, 0));
+    let storage: Arc<dyn codex_core::StorageBackend> = Arc::new(InMemoryStorage::new());
+
+    let sess = Session::new_minimal(
+        conversation_id,
+        Arc::clone(&config),
+        event_sink,
+        storage,
+    )
+    .await;
+
+    // The session's base_instructions should contain personality text
+    // (from model_messages template), not generic fallback instructions.
+    let instructions = sess.get_base_instructions().await;
+    assert!(
+        instructions.text.contains("pragmatic")
+            || instructions.text.contains("Pragmatic")
+            || instructions.text.contains("Pragmatism"),
+        "Session::new_minimal should apply personality to base_instructions for gpt-5.3-codex. \
+         Got instructions starting with: {}",
+        &instructions.text[..instructions.text.len().min(200)]
+    );
 }
