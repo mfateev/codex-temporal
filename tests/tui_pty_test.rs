@@ -388,13 +388,20 @@ fn setup_codex_home() -> tempfile::TempDir {
 
 #[tokio::test]
 async fn tui_pty_tests() {
+    // --- shared infrastructure for most tests ---
+    let _server = start_ephemeral_server().await;
+    let server_target = _server.target().to_string();
+    spawn_worker(&server_target);
+    let codex_home = setup_codex_home();
+    let env = tui_env(&server_target, codex_home.path());
+
     eprintln!("--- test: tui_startup_and_shutdown ---");
-    timeout(Duration::from_secs(15), tui_startup_and_shutdown_inner())
+    timeout(Duration::from_secs(15), tui_startup_and_shutdown_inner(&env))
         .await
         .expect("tui_startup_and_shutdown timed out after 15s");
 
     eprintln!("--- test: tui_session_reconnect ---");
-    timeout(Duration::from_secs(20), tui_session_reconnect_inner())
+    timeout(Duration::from_secs(20), tui_session_reconnect_inner(&env, &server_target))
         .await
         .expect("tui_session_reconnect timed out after 20s");
 
@@ -404,7 +411,7 @@ async fn tui_pty_tests() {
         .expect("tui_session_switch timed out after 15s");
 
     eprintln!("--- test: tui_tool_approval ---");
-    timeout(Duration::from_secs(30), tui_tool_approval_inner())
+    timeout(Duration::from_secs(30), tui_tool_approval_inner(&env, &server_target))
         .await
         .expect("tui_tool_approval timed out after 30s");
 
@@ -414,31 +421,27 @@ async fn tui_pty_tests() {
         .expect("tui_apply_patch_approval timed out after 150s");
 
     eprintln!("--- test: tui_request_user_input ---");
-    timeout(Duration::from_secs(30), tui_request_user_input_inner())
+    timeout(Duration::from_secs(30), tui_request_user_input_inner(&env))
         .await
         .expect("tui_request_user_input timed out after 30s");
 
     eprintln!("--- test: tui_activity_error_message ---");
-    timeout(Duration::from_secs(15), tui_activity_error_message_inner())
+    timeout(Duration::from_secs(15), tui_activity_error_message_inner(&server_target, codex_home.path()))
         .await
         .expect("tui_activity_error_message timed out after 15s");
+
+    eprintln!("--- test: tui_multi_tool_rendering ---");
+    timeout(Duration::from_secs(90), tui_multi_tool_rendering_inner(&env))
+        .await
+        .expect("tui_multi_tool_rendering timed out after 90s");
 }
 
-async fn tui_startup_and_shutdown_inner() {
-
-    // --- Start ephemeral Temporal server + worker ---
-    let _server = start_ephemeral_server().await;
-    let server_target = _server.target().to_string();
-    spawn_worker(&server_target);
-
-    // --- Set up CODEX_HOME ---
-    let codex_home = setup_codex_home();
-    let env = tui_env(&server_target, codex_home.path());
+async fn tui_startup_and_shutdown_inner(env: &HashMap<String, String>) {
 
     // --- Spawn TUI via PTY (no prompt — just start and /quit) ---
     // React to the model name appearing in the TUI header, then /quit.
     let result = run_tui_reactive(
-        &env,
+        env,
         &[], // no arguments — start in interactive mode
         vec![ReactiveInput {
             pattern: "codex".to_string(),
@@ -531,22 +534,13 @@ async fn find_session_workflow_id(server_target: &str) -> Option<String> {
 /// 3. Discover the session workflow ID via `temporal workflow list` CLI.
 /// 4. Run TUI #2 via PTY with `--resume <session_id>` — verify it starts,
 ///    loads the previous session's messages, and exits cleanly under Ctrl+C.
-async fn tui_session_reconnect_inner() {
-
-    // --- Start ephemeral Temporal server + worker ---
-    let _server = start_ephemeral_server().await;
-    let server_target = _server.target().to_string();
-    spawn_worker(&server_target);
-
-    // --- Set up CODEX_HOME ---
-    let codex_home = setup_codex_home();
-    let env = tui_env(&server_target, codex_home.path());
+async fn tui_session_reconnect_inner(env: &HashMap<String, String>, server_target: &str) {
 
     // --- Run TUI #1: start a new session (workflow just needs to be created) ---
     // Wait for the model to start responding, then /quit.
     eprintln!("  [reconnect] starting TUI #1 with prompt...");
     let result1 = run_tui_reactive(
-        &env,
+        env,
         &["hi".to_string()],
         vec![ReactiveInput {
             pattern: "codex".to_string(),
@@ -568,7 +562,7 @@ async fn tui_session_reconnect_inner() {
     // The TUI binary creates a SessionWorkflow with ID `codex-tui-{uuid}`.
     // Use the temporal CLI to find it.
     eprintln!("  [reconnect] querying temporal for session workflow ID...");
-    let session_id = find_session_workflow_id(&server_target)
+    let session_id = find_session_workflow_id(server_target)
         .await
         .expect("could not find a codex-tui-* SessionWorkflow via temporal CLI");
     eprintln!("  [reconnect] found session: {session_id}");
@@ -576,7 +570,7 @@ async fn tui_session_reconnect_inner() {
     // --- Run TUI #2: resume the previous session ---
     eprintln!("  [reconnect] starting TUI #2 with --resume {session_id}...");
     let result2 = run_tui_reactive(
-        &env,
+        env,
         &["--resume".to_string(), session_id],
         vec![ReactiveInput {
             pattern: "codex".to_string(),
@@ -612,12 +606,12 @@ async fn tui_session_reconnect_inner() {
 /// 9. Assert TUI produced output and exited cleanly.
 async fn tui_session_switch_inner() {
 
-    // --- Start ephemeral Temporal server + worker ---
+    // Session switch needs its own server because the /session picker shows
+    // all sessions — leftover sessions from prior tests would change the
+    // picker layout and break the Down+Enter navigation.
     let _server = start_ephemeral_server().await;
     let server_target = _server.target().to_string();
     spawn_worker(&server_target);
-
-    // --- Set up CODEX_HOME ---
     let codex_home = setup_codex_home();
     let env = tui_env(&server_target, codex_home.path());
 
@@ -834,16 +828,7 @@ async fn run_tui_reactive(
 /// 4. Send 'y' to approve the tool call.
 /// 5. Wait for the model to respond, then Ctrl+C to exit.
 /// 6. Assert the TUI output contains evidence of the approved command.
-async fn tui_tool_approval_inner() {
-
-    // --- Start ephemeral Temporal server + worker ---
-    let _server = start_ephemeral_server().await;
-    let server_target = _server.target().to_string();
-    spawn_worker(&server_target);
-
-    // --- Set up CODEX_HOME ---
-    let codex_home = setup_codex_home();
-    let env = tui_env(&server_target, codex_home.path());
+async fn tui_tool_approval_inner(env: &HashMap<String, String>, server_target: &str) {
 
     // --- Spawn TUI with a prompt that will trigger a tool call ---
     // The model should invoke `shell` to run `echo hello`. The default
@@ -859,7 +844,7 @@ async fn tui_tool_approval_inner() {
     // 2. "XTESTDONE" → tool executed successfully. Send "/quit\r" to
     //    exit cleanly without waiting for the model to respond.
     let result = run_tui_reactive(
-        &env,
+        env,
         &["Print XTESTDONE using the shell".to_string()],
         vec![
             ReactiveInput {
@@ -1137,16 +1122,7 @@ async fn tui_apply_patch_approval_inner() {
 /// 4. Press Enter to submit the default answer.
 /// 5. Wait for the model to respond with a completion marker, then `/quit`.
 /// 6. Assert the workflow history contains a `UserInputAnswer` signal.
-async fn tui_request_user_input_inner() {
-
-    // --- Start ephemeral Temporal server + worker ---
-    let _server = start_ephemeral_server().await;
-    let server_target = _server.target().to_string();
-    spawn_worker(&server_target);
-
-    // --- Set up CODEX_HOME ---
-    let codex_home = setup_codex_home();
-    let env = tui_env(&server_target, codex_home.path());
+async fn tui_request_user_input_inner(env: &HashMap<String, String>) {
 
     // --- Spawn TUI with a prompt that triggers request_user_input ---
     // The model is instructed to call the request_user_input tool with a
@@ -1157,7 +1133,7 @@ async fn tui_request_user_input_inner() {
     eprintln!("  [user_input] starting TUI with request_user_input prompt...");
 
     let result = run_tui_reactive(
-        &env,
+        env,
         &[
             "You must use the request_user_input tool to ask me exactly one \
              yes/no question before responding. Do not use any other tools. \
@@ -1215,17 +1191,10 @@ async fn tui_request_user_input_inner() {
 /// Uses a bogus OPENAI_API_KEY so the model_call activity fails with an
 /// authentication error.  The TUI should display the real error from the
 /// API (e.g. "Incorrect API key") rather than a generic wrapper.
-async fn tui_activity_error_message_inner() {
-
-    // --- Start ephemeral Temporal server + worker ---
-    let _server = start_ephemeral_server().await;
-    let server_target = _server.target().to_string();
-    spawn_worker(&server_target);
-
-    // --- Set up CODEX_HOME ---
-    let codex_home = setup_codex_home();
+async fn tui_activity_error_message_inner(server_target: &str, codex_home_path: &std::path::Path) {
 
     // Build env with a bogus API key to trigger an auth error.
+    // Uses the shared server+worker but overrides the API key for the TUI process.
     let mut env = HashMap::new();
     env.insert(
         "TEMPORAL_ADDRESS".to_string(),
@@ -1237,7 +1206,7 @@ async fn tui_activity_error_message_inner() {
     );
     env.insert(
         "CODEX_HOME".to_string(),
-        codex_home.path().display().to_string(),
+        codex_home_path.display().to_string(),
     );
     env.insert("CODEX_DISABLE_ANALYTICS".to_string(), "1".to_string());
 
@@ -1290,6 +1259,83 @@ async fn tui_activity_error_message_inner() {
              error may have surfaced in a different form"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tool TUI rendering test
+// ---------------------------------------------------------------------------
+
+/// Verify that multiple sequential tool calls render in the TUI.
+///
+/// Regression test for the blank-screen bug: when the agentic loop calls
+/// multiple tools back-to-back, the temporal tool handler must emit
+/// ExecCommandBegin/ExecCommandEnd events for each tool so the TUI's
+/// watcher watermark advances and the UI can display progress.
+///
+/// 1. Start ephemeral Temporal server + worker.
+/// 2. Spawn TUI via PTY with a prompt that triggers two sequential shell
+///    commands, each printing a unique marker.
+/// 3. Verify both markers appear in the TUI output (via reactive patterns).
+///    If ExecCommandBegin/End events were missing, the watcher would block
+///    between tool calls and the second marker would never render.
+async fn tui_multi_tool_rendering_inner(env: &HashMap<String, String>) {
+
+    // --- Spawn TUI with a multi-tool prompt ---
+    // DangerFullAccess + Never approval → auto-approved, no overlay.
+    // The model runs two shell commands that each print a unique marker.
+    // We match on the second marker (XMULTI_B) to prove the TUI received
+    // events from both tool calls, then /quit.
+    eprintln!("  [multi_tool] starting TUI with multi-tool prompt...");
+
+    let result = run_tui_reactive(
+        &env,
+        &[
+            "Run these two shell commands one after the other: \
+             first `echo XMULTI_A`, then `echo XMULTI_B`. \
+             After both succeed, say XMULTIDONE."
+                .to_string(),
+        ],
+        vec![
+            // Stage 1: first tool output rendered.
+            ReactiveInput {
+                pattern: "XMULTI_A".to_string(),
+                data: vec![], // no keystroke — just verify it appeared
+            },
+            // Stage 2: second tool output rendered — proves events
+            // flowed between tool calls.
+            ReactiveInput {
+                pattern: "XMULTI_B".to_string(),
+                data: vec![], // no keystroke
+            },
+            // Stage 3: model finished — quit.
+            ReactiveInput {
+                pattern: "XMULTIDONE".to_string(),
+                data: b"/quit\r".to_vec(),
+            },
+        ],
+        Duration::from_secs(0),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    let result = result.expect("TUI binary failed to start");
+    eprintln!(
+        "  [multi_tool] TUI exited (code {}, reactions matched: {}/3)",
+        result.exit_code, result.reactions_matched,
+    );
+
+    // All three reactive patterns must match:
+    //   1. XMULTI_A — first tool output rendered in TUI
+    //   2. XMULTI_B — second tool output rendered (requires ExecCommandBegin/End)
+    //   3. XMULTIDONE — model completed turn
+    assert!(
+        result.reactions_matched >= 2,
+        "Expected at least 2 reactive patterns to match (XMULTI_A + XMULTI_B), \
+         but only {}/3 matched. The TUI did not render output from sequential \
+         tool calls — ExecCommandBegin/End events may be missing.",
+        result.reactions_matched,
+    );
+    eprintln!("  [multi_tool] PASSED — TUI rendered output from multiple sequential tool calls");
 }
 
 /// Strip ANSI escape sequences from a string for content matching.

@@ -8,12 +8,12 @@
 //! 4. If approved, executes the tool as a Temporal activity
 //! 5. If denied, returns an error response
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use codex_core::error::CodexErr;
 use codex_core::exec_policy::render_decision_for_unmatched_command;
@@ -27,7 +27,8 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::{
     AskForApproval, ApplyPatchApprovalRequestEvent, Event, EventMsg, ExecApprovalRequestEvent,
-    SandboxPolicy,
+    ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandSource, ExecCommandStatus,
+    PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, SandboxPolicy,
 };
 use codex_protocol::request_user_input::{RequestUserInputArgs, RequestUserInputEvent};
 use temporalio_common::protos::coresdk::workflow_commands::ActivityCancellationType;
@@ -483,6 +484,7 @@ impl ToolCallHandler for TemporalToolHandler {
 
                 // Execute via activity (with already_approved flag).
                 let already_approved = matches!(patch_needs_approval, PatchDecision::AskUser | PatchDecision::AutoApprove);
+                let auto_approved = matches!(patch_needs_approval, PatchDecision::AutoApprove);
                 let input = ToolExecInput {
                     tool_name,
                     call_id: call_id.clone(),
@@ -493,6 +495,17 @@ impl ToolCallHandler for TemporalToolHandler {
                     already_approved,
                     payload_kind: payload_kind.clone(),
                 };
+
+                // Emit PatchApplyBegin so the TUI shows progress.
+                events.emit_event_sync(Event {
+                    id: turn_id.clone(),
+                    msg: EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+                        call_id: call_id.clone(),
+                        turn_id: turn_id.clone(),
+                        auto_approved,
+                        changes: HashMap::new(),
+                    }),
+                });
 
                 let opts = ActivityOptions {
                     start_to_close_timeout: Some(Duration::from_secs(600)),
@@ -514,6 +527,25 @@ impl ToolCallHandler for TemporalToolHandler {
                         CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
                     })?,
                 };
+
+                // Emit PatchApplyEnd so the TUI renders the result.
+                let success = output.exit_code == 0;
+                events.emit_event_sync(Event {
+                    id: turn_id.clone(),
+                    msg: EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+                        call_id: call_id.clone(),
+                        turn_id: turn_id.clone(),
+                        stdout: output.output.clone(),
+                        stderr: String::new(),
+                        success,
+                        changes: HashMap::new(),
+                        status: if success {
+                            PatchApplyStatus::Completed
+                        } else {
+                            PatchApplyStatus::Failed
+                        },
+                    }),
+                });
 
                 return Ok(output.into_response_input_item());
             }
@@ -591,8 +623,8 @@ impl ToolCallHandler for TemporalToolHandler {
                     msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
                         call_id: call_id.clone(),
                         approval_id: Some(call_id.clone()),
-                        turn_id,
-                        command,
+                        turn_id: turn_id.clone(),
+                        command: command.clone(),
                         cwd: PathBuf::from("/tmp"),
                         reason: None,
                         network_approval_context: None,
@@ -645,15 +677,38 @@ impl ToolCallHandler for TemporalToolHandler {
 
             // 5. Execute tool as activity
             let input = ToolExecInput {
-                tool_name,
+                tool_name: tool_name.clone(),
                 call_id: call_id.clone(),
                 arguments,
                 model,
-                cwd,
+                cwd: cwd.clone(),
                 config_toml,
                 already_approved: needs_approval,
                 payload_kind: payload_kind.clone(),
             };
+
+            // Emit ExecCommandBegin so the TUI shows progress for this tool call.
+            // For shell tools we use the parsed command; for other tools (read_file,
+            // list_dir, etc.) we synthesize a command from the tool name so the TUI
+            // has something to display and the event watermark advances.
+            let display_command = if is_shell_tool {
+                command.clone()
+            } else {
+                vec![tool_name.clone()]
+            };
+            events.emit_event_sync(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                    call_id: call_id.clone(),
+                    process_id: None,
+                    turn_id: turn_id.clone(),
+                    command: display_command.clone(),
+                    cwd: PathBuf::from(&cwd),
+                    parsed_cmd: Vec::new(),
+                    source: ExecCommandSource::Agent,
+                    interaction_input: None,
+                }),
+            });
 
             let opts = ActivityOptions {
                 start_to_close_timeout: Some(Duration::from_secs(600)),
@@ -662,6 +717,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 ..Default::default()
             };
 
+            let started = Instant::now();
             let activity = ctx.start_activity(CodexActivities::tool_exec, input, opts);
             tokio::pin!(activity);
             let output = tokio::select! {
@@ -674,6 +730,34 @@ impl ToolCallHandler for TemporalToolHandler {
                     CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
                 })?,
             };
+
+            // Emit ExecCommandEnd so the TUI renders the result.
+            let duration = started.elapsed();
+            let exit_code = output.exit_code;
+            events.emit_event_sync(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    call_id: call_id.clone(),
+                    process_id: None,
+                    turn_id: turn_id.clone(),
+                    command: display_command,
+                    cwd: PathBuf::from(&cwd),
+                    parsed_cmd: Vec::new(),
+                    source: ExecCommandSource::Agent,
+                    interaction_input: None,
+                    stdout: output.output.clone(),
+                    stderr: String::new(),
+                    aggregated_output: String::new(),
+                    exit_code,
+                    duration,
+                    formatted_output: output.output.clone(),
+                    status: if exit_code == 0 {
+                        ExecCommandStatus::Completed
+                    } else {
+                        ExecCommandStatus::Failed
+                    },
+                }),
+            });
 
             Ok(output.into_response_input_item())
         })

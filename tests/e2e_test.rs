@@ -2960,6 +2960,9 @@ async fn e2e_tests_inner() {
     eprintln!("--- test: patch_auto_approve_full_access ---");
     patch_auto_approve_full_access(&client).await;
 
+    eprintln!("--- test: multi_tool_emits_exec_events ---");
+    multi_tool_emits_exec_events(&client).await;
+
     // --- teardown ---
     // Restore CODEX_HOME.
     // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
@@ -3289,6 +3292,90 @@ async fn patch_auto_approve_full_access(client: &Client) {
             _ => {}
         }
     }
+
+    drain_shutdown(&session).await;
+}
+
+/// Test: multiple sequential tool calls emit ExecCommandBegin/End events.
+///
+/// Regression test for the TUI blank-screen bug: when the agentic loop calls
+/// multiple tools in a row, the temporal tool handler must emit
+/// ExecCommandBegin/ExecCommandEnd events for each tool so the TUI watcher's
+/// watermark advances and the UI can display progress.
+async fn multi_tool_emits_exec_events(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Ask for two sequential shell commands so the model calls tools back-to-back.
+    let op = Op::UserTurn {
+        items: vec![UserInput::Text {
+            text: "Run these two shell commands one after the other and tell me both outputs: \
+                   first `echo MULTI_TOOL_A`, then `echo MULTI_TOOL_B`."
+                .to_string(),
+            text_elements: vec![],
+        }],
+        cwd: std::env::current_dir().unwrap_or_else(|_| "/tmp".into()),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        model: "gpt-4o-mini".to_string(),
+        effort: None,
+        summary: Some(ReasoningSummary::Auto),
+        service_tier: None,
+        final_output_json_schema: None,
+        collaboration_mode: None,
+        personality: None,
+    };
+    session.submit(op).await.expect("submit failed");
+
+    let mut exec_begin_count = 0usize;
+    let mut exec_end_count = 0usize;
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!(
+                "timed out waiting for TurnComplete (saw {exec_begin_count} begins, \
+                 {exec_end_count} ends)"
+            );
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ExecCommandBegin(_) => exec_begin_count += 1,
+            EventMsg::ExecCommandEnd(_) => exec_end_count += 1,
+            EventMsg::ExecApprovalRequest(req) => {
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("approval failed");
+            }
+            EventMsg::TurnComplete(tc) => {
+                assert!(
+                    tc.last_agent_message.is_some(),
+                    "expected non-empty agent message"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // We should see at least 2 begin/end pairs (one per tool call).
+    assert!(
+        exec_begin_count >= 2,
+        "expected at least 2 ExecCommandBegin events for multi-tool turn, got {exec_begin_count}"
+    );
+    assert!(
+        exec_end_count >= 2,
+        "expected at least 2 ExecCommandEnd events for multi-tool turn, got {exec_end_count}"
+    );
+    assert_eq!(
+        exec_begin_count, exec_end_count,
+        "ExecCommandBegin ({exec_begin_count}) and ExecCommandEnd ({exec_end_count}) counts \
+         should match"
+    );
 
     drain_shutdown(&session).await;
 }
