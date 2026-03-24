@@ -406,9 +406,9 @@ async fn tui_pty_tests() {
         .expect("tui_session_reconnect timed out after 20s");
 
     eprintln!("--- test: tui_session_switch ---");
-    timeout(Duration::from_secs(15), tui_session_switch_inner())
+    timeout(Duration::from_secs(30), tui_session_switch_inner())
         .await
-        .expect("tui_session_switch timed out after 15s");
+        .expect("tui_session_switch timed out after 30s");
 
     eprintln!("--- test: tui_tool_approval ---");
     timeout(Duration::from_secs(30), tui_tool_approval_inner(&env, &server_target))
@@ -647,41 +647,53 @@ async fn tui_session_switch_inner() {
         &env,
         &["hi".to_string()],
         vec![
-            // TUI started — open session picker.
+            // Wait for the TUI to be idle (turn complete) before
+            // opening the session picker.  "% left" appears in the
+            // status bar only when the main view is rendered.
             ReactiveInput {
-                pattern: "codex".to_string(),
-                data: b"/session\r".to_vec(),
+                pattern: "% left".to_string(),
+                data: b"/session".to_vec(), // type command (no Enter yet)
             },
-            // Picker rendered — select session A.
+            // Slash command popup shows the "session" option — press Enter.
             ReactiveInput {
                 pattern: "session".to_string(),
+                data: b"\r".to_vec(),
+            },
+            // Session picker rendered — select session A.
+            ReactiveInput {
+                pattern: "select a session".to_string(),
                 data: down_enter.clone(),
             },
-            // Switched to session A — open picker again.
+            // Switched to session A — wait for status bar (main view).
             ReactiveInput {
-                pattern: "codex".to_string(),
-                data: b"/session\r".to_vec(),
+                pattern: "% left".to_string(),
+                data: b"/session".to_vec(),
             },
-            // Picker rendered — select session B.
+            // Slash command popup — press Enter.
             ReactiveInput {
                 pattern: "session".to_string(),
+                data: b"\r".to_vec(),
+            },
+            // Session picker rendered — select session B.
+            ReactiveInput {
+                pattern: "select a session".to_string(),
                 data: down_enter,
             },
             // Switched back to session B — quit.
             ReactiveInput {
-                pattern: "codex".to_string(),
+                pattern: "% left".to_string(),
                 data: b"/quit\r".to_vec(),
             },
         ],
         Duration::from_secs(0),
-        Duration::from_secs(10),
+        Duration::from_secs(15),
     )
     .await
     .expect("failed to run TUI #2 with /session switching");
 
     assert_eq!(
-        result2.reactions_matched, 5,
-        "Expected all 5 session-switch reactions to match, but only {}/5 matched.",
+        result2.reactions_matched, 7,
+        "Expected all 7 session-switch reactions to match, but only {}/7 matched.",
         result2.reactions_matched,
     );
 
@@ -808,6 +820,12 @@ async fn run_tui_reactive(
                 output.extend_from_slice(&chunk);
             }
             let output = String::from_utf8_lossy(&output).to_string();
+            // Dump pending output for debugging timeouts.
+            if !output.is_empty() {
+                eprintln!("  [reactive] TIMEOUT — pending output ({} bytes):\n---\n{}\n---", output.len(), &output[..output.len().min(2000)]);
+            } else {
+                eprintln!("  [reactive] TIMEOUT — no pending output");
+            }
             return Ok(TuiOutput { exit_code: -1, output, reactions_matched });
         }
     };
@@ -1191,18 +1209,38 @@ async fn tui_request_user_input_inner(env: &HashMap<String, String>) {
 /// Uses a bogus OPENAI_API_KEY so the model_call activity fails with an
 /// authentication error.  The TUI should display the real error from the
 /// API (e.g. "Incorrect API key") rather than a generic wrapper.
-async fn tui_activity_error_message_inner(server_target: &str, codex_home_path: &std::path::Path) {
+async fn tui_activity_error_message_inner(_server_target: &str, codex_home_path: &std::path::Path) {
 
-    // Build env with a bogus API key to trigger an auth error.
-    // Uses the shared server+worker but overrides the API key for the TUI process.
+    // This test needs its own server+worker so the WORKER uses the bogus key.
+    // The shared worker has the real API key, and `credentials_available`
+    // returns true, causing the TUI to skip token forwarding — so the
+    // shared worker would use the real key and succeed instead of failing.
+    let bogus_key = "sk-bogus-key-for-error-test";
+
+    // Temporarily set the bogus key so the worker picks it up.
+    let real_key = std::env::var("OPENAI_API_KEY").ok();
+    unsafe { std::env::set_var("OPENAI_API_KEY", bogus_key) };
+
+    let _error_server = start_ephemeral_server().await;
+    let error_server_target = _error_server.target().to_string();
+    spawn_worker(&error_server_target);
+
+    // Restore the real key for subsequent tests.
+    unsafe {
+        match real_key {
+            Some(key) => std::env::set_var("OPENAI_API_KEY", key),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
+
     let mut env = HashMap::new();
     env.insert(
         "TEMPORAL_ADDRESS".to_string(),
-        format!("http://{}", server_target),
+        format!("http://{}", error_server_target),
     );
     env.insert(
         "OPENAI_API_KEY".to_string(),
-        "sk-bogus-key-for-error-test".to_string(),
+        bogus_key.to_string(),
     );
     env.insert(
         "CODEX_HOME".to_string(),

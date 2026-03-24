@@ -124,6 +124,7 @@ fn new_session_with_policy(
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -400,6 +401,7 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -428,6 +430,7 @@ fn new_session_with_effort(
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -506,6 +509,7 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -850,6 +854,7 @@ async fn session_resume(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1109,6 +1114,7 @@ shell_tool = true
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1203,6 +1209,7 @@ sandbox_mode = "read-only"
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2044,6 +2051,7 @@ async fn patch_approval_flow(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2159,6 +2167,7 @@ async fn dynamic_tool_flow(client: &Client) {
             }),
             defer_loading: false,
         }],
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -2249,6 +2258,7 @@ async fn session_spawns_main_agent(client: &Client) {
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -2314,6 +2324,7 @@ async fn session_spawn_additional_agent(client: &Client) {
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
 
@@ -2431,6 +2442,7 @@ description = "Main agent"
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let mut inputs = std::collections::BTreeMap::new();
@@ -2522,6 +2534,7 @@ description = "Helper agent for sub-tasks"
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let inputs = std::collections::BTreeMap::new();
@@ -2650,6 +2663,7 @@ async fn default_crew_agents_available(client: &Client) {
         model_provider: None,
         crew_agents,
         continued_state: None,
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
 
@@ -3062,6 +3076,7 @@ async fn session_switch_via_browser(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,

@@ -28,8 +28,8 @@ use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
-    AskForApproval, ContextCompactedEvent, Event, EventMsg, Op, ReviewDecision,
-    TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+    AgentMessageEvent, AskForApproval, ContextCompactedEvent, Event, EventMsg, Op,
+    ReviewDecision, TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
 };
 use codex_protocol::user_input::UserInput;
 use codex_protocol::ThreadId;
@@ -57,8 +57,8 @@ use crate::types::{
     StateUpdateRequest, StateUpdateResponse, UserTurnInput,
 };
 
-/// Maximum number of model→tool loop iterations per turn.
-const MAX_ITERATIONS: u32 = 50;
+/// Default maximum number of model→tool loop iterations per turn.
+const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
 #[workflow]
 pub struct AgentWorkflow {
@@ -484,6 +484,7 @@ impl AgentWorkflow {
     pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<AgentWorkflowOutput> {
         let input = ctx.state(|s| s.input.clone());
         let events = ctx.state(|s| s.events.clone());
+        let max_iterations = input.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
         // --- deterministic entropy ---
         let seed = ctx.random_seed();
@@ -898,8 +899,27 @@ impl AgentWorkflow {
                             break;
                         }
 
-                        if iterations >= MAX_ITERATIONS {
-                            tracing::warn!("max iterations reached ({MAX_ITERATIONS}), stopping turn");
+                        if iterations >= max_iterations {
+                            tracing::warn!("max iterations reached ({max_iterations}), stopping turn");
+                            // Emit a visible message so the user knows why the
+                            // turn ended without a final response.
+                            events.emit_event_sync(Event {
+                                id: turn_id.clone(),
+                                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                    message: format!(
+                                        "⚠️ Maximum iterations ({max_iterations}) reached. \
+                                         The model was still processing tool calls. \
+                                         You can continue with a follow-up message."
+                                    ),
+                                    phase: None,
+                                }),
+                            });
+                            ctx.state_mut(|s| s.bump_version());
+                            last_agent_message = Some(format!(
+                                "Maximum iterations ({max_iterations}) reached — \
+                                 the model was still processing. \
+                                 You can continue with a follow-up message."
+                            ));
                             break;
                         }
 

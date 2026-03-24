@@ -534,6 +534,10 @@ pub struct AgentWorkflowInput {
     /// Client-defined dynamic tools (handled via signal/wait).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    /// Maximum number of model→tool loop iterations per turn.
+    /// Defaults to 50 when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 }
 
 fn default_role() -> String {
@@ -602,6 +606,10 @@ pub struct SessionWorkflowInput {
     /// State carried over from a previous continue-as-new execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_state: Option<SessionContinueAsNewState>,
+    /// Maximum number of model→tool loop iterations per turn.
+    /// Defaults to 50 when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 }
 
 impl From<AgentWorkflowInput> for SessionWorkflowInput {
@@ -619,6 +627,7 @@ impl From<AgentWorkflowInput> for SessionWorkflowInput {
             model_provider: input.model_provider,
             crew_agents: BTreeMap::new(),
             continued_state: None,
+            max_iterations: input.max_iterations,
         }
     }
 }

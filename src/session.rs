@@ -517,6 +517,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                     model_provider: base_input.model_provider.clone(),
                     crew_agents: base_input.crew_agents.clone(),
                     continued_state: None,
+                    max_iterations: base_input.max_iterations,
                 };
 
                 // Try once synchronously first.

@@ -162,6 +162,7 @@ fn workflow_input_roundtrips_through_json() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -543,6 +544,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -568,6 +570,7 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -606,6 +609,7 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -638,6 +642,7 @@ fn workflow_input_reasoning_effort_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -752,6 +757,7 @@ fn workflow_input_with_continued_state_roundtrips() {
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
         dynamic_tools: Vec::new(),
+        max_iterations: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -1524,6 +1530,7 @@ fn workflow_input_developer_instructions_roundtrips() {
         developer_instructions: Some("Always respond in JSON format.".to_string()),
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1573,6 +1580,7 @@ fn workflow_input_model_provider_roundtrips() {
         developer_instructions: None,
         model_provider: Some(provider.clone()),
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2155,6 +2163,7 @@ fn session_workflow_input_roundtrips_through_json() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -2209,6 +2218,7 @@ fn agent_workflow_input_with_new_fields_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "explorer".to_string(),
         config_toml: Some("model = \"gpt-5\"".to_string()),
         project_context: Some(ProjectContextOutput {
@@ -2416,6 +2426,7 @@ fn backward_compat_type_aliases_work() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2446,6 +2457,7 @@ fn codex_workflow_input_converts_to_session_workflow_input() {
         developer_instructions: Some("dev note".to_string()),
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2637,6 +2649,7 @@ fn apply_crew_type_interpolates_placeholders() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     apply_crew_type(&crew, &inputs, &mut base).unwrap();
@@ -2694,6 +2707,7 @@ fn apply_crew_type_rejects_missing_required_input() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let err = apply_crew_type(&crew, &empty_inputs, &mut base);
@@ -2743,6 +2757,7 @@ fn apply_crew_type_uses_input_defaults() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     apply_crew_type(&crew, &empty_inputs, &mut base).unwrap();
@@ -2865,6 +2880,7 @@ fn session_workflow_input_crew_agents_roundtrip() {
         model_provider: None,
         crew_agents: crew_agents.clone(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -2975,6 +2991,7 @@ fn apply_crew_type_populates_crew_agents() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     apply_crew_type(&crew, &inputs, &mut base).unwrap();
