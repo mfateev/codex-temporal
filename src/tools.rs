@@ -747,7 +747,7 @@ impl ToolCallHandler for TemporalToolHandler {
                     interaction_input: None,
                     stdout: output.output.clone(),
                     stderr: String::new(),
-                    aggregated_output: String::new(),
+                    aggregated_output: output.output.clone(),
                     exit_code,
                     duration,
                     formatted_output: output.output.clone(),
