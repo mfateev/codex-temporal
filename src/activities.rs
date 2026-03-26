@@ -152,7 +152,6 @@ impl CodexActivities {
             provider,
             SessionSource::Exec,
             None,  // model_verbosity
-            false, // responses_websockets_enabled_by_feature
             false, // request compression
             false, // timing metrics
             None,  // beta features header
@@ -417,7 +416,8 @@ impl CodexActivities {
         let codex_home = PathBuf::from("/tmp/codex-temporal");
         let mut config = codex_core::config::Config::for_harness(codex_home)
             .map_err(|e| anyhow::anyhow!("failed to build config for project context: {e}"))?;
-        config.cwd = cwd.clone();
+        config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(cwd.clone())
+            .map_err(|e| anyhow::anyhow!("invalid cwd: {e}"))?;
 
         // Read AGENTS.md chain (git root → cwd).
         let user_instructions = codex_core::project_doc::read_project_docs(&config)
@@ -428,7 +428,13 @@ impl CodexActivities {
             });
 
         // Collect git info (commit, branch, remote URL).
-        let git_info = codex_core::git_info::collect_git_info(&cwd).await;
+        let git_info = codex_git_utils::collect_git_info(&cwd).await.map(|g| {
+            codex_protocol::protocol::GitInfo {
+                commit_hash: g.commit_hash,
+                branch: g.branch,
+                repository_url: g.repository_url,
+            }
+        });
 
         tracing::debug!(
             has_instructions = user_instructions.is_some(),
@@ -630,7 +636,8 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
         let codex_home = PathBuf::from("/tmp/codex-temporal");
         let mut c = codex_core::config::Config::for_harness(codex_home)
             .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
-        c.cwd = cwd;
+        c.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(cwd)
+            .map_err(|e| anyhow::anyhow!("invalid cwd: {e}"))?;
         c
     };
     config.model = Some(input.model.clone());
@@ -848,10 +855,11 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
 
     // Dispatch via the router.
     match router
-        .dispatch_tool_call(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
+        .dispatch_tool_call_with_code_mode_result(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
         .await
     {
-        Ok(response_item) => {
+        Ok(result) => {
+            let response_item = result.into_response();
             let (output, exit_code) = extract_tool_output(&response_item);
             Ok(ToolExecOutput {
                 call_id: input.call_id,

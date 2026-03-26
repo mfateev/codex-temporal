@@ -88,6 +88,7 @@ fn user_turn_op(text: &str) -> Op {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
+        approvals_reviewer: None,
     }
 }
 

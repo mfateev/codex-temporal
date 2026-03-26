@@ -39,6 +39,9 @@ codex-tui = { git = "https://github.com/mfateev/codex.git", branch = "task/codex
 codex-shell-command = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
 codex-apply-patch = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
 codex-rmcp-client = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-features = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-git-utils = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
+codex-utils-absolute-path = { git = "https://github.com/mfateev/codex.git", branch = "task/codex-temporal" }
 rmcp = { version = "0.15.0", default-features = false, features = ["base64", "macros", "schemars"] }
 
 

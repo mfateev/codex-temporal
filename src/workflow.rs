@@ -157,7 +157,7 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
             env_lines.push(format!("    <branch>{branch}</branch>"));
         }
         if let Some(ref commit) = git.commit_hash {
-            env_lines.push(format!("    <commit>{commit}</commit>"));
+            env_lines.push(format!("    <commit>{}</commit>", commit.0));
         }
         if let Some(ref url) = git.repository_url {
             env_lines.push(format!("    <repository_url>{url}</repository_url>"));
@@ -912,6 +912,7 @@ impl AgentWorkflow {
                                          You can continue with a follow-up message."
                                     ),
                                     phase: None,
+                                    memory_citation: None,
                                 }),
                             });
                             ctx.state_mut(|s| s.bump_version());
