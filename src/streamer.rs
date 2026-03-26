@@ -77,7 +77,13 @@ impl ModelStreamer for TemporalModelStreamer {
                 return Err(codex_core::error::CodexErr::TurnAborted);
             }
             result = &mut activity => result.map_err(|e| {
-                let msg = format!("{e}");
+                // Extract the full error message chain from the Temporal
+                // Failure.  ActivityExecutionError::Failed wraps a Failure
+                // proto whose Display only shows the top-level `message`
+                // field (often just "Activity task failed").  The actual
+                // error from the activity (e.g. "Quota exceeded") is in
+                // the `cause` chain.  Walk it to build a complete message.
+                let msg = unwrap_activity_error_message(&e);
                 // Preserve non-retryable semantics: if the activity error
                 // message matches a known fatal condition, map to the
                 // corresponding non-retryable CodexErr so the workflow
@@ -88,7 +94,7 @@ impl ModelStreamer for TemporalModelStreamer {
                     codex_core::error::CodexErr::UsageNotIncluded
                 } else {
                     codex_core::error::CodexErr::Stream(
-                        format!("model_call activity failed: {e}"),
+                        format!("model_call activity failed: {msg}"),
                         None,
                     )
                 }
@@ -111,5 +117,21 @@ impl ModelStreamer for TemporalModelStreamer {
         .ok();
 
         Ok(ResponseStream::from_receiver(rx))
+    }
+}
+
+/// Extract the full error message chain from an [`ActivityExecutionError`].
+///
+/// Delegates to [`format_temporal_failure`] for the `Failure` proto inside
+/// `Failed` and `Cancelled` variants.
+fn unwrap_activity_error_message(
+    e: &temporalio_sdk::ActivityExecutionError,
+) -> String {
+    use temporalio_sdk::ActivityExecutionError;
+    match e {
+        ActivityExecutionError::Failed(f) | ActivityExecutionError::Cancelled(f) => {
+            crate::types::format_temporal_failure(f)
+        }
+        other => format!("{other}"),
     }
 }

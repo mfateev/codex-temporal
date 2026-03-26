@@ -94,6 +94,7 @@ pub async fn load_harness_config() -> Result<HarnessConfig, Box<dyn std::error::
         model_provider: None, // Set by caller from HarnessConfig.model_provider
         crew_agents,
         continued_state: None,
+        max_iterations: None,
     };
 
     Ok(HarnessConfig {

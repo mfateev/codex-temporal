@@ -238,6 +238,7 @@ impl SessionWorkflow {
             project_context: Some(project_context.clone()),
             mcp_tools: mcp_tools.clone(),
             dynamic_tools: Vec::new(),
+            max_iterations: input.max_iterations,
         };
 
         let child = ctx.child_workflow(ChildWorkflowOptions {
@@ -436,6 +437,7 @@ impl SessionWorkflow {
                     project_context: Some(project_context.clone()),
                     mcp_tools: mcp_tools.clone(),
                     dynamic_tools: Vec::new(),
+                    max_iterations: input.max_iterations,
                 };
 
                 let child = ctx.child_workflow(ChildWorkflowOptions {

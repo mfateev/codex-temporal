@@ -28,8 +28,8 @@ use codex_protocol::config_types::{Personality, ReasoningSummary};
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
-    AskForApproval, ContextCompactedEvent, Event, EventMsg, Op, ReviewDecision,
-    TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
+    AgentMessageEvent, AskForApproval, ContextCompactedEvent, Event, EventMsg, Op,
+    ReviewDecision, TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
 };
 use codex_protocol::user_input::UserInput;
 use codex_protocol::ThreadId;
@@ -57,8 +57,8 @@ use crate::types::{
     StateUpdateRequest, StateUpdateResponse, UserTurnInput,
 };
 
-/// Maximum number of model→tool loop iterations per turn.
-const MAX_ITERATIONS: u32 = 50;
+/// Default maximum number of model→tool loop iterations per turn.
+const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
 #[workflow]
 pub struct AgentWorkflow {
@@ -157,7 +157,7 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
             env_lines.push(format!("    <branch>{branch}</branch>"));
         }
         if let Some(ref commit) = git.commit_hash {
-            env_lines.push(format!("    <commit>{commit}</commit>"));
+            env_lines.push(format!("    <commit>{}</commit>", commit.0));
         }
         if let Some(ref url) = git.repository_url {
             env_lines.push(format!("    <repository_url>{url}</repository_url>"));
@@ -484,30 +484,13 @@ impl AgentWorkflow {
     pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<AgentWorkflowOutput> {
         let input = ctx.state(|s| s.input.clone());
         let events = ctx.state(|s| s.events.clone());
+        let max_iterations = input.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
         // --- deterministic entropy ---
         let seed = ctx.random_seed();
         let entropy = EntropyProviders {
             random: Arc::new(TemporalRandomSource::new(seed)),
         };
-
-        // --- startup: fetch worker token (always, even after CAN) ---
-        // The worker token ties activity dispatch to this worker, preventing
-        // unauthorized tool execution from rogue workflows on shared task queues.
-        let worker_token: String = ctx
-            .start_activity(
-                CodexActivities::get_worker_token,
-                (),
-                ActivityOptions {
-                    schedule_to_close_timeout: Some(std::time::Duration::from_secs(5)),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("get_worker_token failed: {e} — proceeding without token");
-                String::new()
-            });
 
         // --- startup: load config, project context, MCP tools ---
         // If pre-resolved by SessionWorkflow, use directly; otherwise fall
@@ -516,7 +499,6 @@ impl AgentWorkflow {
             if input.config_toml.is_some() && input.project_context.is_some() {
                 let config_output = ConfigOutput {
                     config_toml: input.config_toml.clone().unwrap(),
-                    worker_token: Some(worker_token.clone()),
                 };
                 let project_context = input.project_context.clone().unwrap();
                 let mcp_tools = input.mcp_tools.clone();
@@ -917,8 +899,28 @@ impl AgentWorkflow {
                             break;
                         }
 
-                        if iterations >= MAX_ITERATIONS {
-                            tracing::warn!("max iterations reached ({MAX_ITERATIONS}), stopping turn");
+                        if iterations >= max_iterations {
+                            tracing::warn!("max iterations reached ({max_iterations}), stopping turn");
+                            // Emit a visible message so the user knows why the
+                            // turn ended without a final response.
+                            events.emit_event_sync(Event {
+                                id: turn_id.clone(),
+                                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                                    message: format!(
+                                        "⚠️ Maximum iterations ({max_iterations}) reached. \
+                                         The model was still processing tool calls. \
+                                         You can continue with a follow-up message."
+                                    ),
+                                    phase: None,
+                                    memory_citation: None,
+                                }),
+                            });
+                            ctx.state_mut(|s| s.bump_version());
+                            last_agent_message = Some(format!(
+                                "Maximum iterations ({max_iterations}) reached — \
+                                 the model was still processing. \
+                                 You can continue with a follow-up message."
+                            ));
                             break;
                         }
 
@@ -939,7 +941,6 @@ impl AgentWorkflow {
                             effective_model,
                             config.cwd.to_string_lossy().to_string(),
                             Some(config_output.config_toml.clone()),
-                            config_output.worker_token.clone(),
                             mcp_tool_names.clone(),
                             dynamic_tool_names.clone(),
                             config.permissions.sandbox_policy.get().clone(),

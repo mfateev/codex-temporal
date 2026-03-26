@@ -77,11 +77,6 @@ pub struct CodexActivities {
     models_manager: Arc<ModelsManager>,
     /// Persistent MCP server connections (initialized via `discover_mcp_tools`).
     mcp_manager: Arc<Mutex<HarnessMcpManager>>,
-    /// Worker-issued token for activity-level authentication.
-    /// Generated once at worker startup; verified by `tool_exec` before
-    /// executing any tool. Prevents unauthorized activity dispatch from
-    /// rogue workflows on shared task queues.
-    worker_token: String,
 }
 
 impl Default for CodexActivities {
@@ -113,7 +108,6 @@ impl CodexActivities {
             _auth_manager: auth_manager,
             models_manager,
             mcp_manager: Arc::new(Mutex::new(HarnessMcpManager::new())),
-            worker_token: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -158,7 +152,6 @@ impl CodexActivities {
             provider,
             SessionSource::Exec,
             None,  // model_verbosity
-            false, // responses_websockets_enabled_by_feature
             false, // request compression
             false, // timing metrics
             None,  // beta features header
@@ -245,40 +238,12 @@ impl CodexActivities {
     ///
     /// Supports all tools registered by `build_specs`: shell, apply_patch,
     /// read_file, list_dir, grep_files, etc.
-    ///
-    /// Verifies the `worker_token` in the input matches this worker's token
-    /// before executing. This prevents unauthorized activity dispatch from
-    /// rogue workflows on shared Temporal task queues.
     #[activity]
     pub async fn tool_exec(
         self: Arc<Self>,
         _ctx: ActivityContext,
         input: ToolExecInput,
     ) -> Result<ToolExecOutput, ActivityError> {
-        // Verify worker token before executing anything.
-        match &input.worker_token {
-            Some(token) if token == &self.worker_token => {}
-            Some(_) => {
-                tracing::warn!(
-                    tool = %input.tool_name,
-                    call_id = %input.call_id,
-                    "tool_exec rejected: worker token mismatch"
-                );
-                return Err(anyhow::anyhow!(
-                    "tool_exec rejected: worker token mismatch — \
-                     activity was not dispatched by a legitimate workflow on this worker"
-                ).into());
-            }
-            None => {
-                tracing::warn!(
-                    tool = %input.tool_name,
-                    call_id = %input.call_id,
-                    "tool_exec: no worker token provided (legacy caller)"
-                );
-                // Allow for backward compatibility, but log the gap.
-            }
-        }
-
         tracing::debug!(
             tool = %input.tool_name,
             call_id = %input.call_id,
@@ -321,7 +286,6 @@ impl CodexActivities {
 
         Ok(ConfigOutput {
             config_toml: toml_string,
-            worker_token: Some(self.worker_token.clone()),
         })
     }
 
@@ -452,7 +416,8 @@ impl CodexActivities {
         let codex_home = PathBuf::from("/tmp/codex-temporal");
         let mut config = codex_core::config::Config::for_harness(codex_home)
             .map_err(|e| anyhow::anyhow!("failed to build config for project context: {e}"))?;
-        config.cwd = cwd.clone();
+        config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(cwd.clone())
+            .map_err(|e| anyhow::anyhow!("invalid cwd: {e}"))?;
 
         // Read AGENTS.md chain (git root → cwd).
         let user_instructions = codex_core::project_doc::read_project_docs(&config)
@@ -463,7 +428,13 @@ impl CodexActivities {
             });
 
         // Collect git info (commit, branch, remote URL).
-        let git_info = codex_core::git_info::collect_git_info(&cwd).await;
+        let git_info = codex_git_utils::collect_git_info(&cwd).await.map(|g| {
+            codex_protocol::protocol::GitInfo {
+                commit_hash: g.commit_hash,
+                branch: g.branch,
+                repository_url: g.repository_url,
+            }
+        });
 
         tracing::debug!(
             has_instructions = user_instructions.is_some(),
@@ -476,21 +447,6 @@ impl CodexActivities {
             user_instructions,
             git_info,
         })
-    }
-
-    /// Return this worker's activity token.
-    ///
-    /// Lightweight activity called at workflow startup so the workflow can
-    /// include the token in subsequent `ToolExecInput` calls. This is
-    /// always called — even after continue-as-new or when config is
-    /// pre-resolved — to ensure the token matches the current worker.
-    #[activity]
-    pub async fn get_worker_token(
-        self: Arc<Self>,
-        _ctx: ActivityContext,
-        _input: (),
-    ) -> Result<String, ActivityError> {
-        Ok(self.worker_token.clone())
     }
 
     /// Check if the worker has API credentials available.
@@ -680,7 +636,8 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
         let codex_home = PathBuf::from("/tmp/codex-temporal");
         let mut c = codex_core::config::Config::for_harness(codex_home)
             .map_err(|e| anyhow::anyhow!("failed to build config: {e}"))?;
-        c.cwd = cwd;
+        c.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(cwd)
+            .map_err(|e| anyhow::anyhow!("invalid cwd: {e}"))?;
         c
     };
     config.model = Some(input.model.clone());
@@ -898,10 +855,11 @@ pub async fn dispatch_tool(input: ToolExecInput) -> Result<ToolExecOutput, anyho
 
     // Dispatch via the router.
     match router
-        .dispatch_tool_call(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
+        .dispatch_tool_call_with_code_mode_result(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
         .await
     {
-        Ok(response_item) => {
+        Ok(result) => {
+            let response_item = result.into_response();
             let (output, exit_code) = extract_tool_output(&response_item);
             Ok(ToolExecOutput {
                 call_id: input.call_id,

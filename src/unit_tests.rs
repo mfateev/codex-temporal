@@ -162,6 +162,7 @@ fn workflow_input_roundtrips_through_json() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -543,6 +544,7 @@ fn workflow_input_approval_policy_never_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -568,6 +570,7 @@ fn workflow_input_approval_policy_untrusted_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -606,6 +609,7 @@ fn workflow_input_web_search_mode_live_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -638,6 +642,7 @@ fn workflow_input_reasoning_effort_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -752,6 +757,7 @@ fn workflow_input_with_continued_state_roundtrips() {
         project_context: None,
         mcp_tools: std::collections::HashMap::new(),
         dynamic_tools: Vec::new(),
+        max_iterations: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -880,7 +886,7 @@ fn tool_input(tool_name: &str, arguments: &str) -> ToolExecInput {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     }
@@ -942,7 +948,7 @@ async fn dispatch_shell_with_cwd() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -978,7 +984,7 @@ sandbox_mode = "read-only"
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(toml_str.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1006,7 +1012,7 @@ async fn dispatch_tool_rejects_empty_tool_name() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1029,7 +1035,7 @@ async fn dispatch_tool_rejects_nonexistent_cwd() {
         model: "gpt-4o".to_string(),
         cwd: "/nonexistent/path/that/does/not/exist".to_string(),
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1056,7 +1062,7 @@ async fn dispatch_tool_rejects_cwd_that_is_file() {
         model: "gpt-4o".to_string(),
         cwd: file_path,
         config_toml: Some(FULL_ACCESS_TOML.to_string()),
-        worker_token: None,
+
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1094,7 +1100,7 @@ async fn dispatch_with_experimental_tools(
     let codex_home = std::path::PathBuf::from("/tmp/codex-temporal");
     let mut config = codex_core::config::Config::for_harness(codex_home).unwrap();
     config.model = Some("gpt-4o".to_string());
-    config.cwd = std::path::PathBuf::from("/tmp");
+    config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(std::path::PathBuf::from("/tmp")).unwrap();
     let config = Arc::new(config);
 
     let model_slug = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
@@ -1151,10 +1157,11 @@ async fn dispatch_with_experimental_tools(
     };
 
     match router
-        .dispatch_tool_call(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
+        .dispatch_tool_call_with_code_mode_result(session, turn_context, tracker, tool_call, ToolCallSource::Direct)
         .await
     {
-        Ok(item) => {
+        Ok(result) => {
+            let item = result.into_response();
             // Extract text from the response item.
             match &item {
                 codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } => {
@@ -1176,28 +1183,7 @@ async fn dispatch_with_experimental_tools(
     }
 }
 
-#[tokio::test]
-async fn dispatch_read_file_reads_system_file() {
-    let file_path = if cfg!(target_os = "linux") {
-        "/etc/hostname"
-    } else {
-        "/etc/hosts" // exists on both macOS and Linux
-    };
-
-    let args = format!(r#"{{"file_path":"{}"}}"#, file_path);
-    let (output, exit_code) = dispatch_with_experimental_tools(
-        "read_file",
-        &args,
-        &["read_file"],
-    )
-    .await;
-
-    assert_eq!(exit_code, 0, "read_file should succeed: {output}");
-    assert!(
-        !output.is_empty(),
-        "read_file output should not be empty",
-    );
-}
+// read_file tool was removed upstream — test removed.
 
 #[tokio::test]
 async fn dispatch_list_dir_lists_tmp() {
@@ -1353,7 +1339,7 @@ fn project_context_output_roundtrips() {
         cwd: "/home/user/project".to_string(),
         user_instructions: Some("Do not modify tests.".to_string()),
         git_info: Some(GitInfo {
-            commit_hash: Some("abc123".to_string()),
+            commit_hash: Some(codex_git_utils::GitSha::new("abc123")),
             branch: Some("main".to_string()),
             repository_url: Some("https://github.com/user/project".to_string()),
         }),
@@ -1365,7 +1351,7 @@ fn project_context_output_roundtrips() {
     assert_eq!(back.cwd, "/home/user/project");
     assert_eq!(back.user_instructions.as_deref(), Some("Do not modify tests."));
     let git = back.git_info.unwrap();
-    assert_eq!(git.commit_hash.as_deref(), Some("abc123"));
+    assert_eq!(git.commit_hash.as_ref().map(|s| s.0.as_str()), Some("abc123"));
     assert_eq!(git.branch.as_deref(), Some("main"));
     assert_eq!(git.repository_url.as_deref(), Some("https://github.com/user/project"));
 }
@@ -1459,7 +1445,7 @@ fn build_context_items_with_git_info() {
         cwd: "/repo".to_string(),
         user_instructions: None,
         git_info: Some(GitInfo {
-            commit_hash: Some("deadbeef".to_string()),
+            commit_hash: Some(codex_git_utils::GitSha::new("deadbeef")),
             branch: Some("feature/test".to_string()),
             repository_url: Some("https://github.com/org/repo".to_string()),
         }),
@@ -1524,6 +1510,7 @@ fn workflow_input_developer_instructions_roundtrips() {
         developer_instructions: Some("Always respond in JSON format.".to_string()),
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1559,6 +1546,7 @@ fn workflow_input_model_provider_roundtrips() {
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        websocket_connect_timeout_ms: None,
     };
 
     let input = CodexWorkflowInput {
@@ -1573,6 +1561,7 @@ fn workflow_input_model_provider_roundtrips() {
         developer_instructions: None,
         model_provider: Some(provider.clone()),
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1624,6 +1613,7 @@ fn model_call_input_provider_roundtrips() {
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        websocket_connect_timeout_ms: None,
     };
 
     let input = ModelCallInput {
@@ -1694,22 +1684,15 @@ fn model_call_input_provider_defaults_to_none() {
 fn config_output_roundtrips() {
     let original = ConfigOutput {
         config_toml: "model = \"gpt-4o\"\napproval_policy = \"on-request\"\n".to_string(),
-        worker_token: Some("test-token-123".to_string()),
     };
     let json = serde_json::to_string(&original).unwrap();
     let back: ConfigOutput = serde_json::from_str(&json).unwrap();
     assert_eq!(back.config_toml, original.config_toml);
-    assert_eq!(back.worker_token, original.worker_token);
-
-    // Backward compat: old JSON without worker_token should default to None.
-    let old_json = r#"{"config_toml":"model = \"gpt-4o\"\n"}"#;
-    let back_old: ConfigOutput = serde_json::from_str(old_json).unwrap();
-    assert!(back_old.worker_token.is_none(), "missing worker_token should default to None");
 }
 
 #[test]
 fn tool_exec_input_config_toml_roundtrip() {
-    // With config_toml and worker_token present.
+    // With config_toml present.
     let input_with = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c1".to_string(),
@@ -1717,7 +1700,6 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: Some("model = \"gpt-4o\"\n".to_string()),
-        worker_token: Some("tok-abc".to_string()),
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1726,15 +1708,10 @@ fn tool_exec_input_config_toml_roundtrip() {
         json_with.contains("config_toml"),
         "config_toml should be serialized when Some"
     );
-    assert!(
-        json_with.contains("worker_token"),
-        "worker_token should be serialized when Some"
-    );
     let back_with: ToolExecInput = serde_json::from_str(&json_with).unwrap();
     assert_eq!(back_with.config_toml, input_with.config_toml);
-    assert_eq!(back_with.worker_token, input_with.worker_token);
 
-    // With config_toml and worker_token absent (backward compat).
+    // With config_toml absent (backward compat).
     let input_none = ToolExecInput {
         tool_name: "shell".to_string(),
         call_id: "c2".to_string(),
@@ -1742,7 +1719,6 @@ fn tool_exec_input_config_toml_roundtrip() {
         model: "gpt-4o".to_string(),
         cwd: "/tmp".to_string(),
         config_toml: None,
-        worker_token: None,
         already_approved: false,
         payload_kind: "function".to_string(),
     };
@@ -1751,27 +1727,19 @@ fn tool_exec_input_config_toml_roundtrip() {
         !json_none.contains("config_toml"),
         "config_toml:None should be skipped in serialization"
     );
-    assert!(
-        !json_none.contains("worker_token"),
-        "worker_token:None should be skipped in serialization"
-    );
 
-    // Deserializing old-format JSON without config_toml/worker_token should default to None.
+    // Deserializing old-format JSON without config_toml should default to None.
     let old_json = r#"{"tool_name":"shell","call_id":"c3","arguments":"{}","model":"gpt-4o","cwd":"/tmp"}"#;
     let back_old: ToolExecInput = serde_json::from_str(old_json).unwrap();
     assert!(
         back_old.config_toml.is_none(),
         "missing config_toml should default to None"
     );
-    assert!(
-        back_old.worker_token.is_none(),
-        "missing worker_token should default to None"
-    );
 }
 
 #[test]
 fn config_from_toml_constructs_features() {
-    use codex_core::features::Feature;
+    use codex_features::Feature;
     use crate::config_loader::config_from_toml;
 
     // Build a Config from a minimal TOML string.
@@ -1792,7 +1760,7 @@ approval_policy = "never"
     // The ShellTool feature should be enabled by default — this confirms
     // that Features were properly constructed (not empty).
     assert!(
-        config.features.enabled(Feature::ShellTool),
+        config.features.get().enabled(Feature::ShellTool),
         "ShellTool feature should be enabled by default"
     );
 }
@@ -2177,6 +2145,7 @@ fn session_workflow_input_roundtrips_through_json() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -2231,6 +2200,7 @@ fn agent_workflow_input_with_new_fields_roundtrips() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "explorer".to_string(),
         config_toml: Some("model = \"gpt-5\"".to_string()),
         project_context: Some(ProjectContextOutput {
@@ -2438,6 +2408,7 @@ fn backward_compat_type_aliases_work() {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2468,6 +2439,7 @@ fn codex_workflow_input_converts_to_session_workflow_input() {
         developer_instructions: Some("dev note".to_string()),
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2659,6 +2631,7 @@ fn apply_crew_type_interpolates_placeholders() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     apply_crew_type(&crew, &inputs, &mut base).unwrap();
@@ -2716,6 +2689,7 @@ fn apply_crew_type_rejects_missing_required_input() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let err = apply_crew_type(&crew, &empty_inputs, &mut base);
@@ -2765,6 +2739,7 @@ fn apply_crew_type_uses_input_defaults() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     apply_crew_type(&crew, &empty_inputs, &mut base).unwrap();
@@ -2887,6 +2862,7 @@ fn session_workflow_input_crew_agents_roundtrip() {
         model_provider: None,
         crew_agents: crew_agents.clone(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -2997,6 +2973,7 @@ fn apply_crew_type_populates_crew_agents() {
         model_provider: None,
         crew_agents: BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     apply_crew_type(&crew, &inputs, &mut base).unwrap();
@@ -3386,7 +3363,7 @@ mod approval_gap_tests {
             model: "gpt-4o".to_string(),
             cwd: "/tmp".to_string(),
             config_toml: None,
-            worker_token: None,
+    
             already_approved: true,
             payload_kind: "function".to_string(),
         };
@@ -3403,7 +3380,7 @@ mod approval_gap_tests {
             model: "gpt-4o".to_string(),
             cwd: "/tmp".to_string(),
             config_toml: None,
-            worker_token: None,
+    
             already_approved: false,
             payload_kind: "function".to_string(),
         };

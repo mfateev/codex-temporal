@@ -10,6 +10,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use codex_core::AgentSession;
+use codex_core::models_manager::manager::ModelsManager;
 use codex_protocol::config_types::{Personality, ReasoningSummary, WebSearchMode};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
@@ -96,6 +97,7 @@ fn user_turn_op(text: &str) -> Op {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
+        approvals_reviewer: None,
     }
 }
 
@@ -123,6 +125,7 @@ fn new_session_with_policy(
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -281,6 +284,7 @@ fn user_turn_op_with_model(text: &str, model: &str) -> Op {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
+        approvals_reviewer: None,
     }
 }
 
@@ -399,6 +403,7 @@ fn new_session_with_web_search(client: &Client, model: &str) -> TemporalAgentSes
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -427,6 +432,7 @@ fn new_session_with_effort(
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -505,6 +511,7 @@ fn new_session_for_caching(client: &Client) -> TemporalAgentSession {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -849,6 +856,7 @@ async fn session_resume(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1108,6 +1116,7 @@ shell_tool = true
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1202,6 +1211,7 @@ sandbox_mode = "read-only"
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -1432,6 +1442,7 @@ async fn command_safety_auto_approves_safe_commands(client: &Client) {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
+        approvals_reviewer: None,
     };
     session.submit(op).await.expect("submit failed");
 
@@ -2043,6 +2054,7 @@ async fn patch_approval_flow(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -2158,6 +2170,7 @@ async fn dynamic_tool_flow(client: &Client) {
             }),
             defer_loading: false,
         }],
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -2248,6 +2261,7 @@ async fn session_spawns_main_agent(client: &Client) {
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), workflow_id, base_input);
 
@@ -2313,6 +2327,7 @@ async fn session_spawn_additional_agent(client: &Client) {
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
 
@@ -2430,6 +2445,7 @@ description = "Main agent"
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let mut inputs = std::collections::BTreeMap::new();
@@ -2521,6 +2537,7 @@ description = "Helper agent for sub-tasks"
         model_provider: None,
         crew_agents: std::collections::BTreeMap::new(),
         continued_state: None,
+        max_iterations: None,
     };
 
     let inputs = std::collections::BTreeMap::new();
@@ -2649,6 +2666,7 @@ async fn default_crew_agents_available(client: &Client) {
         model_provider: None,
         crew_agents,
         continued_state: None,
+        max_iterations: None,
     };
     let session = TemporalAgentSession::new(client.clone(), session_id.clone(), base_input);
 
@@ -2959,6 +2977,9 @@ async fn e2e_tests_inner() {
     eprintln!("--- test: patch_auto_approve_full_access ---");
     patch_auto_approve_full_access(&client).await;
 
+    eprintln!("--- test: multi_tool_emits_exec_events ---");
+    multi_tool_emits_exec_events(&client).await;
+
     // --- teardown ---
     // Restore CODEX_HOME.
     // SAFETY: e2e tests run sequentially in a single thread within e2e_tests_inner.
@@ -3058,6 +3079,7 @@ async fn session_switch_via_browser(client: &Client) {
         developer_instructions: None,
         model_provider: None,
         continued_state: None,
+        max_iterations: None,
         role: "default".to_string(),
         config_toml: None,
         project_context: None,
@@ -3248,6 +3270,7 @@ async fn patch_auto_approve_full_access(client: &Client) {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
+        approvals_reviewer: None,
     };
     session.submit(op).await.expect("submit failed");
 
@@ -3290,4 +3313,329 @@ async fn patch_auto_approve_full_access(client: &Client) {
     }
 
     drain_shutdown(&session).await;
+}
+
+/// Test: multiple sequential tool calls emit ExecCommandBegin/End events.
+///
+/// Regression test for the TUI blank-screen bug: when the agentic loop calls
+/// multiple tools in a row, the temporal tool handler must emit
+/// ExecCommandBegin/ExecCommandEnd events for each tool so the TUI watcher's
+/// watermark advances and the UI can display progress.
+async fn multi_tool_emits_exec_events(client: &Client) {
+    let session = new_session(client, "gpt-4o-mini");
+
+    // Ask for two sequential shell commands so the model calls tools back-to-back.
+    let op = Op::UserTurn {
+        items: vec![UserInput::Text {
+            text: "Run these two shell commands one after the other and tell me both outputs: \
+                   first `echo MULTI_TOOL_A`, then `echo MULTI_TOOL_B`."
+                .to_string(),
+            text_elements: vec![],
+        }],
+        cwd: std::env::current_dir().unwrap_or_else(|_| "/tmp".into()),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        model: "gpt-4o-mini".to_string(),
+        effort: None,
+        summary: Some(ReasoningSummary::Auto),
+        service_tier: None,
+        final_output_json_schema: None,
+        collaboration_mode: None,
+        personality: None,
+        approvals_reviewer: None,
+    };
+    session.submit(op).await.expect("submit failed");
+
+    let mut exec_begin_count = 0usize;
+    let mut exec_end_count = 0usize;
+    let timeout = tokio::time::Instant::now() + Duration::from_secs(120);
+
+    loop {
+        if tokio::time::Instant::now() > timeout {
+            panic!(
+                "timed out waiting for TurnComplete (saw {exec_begin_count} begins, \
+                 {exec_end_count} ends)"
+            );
+        }
+        let event = session.next_event().await.expect("next_event failed");
+        match &event.msg {
+            EventMsg::ExecCommandBegin(_) => exec_begin_count += 1,
+            EventMsg::ExecCommandEnd(_) => exec_end_count += 1,
+            EventMsg::ExecApprovalRequest(req) => {
+                session
+                    .submit(Op::ExecApproval {
+                        id: req.call_id.clone(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await
+                    .expect("approval failed");
+            }
+            EventMsg::TurnComplete(tc) => {
+                assert!(
+                    tc.last_agent_message.is_some(),
+                    "expected non-empty agent message"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // We should see at least 2 begin/end pairs (one per tool call).
+    assert!(
+        exec_begin_count >= 2,
+        "expected at least 2 ExecCommandBegin events for multi-tool turn, got {exec_begin_count}"
+    );
+    assert!(
+        exec_end_count >= 2,
+        "expected at least 2 ExecCommandEnd events for multi-tool turn, got {exec_end_count}"
+    );
+    assert_eq!(
+        exec_begin_count, exec_end_count,
+        "ExecCommandBegin ({exec_begin_count}) and ExecCommandEnd ({exec_end_count}) counts \
+         should match"
+    );
+
+    drain_shutdown(&session).await;
+}
+
+/// Test: tool_exec succeeds after worker restart despite worker token mismatch.
+///
+/// Regression test: verifies that tool execution works across worker restarts.
+/// Previously, a worker token mechanism caused tool_exec to reject calls after
+/// a restart (the replayed token from history wouldn't match the new worker's
+/// token). The worker token has been removed entirely.
+///
+/// 1. Start ephemeral server + worker 1.
+/// 2. Create a session, submit a tool-using turn (establishes worker 1's token).
+/// 3. Shut down worker 1, start worker 2 (fresh CodexActivities = new token).
+/// 4. Submit another tool-using turn on the same session.
+/// 5. Assert the turn completes (would have failed before the fix).
+#[tokio::test]
+async fn tool_exec_survives_worker_restart() {
+    std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+
+    // --- ephemeral server ---
+    let server_result = tokio::time::timeout(Duration::from_secs(60), async {
+        let config = TemporalDevServerConfig::builder()
+            .exe(default_cached_download())
+            .build();
+        config.start_server().await
+    })
+    .await;
+    let mut server = match server_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => panic!("failed to start ephemeral server: {e}"),
+        Err(_) => panic!("ephemeral server startup timed out (60s)"),
+    };
+    let server_target = server.target.clone();
+
+    // --- client ---
+    let conn_opts = ConnectionOptions::new(
+        Url::from_str(&format!("http://{}", server_target)).expect("bad URL"),
+    )
+    .identity("restart-test-client")
+    .build();
+    let tel = TelemetryOptions::builder().build();
+    let rt_opts = RuntimeOptions::builder()
+        .telemetry_options(tel)
+        .build()
+        .expect("runtime options");
+    let runtime = CoreRuntime::new_assume_tokio(rt_opts).expect("runtime");
+    let connection = tokio::time::timeout(Duration::from_secs(10), Connection::connect(conn_opts))
+        .await
+        .expect("connection timed out")
+        .expect("connection failed");
+    let client = Client::new(connection, ClientOptions::new("default").build())
+        .expect("client");
+
+    // Helper: start a worker on a dedicated thread, return shutdown handle + join handle.
+    fn start_worker(
+        target: String,
+    ) -> (Box<dyn Fn() + Send>, std::thread::JoinHandle<()>) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Box<dyn Fn() + Send>, String>>();
+        let join = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime");
+            rt.block_on(async move {
+                let tel = TelemetryOptions::builder().build();
+                let rt_opts = RuntimeOptions::builder()
+                    .telemetry_options(tel)
+                    .build()
+                    .expect("worker runtime options");
+                let worker_runtime =
+                    CoreRuntime::new_assume_tokio(rt_opts).expect("worker CoreRuntime");
+                let conn = ConnectionOptions::new(
+                    Url::from_str(&format!("http://{}", target)).expect("bad URL"),
+                )
+                .identity("restart-test-worker")
+                .build();
+                let connection = match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    Connection::connect(conn),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        let _ = ready_tx.send(Err(format!("connect failed: {e}")));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = ready_tx.send(Err("connect timed out".into()));
+                        return;
+                    }
+                };
+                let worker_client =
+                    Client::new(connection, ClientOptions::new("default").build())
+                        .expect("worker client");
+                let opts = WorkerOptions::new(TASK_QUEUE)
+                    .task_types(WorkerTaskTypes::all())
+                    .register_workflow::<SessionWorkflow>()
+                    .register_workflow::<CodexWorkflow>()
+                    .register_workflow::<CodexHarness>()
+                    .register_activities(CodexActivities::new())
+                    .build();
+                let mut worker =
+                    Worker::new(&worker_runtime, worker_client, opts).expect("create worker");
+                let shutdown = worker.shutdown_handle();
+                // Send shutdown handle back — wrap in Box<dyn Fn() + Send>.
+                let _ = ready_tx.send(Ok(Box::new(shutdown)));
+                if let Err(e) = worker.run().await {
+                    eprintln!("worker stopped: {e}");
+                }
+            });
+        });
+        let shutdown = match ready_rx.recv() {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => panic!("worker failed to start: {e}"),
+            Err(_) => panic!("worker thread died"),
+        };
+        (shutdown, join)
+    }
+
+    // --- worker 1 ---
+    let (shutdown1, join1) = start_worker(server_target.clone());
+
+    // Create session and do a tool-using turn.
+    let session = new_session(&client, "gpt-4o-mini");
+    session
+        .submit(user_turn_op_with_model(
+            "Use shell to run 'echo restart-before' and tell me the output.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 1 failed");
+
+    let msg1 = wait_for_turn_complete(&session).await;
+    assert!(
+        msg1.is_some(),
+        "expected agent message from turn 1 (before restart)"
+    );
+    let text1 = msg1.unwrap().to_lowercase();
+    assert!(
+        text1.contains("restart-before"),
+        "turn 1 should contain tool output, got: {text1}"
+    );
+
+    // --- shut down worker 1, start worker 2 ---
+    eprintln!("  shutting down worker 1...");
+    shutdown1();
+    join1.join().expect("worker 1 thread panicked");
+    eprintln!("  worker 1 stopped, starting worker 2...");
+
+    let (shutdown2, _join2) = start_worker(server_target.clone());
+
+    // --- turn 2 on the same session with worker 2 (different token) ---
+    session
+        .submit(user_turn_op_with_model(
+            "Use shell to run 'echo restart-after' and tell me the output.",
+            "gpt-4o-mini",
+        ))
+        .await
+        .expect("submit turn 2 failed");
+
+    let msg2 = wait_for_turn_complete(&session).await;
+    assert!(
+        msg2.is_some(),
+        "expected agent message from turn 2 (after restart) — \
+         before the fix this would fail with worker token mismatch"
+    );
+    let text2 = msg2.unwrap().to_lowercase();
+    assert!(
+        text2.contains("restart-after"),
+        "turn 2 should contain tool output after worker restart, got: {text2}"
+    );
+
+    // --- cleanup ---
+    drain_shutdown(&session).await;
+    shutdown2();
+    drop(client);
+    drop(runtime);
+    let _ = server.shutdown().await;
+}
+
+/// Test: Session::new_minimal resolves model metadata from the bundled catalog,
+/// not the fallback path, for known models like gpt-5.3-codex.
+///
+/// Regression test for the "Unknown model gpt-5.3-codex" warning. The bug was
+/// that `Session::new_minimal` used `construct_model_info_offline_for_tests`
+/// which passes empty candidates when `config.model_catalog` is None, causing
+/// every known model to hit the fallback path. This loses model_messages
+/// (personality support), correct base_instructions, and other metadata.
+#[tokio::test]
+async fn session_new_minimal_resolves_bundled_model_info() {
+    use codex_core::config::ConfigBuilder;
+    use codex_core::Session;
+    use codex_protocol::ThreadId;
+    use std::sync::Arc;
+
+    use codex_temporal::sink::{BufferEventSink, DEFAULT_EVENT_BUFFER_CAPACITY};
+    use codex_temporal::storage::InMemoryStorage;
+
+    // Build a Config the same way the harness does — no model_catalog.
+    let mut config = ConfigBuilder::default().build().await.unwrap();
+    config.model = Some("gpt-5.3-codex".to_string());
+    config.personality = Some(Personality::Pragmatic);
+    let config = Arc::new(config);
+
+    // Verify the bundled catalog finds gpt-5.3-codex (sanity check).
+    let bundled = ModelsManager::resolve_from_bundled_catalog("gpt-5.3-codex", &config);
+    assert!(
+        !bundled.used_fallback_model_metadata,
+        "bundled catalog should find gpt-5.3-codex without fallback"
+    );
+    assert!(
+        bundled.model_messages.is_some(),
+        "bundled gpt-5.3-codex should have model_messages for personality support"
+    );
+
+    // Now test Session::new_minimal — this is what the workflow actually uses.
+    let conversation_id = ThreadId::new();
+    let event_sink: Arc<dyn codex_core::EventSink> =
+        Arc::new(BufferEventSink::new(DEFAULT_EVENT_BUFFER_CAPACITY, 0));
+    let storage: Arc<dyn codex_core::StorageBackend> = Arc::new(InMemoryStorage::new());
+
+    let sess = Session::new_minimal(
+        conversation_id,
+        Arc::clone(&config),
+        event_sink,
+        storage,
+    )
+    .await;
+
+    // The session's base_instructions should contain personality text
+    // (from model_messages template), not generic fallback instructions.
+    let instructions = sess.get_base_instructions().await;
+    assert!(
+        instructions.text.contains("pragmatic")
+            || instructions.text.contains("Pragmatic")
+            || instructions.text.contains("Pragmatism"),
+        "Session::new_minimal should apply personality to base_instructions for gpt-5.3-codex. \
+         Got instructions starting with: {}",
+        &instructions.text[..instructions.text.len().min(200)]
+    );
 }

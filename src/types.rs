@@ -78,12 +78,6 @@ pub struct ToolExecInput {
     /// sandbox policy, etc. When absent, falls back to Config::for_harness().
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_toml: Option<String>,
-    /// Worker-issued token for activity-level authentication.
-    /// When set, the activity verifies this matches the worker's own token
-    /// before executing the tool. Prevents unauthorized activity dispatch
-    /// from rogue workflows on shared task queues.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_token: Option<String>,
     /// When true, the workflow has already obtained user approval for this
     /// tool call. The activity should skip its own approval check and
     /// execute directly.
@@ -175,11 +169,6 @@ pub struct ProjectContextOutput {
 pub struct ConfigOutput {
     /// Merged config.toml content as a TOML string.
     pub config_toml: String,
-    /// Worker-issued token for activity-level authentication.
-    /// Workflows include this token in subsequent `ToolExecInput` calls;
-    /// the `tool_exec` activity verifies it before executing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +534,10 @@ pub struct AgentWorkflowInput {
     /// Client-defined dynamic tools (handled via signal/wait).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    /// Maximum number of model→tool loop iterations per turn.
+    /// Defaults to 50 when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 }
 
 fn default_role() -> String {
@@ -613,6 +606,10 @@ pub struct SessionWorkflowInput {
     /// State carried over from a previous continue-as-new execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_state: Option<SessionContinueAsNewState>,
+    /// Maximum number of model→tool loop iterations per turn.
+    /// Defaults to 50 when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
 }
 
 impl From<AgentWorkflowInput> for SessionWorkflowInput {
@@ -630,6 +627,7 @@ impl From<AgentWorkflowInput> for SessionWorkflowInput {
             model_provider: input.model_provider,
             crew_agents: BTreeMap::new(),
             continued_state: None,
+            max_iterations: input.max_iterations,
         }
     }
 }
@@ -811,4 +809,54 @@ pub struct ContinueAsNewState {
     /// Snapshot of buffered events carried across CAN.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_snapshot: Vec<Event>,
+}
+
+// ---------------------------------------------------------------------------
+// Temporal Failure formatting
+// ---------------------------------------------------------------------------
+
+use temporalio_common::protos::temporal::api::failure::v1::Failure;
+
+/// Format a Temporal [`Failure`] as a human-readable error string.
+///
+/// Temporal wraps errors in a `Failure` proto chain where the top-level
+/// `message` is often generic (e.g. "Activity task failed") and the actual
+/// error is in the `cause` chain.  This function walks the full chain and
+/// joins all non-empty messages with `: `, mirroring how
+/// `anyhow`/`std::error::Error` chains are typically rendered.
+///
+/// If any `Failure` in the chain has a non-empty `stack_trace` (common
+/// with non-Rust activities and child workflows), it is appended.
+pub fn format_temporal_failure(failure: &Failure) -> String {
+    let mut parts = Vec::new();
+    let mut stack_trace: Option<&str> = None;
+
+    if !failure.message.is_empty() {
+        parts.push(failure.message.as_str());
+    }
+    if !failure.stack_trace.is_empty() {
+        stack_trace = Some(&failure.stack_trace);
+    }
+
+    let mut current = failure.cause.as_deref();
+    while let Some(cause) = current {
+        if !cause.message.is_empty() {
+            parts.push(&cause.message);
+        }
+        if stack_trace.is_none() && !cause.stack_trace.is_empty() {
+            stack_trace = Some(&cause.stack_trace);
+        }
+        current = cause.cause.as_deref();
+    }
+
+    if parts.is_empty() {
+        return failure.message.clone();
+    }
+
+    let mut msg = parts.join(": ");
+    if let Some(trace) = stack_trace {
+        msg.push('\n');
+        msg.push_str(trace);
+    }
+    msg
 }
