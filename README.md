@@ -4,182 +4,24 @@ Temporal durable execution harness for the [OpenAI Codex CLI](https://github.com
 
 Wraps the Codex agentic loop in a Temporal workflow so that multi-turn conversations, tool calls, and approval flows survive process failures and can be replayed deterministically.
 
-## Features
-
-- **Multi-turn conversations** with signal/query protocol — user turns, approvals, interrupts, context overrides
-- **Full tool ecosystem** via codex-core's ToolRegistry — shell, apply_patch, read_file, list_dir, grep_files, view_image, web search, request_user_input
-- **Tool approval gating** with three-tier command safety classification (safe/dangerous/unknown) and policy modes (Never, OnRequest, OnFailure, UnlessTrusted)
-- **MCP server support** — stdio and streamable HTTP transports, tool discovery, elicitation capture and resolution
-- **Dynamic tools** — client-defined tools via signal/wait
-- **Patch approval flow** — dedicated apply_patch approval events with patch text
-- **Session resume** via long-lived `CodexHarness` registry workflow with interactive TUI picker
-- **Continue-as-new** with rolling event buffer, watermark continuity, and full state carry-forward
-- **Project context injection** — AGENTS.md docs and git info injected into model prompts
-- **Config.toml loading** via activity — real sandbox policy, features, MCP servers from user config
-- **Token usage tracking** and prompt cache metrics
-- **Reasoning effort/summary/personality** — workflow-level defaults with per-turn overrides
-- **Multi-agent support** — session workflow with crew types and subagent scoping
-- **Activity-level security** — worker token authentication, input validation, config-driven sandbox policy
-- **Full TUI reuse** via `codex_tui::run_with_session()` — same ChatWidget as the standard Codex CLI
-
 ## Prerequisites
 
 - **Rust** (1.85+, edition 2024)
 - **Temporal CLI** (`temporal server start-dev`) or a running Temporal server
 - **Protocol Buffers compiler** (`protoc`) — required by the Temporal SDK
 - **OpenAI API key** (`OPENAI_API_KEY` env var)
-- **Sibling repos** (only needed for local development — see [Local development](#local-development) below):
 
-```
-parent/
-  codex/           # github.com/openai/codex   (branch: task/codex-temporal)
-  sdk-core/        # github.com/mfateev/sdk-core (branch: master)
-  codex-temporal/  # this repo
-```
+## Codex dependency
 
-By default, all dependencies are fetched from git. You only need sibling checkouts if you want to iterate on codex crates locally.
+This project depends on a modified fork of [openai/codex](https://github.com/openai/codex) on the **`task/codex-temporal`** branch. That branch adds abstraction traits (`AgentSession`, `ModelStreamer`, `ToolCallHandler`, `EventSink`, `StorageBackend`, etc.) and minimal constructors that let an external orchestrator drive the Codex agent loop.
 
-## Quick start
+See [`CODEX_TEMPORAL_CHANGES.md`](https://github.com/mfateev/codex/blob/task/codex-temporal/CODEX_TEMPORAL_CHANGES.md) in the codex repo for the full list of changes.
 
-### 1. Start a local Temporal server
+By default, all codex crates are fetched from git. For local iteration, clone the codex repo on the `task/codex-temporal` branch next to this repo and create `.cargo/config.toml`:
 
 ```bash
-temporal server start-dev
+git clone -b task/codex-temporal https://github.com/openai/codex.git ../codex
 ```
-
-This starts a dev server on `localhost:7233` with a web UI at `http://localhost:8233`.
-
-### 2. Start the worker
-
-The worker runs workflows (`AgentWorkflow`, `CodexHarness`, `SessionWorkflow`) and activities (model calls, tool execution, MCP, config loading) on the `codex-temporal` task queue.
-
-```bash
-export OPENAI_API_KEY="sk-..."
-cargo run --bin codex-temporal-worker
-```
-
-### 3. Run a one-shot workflow
-
-```bash
-cargo run --bin codex-temporal-client -- "What is 2+2? Reply with just the number."
-```
-
-For tool-use prompts:
-
-```bash
-cargo run --bin codex-temporal-client -- "Use shell to run 'echo hello world' and tell me the output."
-```
-
-List running sessions:
-
-```bash
-cargo run --bin codex-temporal-client -- list
-```
-
-### 4. Run the TUI
-
-The TUI binary reuses the Codex ChatWidget but connects to a Temporal workflow instead of an in-process agent. The worker holds the API key and makes LLM calls.
-
-```bash
-cargo run --bin codex-temporal-tui -- "Explain what Temporal is in two sentences."
-```
-
-Launch without an initial prompt for interactive use:
-
-```bash
-cargo run --bin codex-temporal-tui
-```
-
-Resume a previous session:
-
-```bash
-cargo run --bin codex-temporal-tui -- --resume           # interactive picker
-cargo run --bin codex-temporal-tui -- --resume <session_id>  # direct resume
-```
-
-### 5. Configuration
-
-#### Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_API_KEY` | (required) | OpenAI API key for model calls |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL for the OpenAI API |
-| `CODEX_MODEL` | `gpt-4o` | Model slug passed to the Responses API |
-| `CODEX_APPROVAL_POLICY` | `on-request` | Tool approval mode: `never`, `untrusted`, `on-failure`, `on-request` |
-| `CODEX_WEB_SEARCH` | (disabled) | Web search mode: `live` or `cached` |
-| `CODEX_EFFORT` | (model default) | Reasoning effort: `low`, `medium`, `high` |
-| `CODEX_REASONING_SUMMARY` | (default) | Reasoning summary mode |
-| `CODEX_PERSONALITY` | (default) | Agent personality override |
-| `TEMPORAL_ADDRESS` | `http://localhost:7233` | Temporal server gRPC endpoint |
-| `RUST_LOG` | `info` | Tracing filter (e.g. `codex_temporal=debug`) |
-
-#### config.toml
-
-The worker loads config from `~/.codex/config.toml` (same format as the standard Codex CLI). All settings — model, sandbox policy, approval policy, MCP servers, features — flow through to the workflow. Environment variables override config.toml values.
-
-## Building binaries
-
-### Build release binaries
-
-```bash
-cargo build --release
-```
-
-This produces three binaries in `target/release/`:
-
-| Binary | Description |
-|--------|-------------|
-| `codex-temporal-worker` | Temporal worker — runs workflows and activities |
-| `codex-temporal-client` | CLI client — start workflows, list sessions |
-| `codex-temporal-tui` | TUI — interactive Codex interface over Temporal |
-
-### Install to PATH
-
-```bash
-cargo install --path .
-```
-
-This installs all three binaries to `~/.cargo/bin/` (which should already be on your `PATH` if you have Rust installed via rustup).
-
-### Using the installed binaries
-
-Once installed (or using the binaries from `target/release/` directly), you no longer need `cargo run`:
-
-```bash
-# Start the worker
-export OPENAI_API_KEY="sk-..."
-codex-temporal-worker
-
-# Run a one-shot prompt
-codex-temporal-client "What is 2+2?"
-
-# List sessions
-codex-temporal-client list
-
-# Launch the TUI
-codex-temporal-tui
-
-# Resume a session
-codex-temporal-tui --resume
-```
-
-### Cross-compilation
-
-To build for a different target (e.g. `x86_64-unknown-linux-musl` for a static binary):
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-The binary will be at `target/x86_64-unknown-linux-musl/release/codex-temporal-worker` (and similarly for the other binaries).
-
-All dependencies (codex crates, Temporal SDK) are fetched from git — no sibling repo checkouts required for building.
-
-### Local development
-
-For iterating on codex crates locally, create `.cargo/config.toml` to override the git dependencies with local paths:
 
 ```toml
 [patch."https://github.com/mfateev/codex.git"]
@@ -195,27 +37,75 @@ codex-rmcp-client   = { path = "../codex/codex-rs/rmcp-client" }
 
 This file is gitignored. Remove or rename it to build from remote git sources.
 
+## Quick start
+
+### 1. Start a local Temporal server
+
+```bash
+temporal server start-dev
+```
+
+This starts a dev server on `localhost:7233` with a web UI at `http://localhost:8233`.
+
+### 2. Start the worker
+
+```bash
+export OPENAI_API_KEY="sk-..."
+cargo run --bin codex-temporal-worker
+```
+
+The worker runs workflows (`AgentWorkflow`, `CodexHarness`, `SessionWorkflow`) and activities (model calls, tool execution, MCP, config loading) on the `codex-temporal` task queue.
+
+### 3. Run the TUI
+
+```bash
+cargo run --bin codex-temporal-tui
+```
+
+Resume a previous session:
+
+```bash
+cargo run --bin codex-temporal-tui -- --resume           # interactive picker
+cargo run --bin codex-temporal-tui -- --resume <session_id>  # direct resume
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TEMPORAL_ADDRESS` | `http://localhost:7233` | Temporal server gRPC endpoint |
+| `RUST_LOG` | `info` | Tracing filter (e.g. `codex_temporal=debug`) |
+
+All standard Codex environment variables (`OPENAI_API_KEY`, `CODEX_MODEL`, `CODEX_APPROVAL_POLICY`, etc.) and `~/.codex/config.toml` settings are supported — see the [Codex CLI docs](https://github.com/openai/codex) for details.
+
+## Building
+
+```bash
+cargo build --release
+```
+
+Produces two binaries in `target/release/`:
+
+| Binary | Description |
+|--------|-------------|
+| `codex-temporal-worker` | Temporal worker — runs workflows and activities |
+| `codex-temporal-tui` | TUI — interactive Codex interface over Temporal |
+
 ## Tests
 
-### Unit tests (106 tests)
+### Unit tests
 
 ```bash
 cargo test --lib --test unit_tests
 ```
 
-Covers: entropy, event sink (rolling buffer, eviction, CAN snapshot), storage, types serde roundtrips (all I/O types, backward compat), signal payloads, session/context constructors, safety classification, config loading, MCP types, picker conversions, tool dispatch (shell, read_file, list_dir, sandbox policy, input validation).
+### E2E tests
 
-### E2E tests (28 test cases)
-
-E2E tests spin up an ephemeral Temporal server, create an in-process worker, and exercise the full workflow against the real OpenAI API.
+Spins up an ephemeral Temporal server, creates an in-process worker, and exercises the full workflow against the real OpenAI API.
 
 ```bash
 OPENAI_API_KEY="sk-..." cargo test --test e2e_test -- --nocapture
 ```
-
-**Requires `OPENAI_API_KEY`** — tests fail if the key is not set.
-
-Key test cases include: model-only turns, tool approval flow, multi-turn conversation, model selection, web search, prompt caching, reasoning effort, continue-as-new, session resume, project context injection, config loading, sandbox policy enforcement, command safety classification, MCP tool calls, policy amendment, interrupt, request_user_input, patch approval, dynamic tools, override turn context, MCP elicitation, session workflow with crew types and subagent spawning.
 
 ### TUI E2E tests
 
@@ -223,39 +113,64 @@ Key test cases include: model-only turns, tool approval flow, multi-turn convers
 OPENAI_API_KEY="sk-..." cargo test --test tui_e2e_test -- --nocapture
 ```
 
-Verifies the full ChatWidget → `wire_session` → `TemporalAgentSession` → Temporal workflow round-trip.
-
 ## Architecture
 
 ```
-codex-temporal/src/
+src/
   lib.rs              Module declarations
   types.rs            Serializable I/O types, signal payloads, harness types
   entropy.rs          Deterministic RandomSource backed by workflow context
-  sink.rs             BufferEventSink — rolling event buffer with indexed polling and CAN snapshots
+  sink.rs             BufferEventSink — rolling event buffer with watermark-based reads and CAN snapshots
   storage.rs          InMemoryStorage (in-memory StorageBackend)
   streamer.rs         ModelStreamer impl dispatching to model_call activity
-  tools.rs            ToolCallHandler impl — three-tier safety, approval gating, MCP/dynamic routing
+  tools.rs            ToolCallHandler impl — safety classification, approval gating, MCP/dynamic routing
   config_loader.rs    Config loading — load_harness_config, apply_env_overrides, config_from_toml
   mcp.rs              HarnessMcpManager — persistent MCP server connections, tool discovery + execution
   activities.rs       Activities — model_call, tool_exec, load_config, collect_project_context,
                         discover_mcp_tools, mcp_tool_call, get_worker_token, check_credentials,
                         resolve_role_config
-  workflow.rs         AgentWorkflow — multi-turn interactive workflow with signals/queries,
-                        project context, MCP tools, approval, interrupt, CAN
+  workflow.rs         AgentWorkflow — multi-turn workflow with signals/updates, approval, interrupt, CAN
   harness.rs          CodexHarness — long-lived per-user session registry workflow
   session_workflow.rs SessionWorkflow — multi-agent sessions with crew types and subagent scoping
   picker.rs           TUI picker integration — session-to-thread conversion, ID extraction
   session.rs          TemporalAgentSession — AgentSession impl with resume support
   bin/
-    worker.rs         Temporal worker binary — runs all workflows + activities
-    client.rs         CLI — start workflows, list sessions via harness
-    tui.rs            TUI binary — full Codex TUI via codex_tui::run_with_session()
+    worker.rs         Temporal worker binary
+    tui.rs            TUI binary — Codex ChatWidget over Temporal via codex_tui::run_with_session()
 ```
+
+### Workflow types
+
+The system defines three workflow types, registered on a shared `codex-temporal` task queue:
+
+```
+CodexHarness (per-user session registry)
+  │
+  │  register / list / get
+  ▼
+SessionWorkflow (per-session parent)
+  │
+  │  spawns child workflows
+  ├──────────────┬──────────────┐
+  ▼              ▼              ▼
+AgentWorkflow  AgentWorkflow  AgentWorkflow
+ (main)         (role A)       (role B)
+```
+
+**CodexHarness** (`src/harness.rs`) — A long-lived, per-user workflow (`codex-harness-<user>`) that acts as a session registry. It stores a list of `SessionEntry` records and exposes `register_session` / `update_session_status` / `remove_session` signals and `list_sessions` / `get_session` queries. It has no activities of its own and uses continue-as-new to keep its history bounded. The harness also performs a one-time `check_credentials` activity to verify the worker has API keys.
+
+**SessionWorkflow** (`src/session_workflow.rs`) — A per-session parent workflow (`codex-session-<uuid>`) that loads shared state once — merged config, project context, and MCP tool schemas — then spawns and tracks child `AgentWorkflow` instances. It always starts a "main" agent and accepts `spawn_agent` signals to create additional agents with role-based configuration (including crew agent definitions). A `max_agents` limit (default 8) is enforced. The parent close policy is `Terminate`, so shutting down the session terminates all its agents.
+
+**AgentWorkflow** (`src/workflow.rs`) — The core workflow that drives the Codex agentic loop. Each instance runs a deterministic model→tool cycle: call the model, execute approved tools, feed results back, repeat until the turn is complete. It supports multi-turn conversations via `UserTurn` signals, tool/patch approval gating, MCP elicitation, dynamic tool calls, interruption, and mid-workflow overrides (model, approval policy, effort, personality). State is streamed to clients through a `BufferEventSink` with watermark-based reads exposed via a `get_state_update` blocking update. The workflow uses continue-as-new (triggered by a `Compact` signal) to carry forward full conversation state when history grows large.
+
+**Relationships:**
+- CodexHarness ↔ SessionWorkflow — The harness tracks sessions but does not parent them; they are independent workflows linked by signals/queries.
+- SessionWorkflow → AgentWorkflow — True parent-child. The session pre-resolves config and context, passes it to children via input, and terminates children on close.
+- AgentWorkflow ↔ AgentWorkflow — Siblings share no direct link. Multi-agent coordination flows through the parent session.
 
 ### Protocol
 
-The workflow uses a generic `receive_op` signal that dispatches all client operations:
+The workflow uses a `receive_op` signal that dispatches all client operations:
 
 | Op variant | Purpose |
 |------------|---------|
@@ -270,51 +185,46 @@ The workflow uses a generic `receive_op` signal that dispatches all client opera
 | `Interrupt` | Cancel the current turn |
 | `Shutdown` | Gracefully terminate after the current turn |
 
-| Query | Purpose |
-|-------|---------|
-| `get_events_since(index)` | Return new events since the given watermark (for client polling) |
-| `get_events` | Return all events from index 0 (convenience) |
+| Blocking update | Purpose |
+|-----------------|---------|
+| `get_state_update(since_index)` | Block until new events are available, then return them with an updated watermark |
 
-`TemporalAgentSession` implements the `AgentSession` trait by mapping `submit(Op)` to signals and `next_event()` to query polling with adaptive backoff.
+`TemporalAgentSession` implements the `AgentSession` trait by mapping `submit(Op)` to signals and `next_event()` to a background watcher that long-polls via the `get_state_update` blocking update.
 
 ### Workflow execution flow
 
 ```
-Client                    Temporal                     Worker
-  |                         |                            |
-  |-- start_workflow ------>|                            |
-  |                         |-- WorkflowTask ----------->|
-  |                         |                            |-- get_worker_token activity
-  |                         |                            |-- load_config activity
-  |                         |                            |-- collect_project_context activity
-  |                         |                            |-- discover_mcp_tools activity
-  |                         |                            |-- model_call activity
-  |                         |<-- ScheduleActivity -------|
-  |                         |-- ActivityTask ----------->|
-  |                         |<-- ActivityResult ---------|  (model response)
-  |                         |-- WorkflowTask ----------->|
-  |                         |                            |-- emit ExecApprovalRequest
-  |<-- query events --------|                            |   (if tool call needs approval)
-  |-- signal approval ----->|                            |
-  |                         |-- WorkflowTask ----------->|
-  |                         |                            |-- tool_exec activity (token verified)
-  |                         |<-- ScheduleActivity -------|
-  |                         |-- ActivityTask ----------->|
-  |                         |<-- ActivityResult ---------|  (tool output)
-  |                         |-- WorkflowTask ----------->|
-  |                         |                            |-- model_call activity
-  |                         |                            |   (model sees tool result)
-  |                         |                            |-- emit TurnComplete
-  |<-- query events --------|                            |
+TUI
+ │
+ │  start session
+ ▼
+CodexHarness
+ │  register_session signal
+ │
+SessionWorkflow
+ │  1. load_config activity
+ │  2. collect_project_context activity
+ │  3. discover_mcp_tools activity
+ │  4. spawn main AgentWorkflow (passes pre-loaded config/context/tools)
+ │  5. on spawn_agent signal → resolve_role_config activity → spawn additional AgentWorkflow
+ │
+AgentWorkflow
+ │  (if not pre-resolved by parent: load_config, collect_project_context, discover_mcp_tools)
+ │  1. wait for UserTurn signal
+ │  2. model_call activity              ←─┐
+ │  3. if tool needs approval:            │
+ │  │    emit ExecApprovalRequest         │
+ │  │    wait for ExecApproval signal     │
+ │  4. tool_exec activity                 │  agentic
+ │  │   (or mcp_tool_call activity)       │  loop
+ │  5. feed tool result back to model  ───┘
+ │  6. emit TurnComplete
+ │  7. goto 1 (next turn) or shutdown
+ │
+ │  on Compact signal → continue-as-new with full state
+ │
+TUI ◄── get_state_update blocking update (streams events back)
 ```
-
-## Security
-
-- **Sandbox policy** from user's `config.toml` is enforced in tool activities (not hardcoded)
-- **Worker token authentication** prevents unauthorized `tool_exec` dispatch from rogue workflows on shared task queues
-- **Input validation** in `dispatch_tool()` — cwd must exist and be a directory, tool_name must be non-empty
-- **Three-tier command safety** classification at the workflow level (safe auto-approve, dangerous always prompt, unknown defers to policy)
-- **Approval handled at workflow level** before activity dispatch — activities run with `AskForApproval::Never` by design
 
 ## License
 
