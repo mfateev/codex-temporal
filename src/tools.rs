@@ -43,6 +43,56 @@ use crate::types::{
 };
 use crate::workflow::AgentWorkflow;
 
+/// Wait for a pending signal to be resolved, or return `None` if the workflow
+/// is interrupted while waiting.
+///
+/// `get_resolved` should return `Some(value)` once the signal response is
+/// available, and `None` while still pending.
+/// `clear` is called to reset the pending state in both the success and
+/// interrupt paths.
+async fn wait_for_resolution<T>(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    get_resolved: impl Fn(&AgentWorkflow) -> Option<T>,
+    clear: impl FnOnce(&mut AgentWorkflow),
+) -> Option<T> {
+    ctx.wait_condition(|s| get_resolved(s).is_some() || s.interrupt_requested)
+        .await;
+
+    if ctx.state(|s| s.interrupt_requested) {
+        ctx.state_mut(clear);
+        return None;
+    }
+
+    let value = ctx.state(|s| get_resolved(s));
+    ctx.state_mut(clear);
+    value
+}
+
+/// Execute an activity with cancellation support. On cancellation, returns
+/// a denied response. Builds `ActivityOptions` from the given timeout.
+macro_rules! run_with_cancellation {
+    ($ctx:expr, $activity_fn:expr, $input:expr, $timeout:expr, $cancel:expr, $call_id:expr, $label:expr) => {{
+        let opts = ActivityOptions {
+            start_to_close_timeout: Some(Duration::from_secs($timeout)),
+            heartbeat_timeout: Some(Duration::from_secs(30)),
+            cancellation_type: ActivityCancellationType::TryCancel,
+            ..Default::default()
+        };
+        let activity = $ctx.start_activity($activity_fn, $input, opts);
+        tokio::pin!(activity);
+        tokio::select! {
+            biased;
+            _ = $cancel.cancelled() => {
+                activity.cancel();
+                return Ok(denied_response($call_id.clone()));
+            }
+            result = &mut activity => result.map_err(|e| {
+                CodexErr::Fatal(format!(concat!($label, " activity failed: {}"), e))
+            })?,
+        }
+    }};
+}
+
 /// A [`ToolCallHandler`] that gates tool calls on client approval, then
 /// dispatches approved calls as Temporal activities.
 ///
@@ -177,26 +227,10 @@ impl ToolCallHandler for TemporalToolHandler {
                     arguments,
                 };
 
-                let opts = ActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(120)),
-                    heartbeat_timeout: Some(Duration::from_secs(30)),
-                    cancellation_type: ActivityCancellationType::TryCancel,
-                    ..Default::default()
-                };
-
-                let activity =
-                    ctx.start_activity(CodexActivities::mcp_tool_call, mcp_input, opts);
-                tokio::pin!(activity);
-                let mut output = tokio::select! {
-                    biased;
-                    _ = cancellation_token.cancelled() => {
-                        activity.cancel();
-                        return Ok(denied_response(call_id));
-                    }
-                    result = &mut activity => result.map_err(|e| {
-                        CodexErr::Fatal(format!("mcp_tool_call activity failed: {e}"))
-                    })?,
-                };
+                let mut output = run_with_cancellation!(
+                    ctx, CodexActivities::mcp_tool_call, mcp_input, 120,
+                    cancellation_token, call_id, "mcp_tool_call"
+                );
 
                 // Check if the MCP server requested elicitation during this call.
                 if let Some(elicitation) = output.elicitation.take() {
@@ -226,23 +260,13 @@ impl ToolCallHandler for TemporalToolHandler {
                     ctx.state_mut(|s| s.bump_version());
 
                     // Wait for resolution or interrupt.
-                    ctx.wait_condition(|s| {
-                        s.pending_elicitation
-                            .as_ref()
-                            .is_none_or(|p| p.response.is_some())
-                            || s.interrupt_requested
-                    })
-                    .await;
-
-                    // Handle interrupt.
-                    let interrupted = ctx.state(|s| s.interrupt_requested);
-                    if interrupted {
-                        ctx.state_mut(|s| s.pending_elicitation = None);
+                    if wait_for_resolution(
+                        &ctx,
+                        |s| s.pending_elicitation.as_ref().and_then(|p| p.response.as_ref().map(|_| ())),
+                        |s| { s.pending_elicitation = None; },
+                    ).await.is_none() {
                         return Ok(denied_response(call_id));
                     }
-
-                    // Clear pending state.
-                    ctx.state_mut(|s| s.pending_elicitation = None);
                 }
 
                 return Ok(output.into_response_input_item());
@@ -276,34 +300,19 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.state_mut(|s| s.bump_version());
 
                 // Wait for response or interrupt.
-                ctx.wait_condition(|s| {
-                    s.pending_user_input
-                        .as_ref()
-                        .is_none_or(|p| p.response.is_some())
-                        || s.interrupt_requested
-                })
-                .await;
+                let response = wait_for_resolution(
+                    &ctx,
+                    |s| s.pending_user_input.as_ref().and_then(|p| p.response.clone()),
+                    |s| { s.pending_user_input = None; },
+                ).await;
 
-                // Handle interrupt.
-                let interrupted = ctx.state(|s| s.interrupt_requested);
-                if interrupted {
-                    ctx.state_mut(|s| s.pending_user_input = None);
+                if response.is_none() {
                     let output = serde_json::json!({"error": "interrupted"}).to_string();
                     return Ok(ResponseInputItem::FunctionCallOutput {
                         call_id,
                         output: FunctionCallOutputPayload::from_text(output),
                     });
                 }
-
-                // Extract response and return as tool output.
-                let response = ctx.state_mut(|s| {
-                    let resp = s
-                        .pending_user_input
-                        .as_ref()
-                        .and_then(|p| p.response.clone());
-                    s.pending_user_input = None;
-                    resp
-                });
 
                 let output = serde_json::to_string(&response).unwrap_or_default();
                 return Ok(ResponseInputItem::FunctionCallOutput {
@@ -339,30 +348,15 @@ impl ToolCallHandler for TemporalToolHandler {
                 ctx.state_mut(|s| s.bump_version());
 
                 // Wait for response or interrupt.
-                ctx.wait_condition(|s| {
-                    s.pending_dynamic_tool
-                        .as_ref()
-                        .is_none_or(|p| p.response.is_some())
-                        || s.interrupt_requested
-                })
-                .await;
+                let response = wait_for_resolution(
+                    &ctx,
+                    |s| s.pending_dynamic_tool.as_ref().and_then(|p| p.response.clone()),
+                    |s| { s.pending_dynamic_tool = None; },
+                ).await;
 
-                // Handle interrupt.
-                let interrupted = ctx.state(|s| s.interrupt_requested);
-                if interrupted {
-                    ctx.state_mut(|s| s.pending_dynamic_tool = None);
+                if response.is_none() {
                     return Ok(denied_response(call_id));
                 }
-
-                // Extract response.
-                let response = ctx.state_mut(|s| {
-                    let resp = s
-                        .pending_dynamic_tool
-                        .as_ref()
-                        .and_then(|p| p.response.clone());
-                    s.pending_dynamic_tool = None;
-                    resp
-                });
 
                 // Convert DynamicToolResponse to FunctionCallOutput.
                 if let Some(resp) = response {
@@ -447,31 +441,11 @@ impl ToolCallHandler for TemporalToolHandler {
                         ctx.state_mut(|s| s.bump_version());
 
                         // Wait for decision or interrupt.
-                        ctx.wait_condition(|s| {
-                            s.pending_patch_approval
-                                .as_ref()
-                                .is_none_or(|p| p.decision.is_some())
-                                || s.interrupt_requested
-                        })
-                        .await;
-
-                        // Handle interrupt.
-                        let interrupted = ctx.state(|s| s.interrupt_requested);
-                        if interrupted {
-                            ctx.state_mut(|s| s.pending_patch_approval = None);
-                            return Ok(denied_response(call_id));
-                        }
-
-                        // Check decision.
-                        let approved = ctx.state_mut(|s| {
-                            let decision = s
-                                .pending_patch_approval
-                                .as_ref()
-                                .and_then(|p| p.decision)
-                                .unwrap_or(false);
-                            s.pending_patch_approval = None;
-                            decision
-                        });
+                        let approved = wait_for_resolution(
+                            &ctx,
+                            |s| s.pending_patch_approval.as_ref().and_then(|p| p.decision),
+                            |s| { s.pending_patch_approval = None; },
+                        ).await.unwrap_or(false);
 
                         if !approved {
                             return Ok(denied_response(call_id));
@@ -507,26 +481,10 @@ impl ToolCallHandler for TemporalToolHandler {
                     }),
                 });
 
-                let opts = ActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(600)),
-                    heartbeat_timeout: Some(Duration::from_secs(30)),
-                    cancellation_type: ActivityCancellationType::TryCancel,
-                    ..Default::default()
-                };
-
-                let activity =
-                    ctx.start_activity(CodexActivities::tool_exec, input, opts);
-                tokio::pin!(activity);
-                let output = tokio::select! {
-                    biased;
-                    _ = cancellation_token.cancelled() => {
-                        activity.cancel();
-                        return Ok(denied_response(call_id));
-                    }
-                    result = &mut activity => result.map_err(|e| {
-                        CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
-                    })?,
-                };
+                let output = run_with_cancellation!(
+                    ctx, CodexActivities::tool_exec, input, 600,
+                    cancellation_token, call_id, "tool_exec"
+                );
 
                 // Emit PatchApplyEnd so the TUI renders the result.
                 let success = output.exit_code == 0;
@@ -639,36 +597,16 @@ impl ToolCallHandler for TemporalToolHandler {
                 events.emit_event_sync(approval_event);
                 ctx.state_mut(|s| s.bump_version());
 
-                // 3. Wait for approval decision or interrupt
-                ctx.wait_condition(|s| {
-                    s.pending_approval
-                        .as_ref()
-                        .is_none_or(|p| p.decision.is_some())
-                        || s.interrupt_requested
-                })
-                .await;
-
-                // 4. Check for interrupt first — return a denied-style
-                // response rather than Err(TurnAborted) to avoid panicking
-                // codex-core's in-flight tool future drain. The workflow
-                // loop will catch `interrupt_requested` at the iteration
-                // boundary and emit TurnAborted.
-                let interrupted = ctx.state(|s| s.interrupt_requested);
-                if interrupted {
-                    ctx.state_mut(|s| s.pending_approval = None);
-                    return Ok(denied_response(call_id));
-                }
-
-                // 5. Check decision
-                let approved = ctx.state_mut(|s| {
-                    let decision = s
-                        .pending_approval
-                        .as_ref()
-                        .and_then(|p| p.decision)
-                        .unwrap_or(false);
-                    s.pending_approval = None;
-                    decision
-                });
+                // 3. Wait for approval decision or interrupt.
+                // On interrupt, returns denied-style response rather than
+                // Err(TurnAborted) to avoid panicking codex-core's in-flight
+                // tool future drain. The workflow loop catches
+                // `interrupt_requested` at the iteration boundary.
+                let approved = wait_for_resolution(
+                    &ctx,
+                    |s| s.pending_approval.as_ref().and_then(|p| p.decision),
+                    |s| { s.pending_approval = None; },
+                ).await.unwrap_or(false);
 
                 if !approved {
                     return Ok(denied_response(call_id));
@@ -710,26 +648,11 @@ impl ToolCallHandler for TemporalToolHandler {
                 }),
             });
 
-            let opts = ActivityOptions {
-                start_to_close_timeout: Some(Duration::from_secs(600)),
-                heartbeat_timeout: Some(Duration::from_secs(30)),
-                cancellation_type: ActivityCancellationType::TryCancel,
-                ..Default::default()
-            };
-
             let started = Instant::now();
-            let activity = ctx.start_activity(CodexActivities::tool_exec, input, opts);
-            tokio::pin!(activity);
-            let output = tokio::select! {
-                biased;
-                _ = cancellation_token.cancelled() => {
-                    activity.cancel();
-                    return Ok(denied_response(call_id));
-                }
-                result = &mut activity => result.map_err(|e| {
-                    CodexErr::Fatal(format!("tool_exec activity failed: {e}"))
-                })?,
-            };
+            let output = run_with_cancellation!(
+                ctx, CodexActivities::tool_exec, input, 600,
+                cancellation_token, call_id, "tool_exec"
+            );
 
             // Emit ExecCommandEnd so the TUI renders the result.
             let duration = started.elapsed();

@@ -131,3 +131,5 @@ Some codex features require **long-lived processes** that outlive individual act
 The planned solution is **worker-level state**: the worker process would own persistent resources (PTY sessions, JS REPL kernels, sandbox config), and activities would access them by reference. This would require sticky task routing — assigning each workflow to a specific worker — which is the natural model for a coding agent since the worker runs on the machine with the code.
 
 This is not yet implemented. Currently, MCP connections are the only persistent resource, managed at the activity level by `HarnessMcpManager`.
+
+See [REFACTORING.md](REFACTORING.md) for known code quality improvements.

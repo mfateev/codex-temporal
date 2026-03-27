@@ -30,7 +30,6 @@ use codex_protocol::protocol::{
     AgentMessageEvent, AskForApproval, ContextCompactedEvent, Event, EventMsg, Op,
     ReviewDecision, TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
 };
-use codex_protocol::user_input::UserInput;
 use codex_protocol::ThreadId;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
@@ -53,7 +52,7 @@ use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
     PendingPatchApproval, PendingUserInput, ProjectContextOutput, ResolveModelInfoInput,
-    StateUpdateRequest, StateUpdateResponse, TurnOverrides, UserTurnInput,
+    StateUpdateRequest, StateUpdateResponse, TurnOverrides, UserTurnInput, extract_message,
 };
 
 /// Default maximum number of model→tool loop iterations per turn.
@@ -96,18 +95,6 @@ pub struct AgentWorkflow {
     /// Monotonically increasing counter bumped on every mutation visible to
     /// external observers.
     state_version: u64,
-}
-
-/// Extract the text message from user input items.
-fn extract_message(items: &[UserInput]) -> String {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            UserInput::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Build ephemeral context items from project context, matching codex-core's

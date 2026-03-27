@@ -845,7 +845,20 @@ pub struct ContinueAsNewState {
 // Temporal Failure formatting
 // ---------------------------------------------------------------------------
 
+use codex_protocol::user_input::UserInput;
 use temporalio_common::protos::temporal::api::failure::v1::Failure;
+
+/// Extract the text message from user input items.
+pub fn extract_message(items: &[UserInput]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Format a Temporal [`Failure`] as a human-readable error string.
 ///

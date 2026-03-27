@@ -24,7 +24,6 @@ use codex_protocol::protocol::{
     BackgroundEventEvent, Event, EventMsg, Op, SandboxPolicy, SessionConfiguredEvent,
     TurnAbortReason, TurnAbortedEvent,
 };
-use codex_protocol::user_input::UserInput;
 use temporalio_client::{
     Client, WorkflowExecuteUpdateOptions, WorkflowQueryOptions, WorkflowSignalOptions,
     WorkflowStartOptions,
@@ -33,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::harness::{CodexHarness, CodexHarnessRun};
 use crate::session_workflow::{SessionWorkflow, SessionWorkflowRun};
-use crate::types::{SessionWorkflowInput, SpawnAgentInput, StateUpdateRequest};
+use crate::types::{SessionWorkflowInput, SpawnAgentInput, StateUpdateRequest, extract_message};
 use crate::watcher::{Watcher, WatcherEvent};
 use crate::workflow::{AgentWorkflow, AgentWorkflowRun};
 
@@ -248,45 +247,7 @@ impl TemporalAgentSession {
                 watcher.run_watching(tx).await;
             });
 
-            let mut stall_notified = false;
-            while let Some(result) = rx.recv().await {
-                // Check generation for staleness.
-                if *generation.lock().expect("lock poisoned") != gen_at_start {
-                    return;
-                }
-                match result {
-                    WatcherEvent::Events(events, _watermark) => {
-                        stall_notified = false;
-                        if !events.is_empty() {
-                            buffer.lock().expect("lock poisoned").extend(events);
-                            notify.notify_one();
-                        }
-                    }
-                    WatcherEvent::Completed => {
-                        buffer.lock().expect("lock poisoned").push(Event {
-                            id: String::new(),
-                            msg: EventMsg::ShutdownComplete,
-                        });
-                        notify.notify_one();
-                        return;
-                    }
-                    WatcherEvent::Error(e) => {
-                        tracing::warn!(error = %e, "watcher: connection error, retrying");
-                        // Show a status message once per stall period.
-                        if !stall_notified {
-                            stall_notified = true;
-                            buffer.lock().expect("lock poisoned").push(Event {
-                                id: String::new(),
-                                msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
-                                    message: "Connecting to backend...".to_string(),
-                                }),
-                            });
-                            notify.notify_one();
-                        }
-                        // Watcher keeps retrying — don't return.
-                    }
-                }
-            }
+            drain_watcher_into_buffer(&mut rx, &buffer, &notify, &generation, gen_at_start).await;
         });
 
         *self.watch_handle.lock().expect("lock poisoned") = Some(handle);
@@ -381,18 +342,6 @@ impl TemporalAgentSession {
         Ok(events.into_iter().map(|e| e.msg).collect())
     }
 
-    /// Extract the text message from user input items.
-    fn extract_message(items: &[UserInput]) -> String {
-        items
-            .iter()
-            .filter_map(|item| match item {
-                UserInput::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// Signal an operation to the active agent workflow.
     async fn signal_agent_op(&self, op: Op) -> CodexResult<String> {
         let agent_id = self.active_agent_id();
@@ -412,6 +361,54 @@ impl TemporalAgentSession {
         Ok("ok".to_string())
     }
 
+}
+
+/// Drain watcher events into a shared buffer until the channel closes,
+/// the workflow completes, or the generation counter changes (indicating
+/// the session has been switched).
+async fn drain_watcher_into_buffer(
+    rx: &mut tokio::sync::mpsc::Receiver<WatcherEvent>,
+    buffer: &Arc<Mutex<Vec<Event>>>,
+    notify: &Arc<tokio::sync::Notify>,
+    generation: &Arc<Mutex<u64>>,
+    gen_at_start: u64,
+) {
+    let mut stall_notified = false;
+    while let Some(result) = rx.recv().await {
+        if *generation.lock().expect("lock poisoned") != gen_at_start {
+            return;
+        }
+        match result {
+            WatcherEvent::Events(events, _) => {
+                stall_notified = false;
+                if !events.is_empty() {
+                    buffer.lock().expect("lock poisoned").extend(events);
+                    notify.notify_one();
+                }
+            }
+            WatcherEvent::Completed => {
+                buffer.lock().expect("lock poisoned").push(Event {
+                    id: String::new(),
+                    msg: EventMsg::ShutdownComplete,
+                });
+                notify.notify_one();
+                return;
+            }
+            WatcherEvent::Error(e) => {
+                tracing::warn!(error = %e, "watcher: connection error, retrying");
+                if !stall_notified {
+                    stall_notified = true;
+                    buffer.lock().expect("lock poisoned").push(Event {
+                        id: String::new(),
+                        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+                            message: "Connecting to backend...".to_string(),
+                        }),
+                    });
+                    notify.notify_one();
+                }
+            }
+        }
+    }
 }
 
 /// Derive the harness workflow ID for the current user.
@@ -486,7 +483,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
         {
             let started = *self.started.lock().expect("lock poisoned");
             if !started {
-                let message = Self::extract_message(items);
+                let message = extract_message(items);
                 // Retry start_workflow in a background task with cancellation.
                 let cancel = CancellationToken::new();
                 *self.submit_cancel.lock().expect("lock poisoned") = Some(cancel.clone());
@@ -609,45 +606,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                         tokio::spawn(async move {
                                             watcher.run_watching(wtx).await;
                                         });
-                                        let buffer3 = buffer2;
-                                        let notify3 = notify2;
-                                        // Feed watcher events into the shared buffer.
-                                        let mut stall_notified = false;
-                                        while let Some(result) = wrx.recv().await {
-                                            if *generation.lock().expect("lock poisoned") != gen_at_start {
-                                                return;
-                                            }
-                                            match result {
-                                                WatcherEvent::Events(events, _) => {
-                                                    stall_notified = false;
-                                                    if !events.is_empty() {
-                                                        buffer3.lock().expect("lock poisoned").extend(events);
-                                                        notify3.notify_one();
-                                                    }
-                                                }
-                                                WatcherEvent::Completed => {
-                                                    buffer3.lock().expect("lock poisoned").push(Event {
-                                                        id: String::new(),
-                                                        msg: EventMsg::ShutdownComplete,
-                                                    });
-                                                    notify3.notify_one();
-                                                    return;
-                                                }
-                                                WatcherEvent::Error(e) => {
-                                                    tracing::warn!(error = %e, "watcher: connection error, retrying");
-                                                    if !stall_notified {
-                                                        stall_notified = true;
-                                                        buffer3.lock().expect("lock poisoned").push(Event {
-                                                            id: String::new(),
-                                                            msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
-                                                                message: "Connecting to backend...".to_string(),
-                                                            }),
-                                                        });
-                                                        notify3.notify_one();
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        drain_watcher_into_buffer(&mut wrx, &buffer2, &notify2, &generation, gen_at_start).await;
                                         return;
                                     }
                                     Err(e) => {
