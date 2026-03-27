@@ -768,6 +768,48 @@ pub struct StateUpdateResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Turn overrides
+// ---------------------------------------------------------------------------
+
+/// Per-session overrides set via `Op::OverrideTurnContext` signals.
+///
+/// These five fields always travel together — across continue-as-new
+/// boundaries, signal handlers, and turn configuration merges.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnOverrides {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "approval_policy_override"
+    )]
+    pub approval_policy: Option<AskForApproval>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "model_override"
+    )]
+    pub model: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "effort_override"
+    )]
+    pub effort: Option<Option<ReasoningEffort>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "summary_override"
+    )]
+    pub summary: Option<ReasoningSummary>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "personality_override"
+    )]
+    pub personality: Option<Personality>,
+}
+
+// ---------------------------------------------------------------------------
 // Continue-as-new state
 // ---------------------------------------------------------------------------
 
@@ -788,21 +830,9 @@ pub struct ContinueAsNewState {
     /// Discovered MCP tool schemas (carried across CAN to avoid re-discovery).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
-    /// Overridden approval policy (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy_override: Option<AskForApproval>,
-    /// Overridden model slug (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
-    /// Overridden reasoning effort (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort_override: Option<Option<ReasoningEffort>>,
-    /// Overridden reasoning summary (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_override: Option<ReasoningSummary>,
-    /// Overridden personality (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub personality_override: Option<Personality>,
+    /// Persistent turn-context overrides.
+    #[serde(default, flatten)]
+    pub overrides: TurnOverrides,
     /// Monotonic offset of evicted events from the rolling event buffer.
     #[serde(default)]
     pub event_offset: usize,

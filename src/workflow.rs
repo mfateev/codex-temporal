@@ -24,9 +24,8 @@ use codex_core::{
     TurnContext, TurnDiffTracker, ToolsConfig, ToolsConfigParams, build_specs,
     try_run_sampling_request,
 };
-use codex_protocol::config_types::{Personality, ReasoningSummary};
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::{BaseInstructions, ContentItem, ResponseItem};
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::{
     AgentMessageEvent, AskForApproval, ContextCompactedEvent, Event, EventMsg, Op,
     ReviewDecision, TurnAbortReason, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent,
@@ -54,7 +53,7 @@ use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
     PendingPatchApproval, PendingUserInput, ProjectContextOutput, ResolveModelInfoInput,
-    StateUpdateRequest, StateUpdateResponse, UserTurnInput,
+    StateUpdateRequest, StateUpdateResponse, TurnOverrides, UserTurnInput,
 };
 
 /// Default maximum number of model→tool loop iterations per turn.
@@ -86,18 +85,8 @@ pub struct AgentWorkflow {
     shutdown_requested: bool,
     /// When true the workflow will run compaction and then continue-as-new.
     compact_requested: bool,
-    /// Overridden approval policy (from `Op::OverrideTurnContext`).
-    /// `None` means use `input.approval_policy`.
-    approval_policy_override: Option<AskForApproval>,
-    /// Overridden model slug (from `Op::OverrideTurnContext`).
-    model_override: Option<String>,
-    /// Overridden reasoning effort (from `Op::OverrideTurnContext`).
-    /// `Some(Some(e))` = set effort, `Some(None)` = clear effort, `None` = unchanged.
-    effort_override: Option<Option<ReasoningEffort>>,
-    /// Overridden reasoning summary (from `Op::OverrideTurnContext`).
-    summary_override: Option<ReasoningSummary>,
-    /// Overridden personality (from `Op::OverrideTurnContext`).
-    personality_override: Option<Personality>,
+    /// Persistent turn-context overrides (from `Op::OverrideTurnContext`).
+    overrides: TurnOverrides,
     /// Set by `Op::Interrupt`; checked between loop iterations and during
     /// approval waits.
     pub(crate) interrupt_requested: bool,
@@ -181,7 +170,6 @@ pub fn build_context_items(ctx: &ProjectContextOutput) -> Vec<ResponseItem> {
 
 /// Build `ContinueAsNewState` from the current workflow state and return
 /// `Err(WorkflowTermination::ContinueAsNew(...))` to trigger CAN.
-#[allow(clippy::too_many_arguments)]
 fn do_continue_as_new(
     input: &AgentWorkflowInput,
     storage: &InMemoryStorage,
@@ -191,11 +179,7 @@ fn do_continue_as_new(
     turn_counter: u32,
     token_usage: Option<codex_protocol::protocol::TokenUsage>,
     mcp_tools: HashMap<String, serde_json::Value>,
-    approval_policy_override: Option<AskForApproval>,
-    model_override: Option<String>,
-    effort_override: Option<Option<ReasoningEffort>>,
-    summary_override: Option<ReasoningSummary>,
-    personality_override: Option<Personality>,
+    overrides: TurnOverrides,
 ) -> WorkflowResult<AgentWorkflowOutput> {
     let (event_offset, event_snapshot) = events.snapshot();
     let state = ContinueAsNewState {
@@ -205,11 +189,7 @@ fn do_continue_as_new(
         cumulative_iterations: total_iterations,
         cumulative_token_usage: token_usage,
         mcp_tools,
-        approval_policy_override,
-        model_override,
-        effort_override,
-        summary_override,
-        personality_override,
+        overrides,
         event_offset,
         event_snapshot,
     };
@@ -249,11 +229,7 @@ impl AgentWorkflow {
                 pending_dynamic_tool: None,
                 shutdown_requested: false,
                 compact_requested: false,
-                approval_policy_override: state.approval_policy_override,
-                model_override: state.model_override.clone(),
-                effort_override: state.effort_override,
-                summary_override: state.summary_override,
-                personality_override: state.personality_override,
+                overrides: state.overrides.clone(),
                 interrupt_requested: false,
                 current_turn_cancellation: None,
                 state_version: 0,
@@ -290,11 +266,7 @@ impl AgentWorkflow {
             pending_dynamic_tool: None,
             shutdown_requested: false,
             compact_requested: false,
-            approval_policy_override: None,
-            model_override: None,
-            effort_override: None,
-            summary_override: None,
-            personality_override: None,
+            overrides: TurnOverrides::default(),
             interrupt_requested: false,
             current_turn_cancellation: None,
             state_version: 0,
@@ -303,7 +275,8 @@ impl AgentWorkflow {
 
     /// Return the effective approval policy, preferring the override.
     pub fn effective_approval_policy(&self) -> AskForApproval {
-        self.approval_policy_override
+        self.overrides
+            .approval_policy
             .unwrap_or(self.input.approval_policy)
     }
 
@@ -390,19 +363,19 @@ impl AgentWorkflow {
                 ..
             } => {
                 if let Some(policy) = approval_policy {
-                    self.approval_policy_override = Some(policy);
+                    self.overrides.approval_policy = Some(policy);
                 }
                 if let Some(m) = model {
-                    self.model_override = Some(m);
+                    self.overrides.model = Some(m);
                 }
                 if let Some(e) = effort {
-                    self.effort_override = Some(e);
+                    self.overrides.effort = Some(e);
                 }
                 if let Some(s) = summary {
-                    self.summary_override = Some(s);
+                    self.overrides.summary = Some(s);
                 }
                 if let Some(p) = personality {
-                    self.personality_override = Some(p);
+                    self.overrides.personality = Some(p);
                 }
                 self.bump_version();
             }
@@ -484,17 +457,111 @@ impl AgentWorkflow {
     pub async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<AgentWorkflowOutput> {
         let input = ctx.state(|s| s.input.clone());
         let events = ctx.state(|s| s.events.clone());
-        let max_iterations = input.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
 
-        // --- deterministic entropy ---
         let seed = ctx.random_seed();
         let entropy = EntropyProviders {
             random: Arc::new(TemporalRandomSource::new(seed)),
         };
 
+        let mut rt = WorkflowRuntime::initialize(ctx, &input, &events).await?;
+
+        let can_result: Option<WorkflowResult<AgentWorkflowOutput>> = ENTROPY
+            .scope(entropy, async {
+                loop {
+                    ctx.wait_condition(|s| {
+                        !s.user_turns.is_empty()
+                            || s.shutdown_requested
+                            || s.compact_requested
+                    })
+                    .await;
+
+                    if ctx.state(|s| s.compact_requested) {
+                        break Some(rt.handle_compact(ctx));
+                    }
+
+                    if ctx.state(|s| s.shutdown_requested && s.user_turns.is_empty()) {
+                        break None;
+                    }
+
+                    let turn = ctx.state_mut(|s| s.user_turns.remove(0));
+                    let overrides = ctx.state(|s| s.overrides.clone());
+
+                    match rt.process_turn(ctx, turn, &overrides).await {
+                        TurnOutcome::ContinueAsNew(r) => break Some(r),
+                        TurnOutcome::Shutdown => break None,
+                        TurnOutcome::Completed => continue,
+                    }
+                }
+            })
+            .await;
+
+        if let Some(can) = can_result {
+            return can;
+        }
+
+        events.emit_event_sync(Event {
+            id: String::new(),
+            msg: EventMsg::ShutdownComplete,
+        });
+        ctx.state_mut(|s| s.bump_version());
+
+        Ok(AgentWorkflowOutput {
+            last_agent_message: rt.last_agent_message,
+            iterations: rt.total_iterations,
+            token_usage: events.latest_token_usage(),
+        })
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowRuntime — post-initialization state and per-turn processing
+// ---------------------------------------------------------------------------
+
+/// Outcome of processing a single user turn.
+enum TurnOutcome {
+    /// Turn completed normally; continue waiting for the next turn.
+    Completed,
+    /// Workflow should continue-as-new.
+    ContinueAsNew(WorkflowResult<AgentWorkflowOutput>),
+    /// Shutdown was requested during this turn.
+    Shutdown,
+}
+
+/// Holds all state produced during workflow initialization and provides
+/// methods for per-turn processing.  Lives outside the `#[workflow_methods]`
+/// impl so it is unconstrained by the Temporal macro's signature rules.
+struct WorkflowRuntime {
+    input: AgentWorkflowInput,
+    events: Arc<BufferEventSink>,
+    config: Arc<codex_core::config::Config>,
+    config_toml: String,
+    sess: Arc<Session>,
+    storage: Arc<InMemoryStorage>,
+    tools: Vec<ToolSpec>,
+    base_instructions: BaseInstructions,
+    context_items: Vec<ResponseItem>,
+    model_info: codex_protocol::openai_models::ModelInfo,
+    conversation_id: ThreadId,
+    mcp_tools: HashMap<String, serde_json::Value>,
+    mcp_tool_names: HashSet<String>,
+    dynamic_tool_names: HashSet<String>,
+    max_iterations: u32,
+    total_iterations: u32,
+    last_agent_message: Option<String>,
+}
+
+impl WorkflowRuntime {
+    /// Run all startup activities (config, project context, MCP discovery,
+    /// model info, session creation, CAN state restoration, tool building).
+    async fn initialize(
+        ctx: &mut WorkflowContext<AgentWorkflow>,
+        input: &AgentWorkflowInput,
+        events: &Arc<BufferEventSink>,
+    ) -> Result<Self, WorkflowTermination> {
+        let max_iterations = input.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS);
+
         // --- startup: load config, project context, MCP tools ---
-        // If pre-resolved by SessionWorkflow, use directly; otherwise fall
-        // back to activities (backward compat for standalone tests).
         let (config_output, project_context, mcp_tools) =
             if input.config_toml.is_some() && input.project_context.is_some() {
                 let config_output = ConfigOutput {
@@ -505,7 +572,6 @@ impl AgentWorkflow {
                 tracing::debug!("using pre-resolved config/context from parent workflow");
                 (config_output, project_context, mcp_tools)
             } else {
-                // Launch load_config and collect_project_context concurrently.
                 let config_activity = ctx.start_activity(
                     CodexActivities::load_config,
                     (),
@@ -577,8 +643,6 @@ impl AgentWorkflow {
         }
 
         // --- config ---
-        // Build a full Config from the activity-loaded TOML, with user
-        // instructions (AGENTS.md) from project context.
         let mut config = config_from_toml(
             &config_output.config_toml,
             std::path::Path::new(&project_context.cwd),
@@ -592,9 +656,6 @@ impl AgentWorkflow {
         let config = Arc::new(config);
 
         // --- model info ---
-        // Resolve model metadata via activity (API-backed with bundled fallback).
-        // The activity already calls backfill_experimental_tools, but the
-        // fallback path needs it too, so apply unconditionally.
         let mut model_info = ctx
             .start_activity(
                 CodexActivities::resolve_model_info,
@@ -630,10 +691,8 @@ impl AgentWorkflow {
 
         // --- restore state from continue-as-new (if any) ---
         if let Some(ref state) = input.continued_state {
-            // Pre-populate storage so it reflects the full rollout history.
             storage.save(&state.rollout_items).await;
 
-            // Rebuild in-memory conversation history from rollout items.
             let mut history_items: Vec<ResponseItem> = Vec::new();
             for item in &state.rollout_items {
                 match item {
@@ -642,25 +701,19 @@ impl AgentWorkflow {
                     }
                     codex_protocol::protocol::RolloutItem::Compacted(compacted) => {
                         if let Some(ref replacement) = compacted.replacement_history {
-                            // Remote compaction: use the pre-computed replacement.
                             history_items = replacement.clone();
                         } else {
-                            // Local compaction: the summary becomes an assistant
-                            // message. Clear prior history and use the compacted
-                            // message as the new baseline.
                             history_items.clear();
                             history_items.push(compacted.clone().into());
                         }
                     }
-                    _ => {} // Skip SessionMeta, TurnContext, EventMsg
+                    _ => {}
                 }
             }
             sess.replace_history(history_items, None).await;
         }
 
         // --- tools ---
-        // Use codex-core's build_specs to get the full set of tool specs
-        // (shell, apply_patch, read_file, list_dir, grep_files, etc.).
         let sandbox_policy = config.permissions.sandbox_policy.get();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
@@ -673,7 +726,6 @@ impl AgentWorkflow {
         })
         .with_agent_roles(config.agent_roles.clone());
 
-        // Convert serialized MCP tools back to rmcp::model::Tool for build_specs.
         let rmcp_tools: Option<HashMap<String, rmcp::model::Tool>> = if mcp_tools.is_empty() {
             None
         } else {
@@ -691,13 +743,11 @@ impl AgentWorkflow {
             if map.is_empty() { None } else { Some(map) }
         };
 
-        // Collect MCP tool names for the tool handler.
         let mcp_tool_names: HashSet<String> = rmcp_tools
             .as_ref()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
-        // Collect dynamic tool names for the tool handler to intercept.
         let dynamic_tool_names: HashSet<String> = input
             .dynamic_tools
             .iter()
@@ -707,421 +757,373 @@ impl AgentWorkflow {
         let builder = build_specs(&tools_config, rmcp_tools, None, &input.dynamic_tools);
         let (configured_specs, _registry) = builder.build();
         let tools: Vec<ToolSpec> = configured_specs.into_iter().map(|cs| cs.spec).collect();
-        let base_instructions = BaseInstructions {
-            text: input.instructions.clone(),
-        };
 
-        let mut total_iterations = input
+        let total_iterations = input
             .continued_state
             .as_ref()
             .map_or(0, |s| s.cumulative_iterations);
-        let mut last_agent_message: Option<String> = None;
 
-        // === main loop: wait for turns, process them, repeat ===
-        let can_result: Option<WorkflowResult<AgentWorkflowOutput>> = ENTROPY
-            .scope(entropy, async {
-                loop {
-                    // Wait until we have a user turn to process or shutdown.
-                    ctx.wait_condition(|s| {
-                        !s.user_turns.is_empty()
-                            || s.shutdown_requested
-                            || s.compact_requested
-                    })
-                    .await;
-
-                    // Check compact — emit event then continue-as-new.
-                    let compact = ctx.state(|s| s.compact_requested);
-                    if compact {
-                        tracing::info!("compact requested — triggering continue-as-new");
-                        ctx.state_mut(|s| s.compact_requested = false);
-
-                        // TODO: run actual compaction through Session here.
-                        // For now, skip model-based summarization and just
-                        // trigger CAN with the full history as-is.
-
-                        // Emit ContextCompactedEvent so clients know compact
-                        // completed (blocking event before CAN).
-                        events.emit_event_sync(Event {
-                            id: String::new(),
-                            msg: EventMsg::ContextCompacted(ContextCompactedEvent),
-                        });
-                        ctx.state_mut(|s| s.bump_version());
-
-                        let pending = ctx.state(|s| s.user_turns.clone());
-                        let turn_count = ctx.state(|s| s.turn_counter);
-                        let (
-                            policy_override,
-                            can_model_override,
-                            can_effort_override,
-                            can_summary_override,
-                            can_personality_override,
-                        ) = ctx.state(|s| {
-                            (
-                                s.approval_policy_override,
-                                s.model_override.clone(),
-                                s.effort_override,
-                                s.summary_override,
-                                s.personality_override,
-                            )
-                        });
-                        break Some(do_continue_as_new(
-                            &input,
-                            &storage,
-                            &events,
-                            pending,
-                            total_iterations,
-                            turn_count,
-                            events.latest_token_usage(),
-                            mcp_tools.clone(),
-                            policy_override,
-                            can_model_override,
-                            can_effort_override,
-                            can_summary_override,
-                            can_personality_override,
-                        ));
-                    }
-
-                    // Check shutdown before processing.
-                    let shutdown = ctx.state(|s| s.shutdown_requested);
-                    if shutdown {
-                        let remaining = ctx.state(|s| s.user_turns.is_empty());
-                        if remaining {
-                            break None;
-                        }
-                    }
-
-                    // Dequeue the next turn.
-                    let turn = ctx.state_mut(|s| s.user_turns.remove(0));
-
-                    let turn_id = turn.turn_id.clone();
-
-                    // Emit TurnStarted
-                    events.emit_event_sync(Event {
-                        id: turn_id.clone(),
-                        msg: EventMsg::TurnStarted(TurnStartedEvent {
-                            turn_id: turn_id.clone(),
-                            model_context_window: None,
-                            collaboration_mode_kind: Default::default(),
-                        }),
-                    });
-                    ctx.state_mut(|s| s.bump_version());
-
-                    // Seed user message into session history.
-                    let user_item = ResponseItem::Message {
-                        id: None,
-                        role: "user".to_string(),
-                        content: vec![ContentItem::InputText {
-                            text: turn.message.clone(),
-                        }],
-                        end_turn: None,
-                        phase: None,
-                    };
-
-                    // Read persistent overrides from workflow state.
-                    let (
-                        persistent_effort,
-                        persistent_summary,
-                        persistent_personality,
-                        persistent_model,
-                    ) = ctx.state(|s| {
-                        (
-                            s.effort_override,
-                            s.summary_override,
-                            s.personality_override,
-                            s.model_override.clone(),
-                        )
-                    });
-
-                    // Per-turn config: per-turn overrides from UserTurnInput take
-                    // priority; persistent overrides (from OverrideTurnContext) are
-                    // used as fallback.
-                    let turn_config = {
-                        let mut c = (*config).clone();
-                        // Per-turn overrides take priority.
-                        if turn.effort.is_some() {
-                            c.model_reasoning_effort = turn.effort;
-                        } else if let Some(e) = persistent_effort {
-                            c.model_reasoning_effort = e;
-                        }
-                        if turn.summary != ReasoningSummary::default() {
-                            c.model_reasoning_summary = Some(turn.summary);
-                        } else if let Some(s) = persistent_summary {
-                            c.model_reasoning_summary = Some(s);
-                        }
-                        if turn.personality.is_some() {
-                            c.personality = turn.personality;
-                        } else if let Some(p) = persistent_personality {
-                            c.personality = Some(p);
-                        }
-                        // Model override: update config model field.
-                        if let Some(ref m) = persistent_model {
-                            c.model = Some(m.clone());
-                        }
-                        Arc::new(c)
-                    };
-
-                    let turn_context = Arc::new(TurnContext::new_minimal(
-                        turn_id.clone(),
-                        model_info.clone(),
-                        Arc::clone(&turn_config),
-                    ));
-
-                    sess.record_items(&turn_context, &[user_item]).await;
-
-                    // --- run the agentic loop for this turn ---
-                    let cancellation_token = CancellationToken::new();
-                    ctx.state_mut(|s| {
-                        s.current_turn_cancellation = Some(cancellation_token.clone());
-                    });
-
-                    let mut streamer = TemporalModelStreamer::new(
-                        ctx.clone(),
-                        conversation_id.to_string(),
-                        input.model_provider.clone(),
-                        cancellation_token.clone(),
-                    );
-
-                    let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-                    let mut iterations = 0u32;
-                    let mut turn_aborted = false;
-                    let mut turn_error: Option<codex_core::error::CodexErr> = None;
-
-                    // Reset interrupt flag at the start of each turn.
-                    ctx.state_mut(|s| s.interrupt_requested = false);
-
-                    loop {
-                        // Check for interrupt at iteration boundary.
-                        let interrupted = ctx.state(|s| s.interrupt_requested);
-                        if interrupted {
-                            tracing::info!("interrupt requested, aborting turn");
-                            turn_aborted = true;
-                            ctx.state_mut(|s| s.interrupt_requested = false);
-                            break;
-                        }
-
-                        if iterations >= max_iterations {
-                            tracing::warn!("max iterations reached ({max_iterations}), stopping turn");
-                            // Emit a visible message so the user knows why the
-                            // turn ended without a final response.
-                            events.emit_event_sync(Event {
-                                id: turn_id.clone(),
-                                msg: EventMsg::AgentMessage(AgentMessageEvent {
-                                    message: format!(
-                                        "⚠️ Maximum iterations ({max_iterations}) reached. \
-                                         The model was still processing tool calls. \
-                                         You can continue with a follow-up message."
-                                    ),
-                                    phase: None,
-                                    memory_citation: None,
-                                }),
-                            });
-                            ctx.state_mut(|s| s.bump_version());
-                            last_agent_message = Some(format!(
-                                "Maximum iterations ({max_iterations}) reached — \
-                                 the model was still processing. \
-                                 You can continue with a follow-up message."
-                            ));
-                            break;
-                        }
-
-                        // Create handler inside the loop so it picks up the
-                        // effective approval policy (which may change mid-turn
-                        // via OverrideTurnContext signals).
-                        let effective_policy =
-                            ctx.state(|s| s.effective_approval_policy());
-                        let effective_model = persistent_model
-                            .as_deref()
-                            .unwrap_or(&input.model)
-                            .to_string();
-                        let handler = TemporalToolHandler::new(
-                            ctx.clone(),
-                            events.clone(),
-                            turn_id.clone(),
-                            effective_policy,
-                            effective_model,
-                            config.cwd.to_string_lossy().to_string(),
-                            Some(config_output.config_toml.clone()),
-                            mcp_tool_names.clone(),
-                            dynamic_tool_names.clone(),
-                            config.permissions.sandbox_policy.get().clone(),
-                        );
-
-                        // Rebuild prompt from accumulated session history,
-                        // prepending ephemeral context items (AGENTS.md +
-                        // environment context) so the model sees project docs.
-                        let history = sess.history_items().await;
-                        let mut input_items = context_items.clone();
-
-                        // Inject developer instructions (from config.toml)
-                        // after project context, before conversation history.
-                        if let Some(ref dev_instructions) = input.developer_instructions {
-                            input_items.push(ResponseItem::Message {
-                                id: None,
-                                role: "developer".to_string(),
-                                content: vec![ContentItem::InputText {
-                                    text: dev_instructions.clone(),
-                                }],
-                                end_turn: None,
-                                phase: None,
-                            });
-                        }
-
-                        input_items.extend(history);
-                        let prompt = Prompt {
-                            input: input_items,
-                            tools: tools.clone(),
-                            parallel_tool_calls: false,
-                            base_instructions: base_instructions.clone(),
-                            personality: turn_config.personality,
-                            output_schema: None,
-                        };
-
-                        let mut server_model_warning_emitted = false;
-                        let result = try_run_sampling_request(
-                            Arc::clone(&sess),
-                            Arc::clone(&turn_context),
-                            &mut streamer,
-                            &handler,
-                            None,
-                            Arc::clone(&diff_tracker),
-                            &mut server_model_warning_emitted,
-                            &prompt,
-                            cancellation_token.child_token(),
-                        )
-                        .await;
-
-                        iterations += 1;
-                        total_iterations += 1;
-
-                        match result {
-                            Ok(outcome) => {
-                                if let Some(msg) = outcome.last_agent_message {
-                                    last_agent_message = Some(msg);
-                                }
-                                if !outcome.needs_follow_up {
-                                    break;
-                                }
-                                tracing::debug!(
-                                    iteration = iterations,
-                                    "follow-up needed, continuing loop"
-                                );
-                            }
-                            Err(codex_core::error::CodexErr::TurnAborted) => {
-                                tracing::debug!("try_run_sampling_request returned TurnAborted");
-                                turn_aborted = true;
-                                ctx.state_mut(|s| s.interrupt_requested = false);
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "try_run_sampling_request failed");
-                                turn_error = Some(e);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Clear the turn cancellation token now that the loop is done.
-                    ctx.state_mut(|s| s.current_turn_cancellation = None);
-
-                    if turn_aborted {
-                        // Emit TurnAborted event.
-                        events.emit_event_sync(Event {
-                            id: turn_id.clone(),
-                            msg: EventMsg::TurnAborted(TurnAbortedEvent {
-                                turn_id: Some(turn_id),
-                                reason: TurnAbortReason::Interrupted,
-                            }),
-                        });
-                        ctx.state_mut(|s| s.bump_version());
-                    } else {
-                        // If the turn ended with an error, emit an Error
-                        // event so the user sees what went wrong (e.g.
-                        // "Quota exceeded").
-                        if let Some(ref err) = turn_error {
-                            let error_event = err.to_error_event(None);
-                            events.emit_event_sync(Event {
-                                id: turn_id.clone(),
-                                msg: EventMsg::Error(error_event),
-                            });
-                            ctx.state_mut(|s| s.bump_version());
-                        }
-
-                        // Emit TurnComplete
-                        events.emit_event_sync(Event {
-                            id: turn_id.clone(),
-                            msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                                turn_id,
-                                last_agent_message: last_agent_message.clone(),
-                            }),
-                        });
-                        ctx.state_mut(|s| s.bump_version());
-                    }
-
-                    // Check if server suggests continue-as-new (history too large).
-                    if ctx.continue_as_new_suggested() {
-                        tracing::info!("server suggested continue-as-new, triggering CAN");
-                        let pending = ctx.state(|s| s.user_turns.clone());
-                        let turn_count = ctx.state(|s| s.turn_counter);
-                        let (
-                            policy_override,
-                            can_model_override,
-                            can_effort_override,
-                            can_summary_override,
-                            can_personality_override,
-                        ) = ctx.state(|s| {
-                            (
-                                s.approval_policy_override,
-                                s.model_override.clone(),
-                                s.effort_override,
-                                s.summary_override,
-                                s.personality_override,
-                            )
-                        });
-                        break Some(do_continue_as_new(
-                            &input,
-                            &storage,
-                            &events,
-                            pending,
-                            total_iterations,
-                            turn_count,
-                            events.latest_token_usage(),
-                            mcp_tools.clone(),
-                            policy_override,
-                            can_model_override,
-                            can_effort_override,
-                            can_summary_override,
-                            can_personality_override,
-                        ));
-                    }
-
-                    // Check if shutdown was requested during this turn.
-                    let shutdown = ctx.state(|s| s.shutdown_requested);
-                    if shutdown {
-                        break None;
-                    }
-                }
-            })
-            .await;
-
-        // If the loop returned a CAN result, propagate it.
-        if let Some(can) = can_result {
-            return can;
-        }
-
-        // Normal shutdown path.
-        events.emit_event_sync(Event {
-            id: String::new(),
-            msg: EventMsg::ShutdownComplete,
-        });
-        ctx.state_mut(|s| s.bump_version());
-
-        Ok(AgentWorkflowOutput {
-            last_agent_message,
-            iterations: total_iterations,
-            token_usage: events.latest_token_usage(),
+        Ok(Self {
+            input: input.clone(),
+            events: Arc::clone(events),
+            config,
+            config_toml: config_output.config_toml,
+            sess,
+            storage,
+            tools,
+            base_instructions: BaseInstructions {
+                text: input.instructions.clone(),
+            },
+            context_items,
+            model_info,
+            conversation_id,
+            mcp_tools,
+            mcp_tool_names,
+            dynamic_tool_names,
+            max_iterations,
+            total_iterations,
+            last_agent_message: None,
         })
     }
 
+    /// Handle a compact request: emit event and trigger continue-as-new.
+    fn handle_compact(
+        &self,
+        ctx: &mut WorkflowContext<AgentWorkflow>,
+    ) -> WorkflowResult<AgentWorkflowOutput> {
+        tracing::info!("compact requested — triggering continue-as-new");
+        ctx.state_mut(|s| s.compact_requested = false);
+
+        self.events.emit_event_sync(Event {
+            id: String::new(),
+            msg: EventMsg::ContextCompacted(ContextCompactedEvent),
+        });
+        ctx.state_mut(|s| s.bump_version());
+
+        self.trigger_continue_as_new(ctx)
+    }
+
+    /// Build `ContinueAsNewState` from the current runtime + workflow state
+    /// and return the CAN termination result.
+    fn trigger_continue_as_new(
+        &self,
+        ctx: &WorkflowContext<AgentWorkflow>,
+    ) -> WorkflowResult<AgentWorkflowOutput> {
+        let pending = ctx.state(|s| s.user_turns.clone());
+        let turn_count = ctx.state(|s| s.turn_counter);
+        let overrides = ctx.state(|s| s.overrides.clone());
+
+        do_continue_as_new(
+            &self.input,
+            &self.storage,
+            &self.events,
+            pending,
+            self.total_iterations,
+            turn_count,
+            self.events.latest_token_usage(),
+            self.mcp_tools.clone(),
+            overrides,
+        )
+    }
+
+    /// Process a single user turn: emit events, run the agentic iteration
+    /// loop, and return the outcome.
+    async fn process_turn(
+        &mut self,
+        ctx: &mut WorkflowContext<AgentWorkflow>,
+        turn: UserTurnInput,
+        overrides: &TurnOverrides,
+    ) -> TurnOutcome {
+        let turn_id = turn.turn_id.clone();
+
+        // Emit TurnStarted.
+        self.events.emit_event_sync(Event {
+            id: turn_id.clone(),
+            msg: EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                model_context_window: None,
+                collaboration_mode_kind: Default::default(),
+            }),
+        });
+        ctx.state_mut(|s| s.bump_version());
+
+        // Record the user message in session history.
+        let user_item = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: turn.message.clone(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+
+        let turn_config = self.build_turn_config(&turn, overrides);
+        let turn_context = Arc::new(TurnContext::new_minimal(
+            turn_id.clone(),
+            self.model_info.clone(),
+            Arc::clone(&turn_config),
+        ));
+        self.sess.record_items(&turn_context, &[user_item]).await;
+
+        // Run the agentic iteration loop.
+        let (turn_aborted, turn_error) =
+            self.run_agentic_loop(ctx, &turn_id, &turn_config, &turn_context, overrides)
+                .await;
+
+        // Emit turn-end events.
+        self.emit_turn_end_events(ctx, &turn_id, turn_aborted, turn_error.as_ref());
+
+        // Check if server suggests continue-as-new.
+        if ctx.continue_as_new_suggested() {
+            tracing::info!("server suggested continue-as-new, triggering CAN");
+            return TurnOutcome::ContinueAsNew(self.trigger_continue_as_new(ctx));
+        }
+
+        if ctx.state(|s| s.shutdown_requested) {
+            return TurnOutcome::Shutdown;
+        }
+
+        TurnOutcome::Completed
+    }
+
+    /// Build a per-turn `Config`, merging per-turn overrides (from
+    /// `UserTurnInput`) with persistent overrides (from
+    /// `Op::OverrideTurnContext`).  Per-turn values take priority.
+    fn build_turn_config(
+        &self,
+        turn: &UserTurnInput,
+        overrides: &TurnOverrides,
+    ) -> Arc<codex_core::config::Config> {
+        let mut c = (*self.config).clone();
+
+        if turn.effort.is_some() {
+            c.model_reasoning_effort = turn.effort;
+        } else if let Some(e) = overrides.effort {
+            c.model_reasoning_effort = e;
+        }
+
+        if turn.summary != ReasoningSummary::default() {
+            c.model_reasoning_summary = Some(turn.summary);
+        } else if let Some(s) = overrides.summary {
+            c.model_reasoning_summary = Some(s);
+        }
+
+        if turn.personality.is_some() {
+            c.personality = turn.personality;
+        } else if let Some(p) = overrides.personality {
+            c.personality = Some(p);
+        }
+
+        if let Some(ref m) = overrides.model {
+            c.model = Some(m.clone());
+        }
+
+        Arc::new(c)
+    }
+
+    /// Build the full prompt (context items + developer instructions + history + tools).
+    fn build_prompt(
+        &self,
+        history: Vec<ResponseItem>,
+        turn_config: &codex_core::config::Config,
+    ) -> Prompt {
+        let mut input_items = self.context_items.clone();
+
+        if let Some(ref dev_instructions) = self.input.developer_instructions {
+            input_items.push(ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: dev_instructions.clone(),
+                }],
+                end_turn: None,
+                phase: None,
+            });
+        }
+
+        input_items.extend(history);
+
+        Prompt {
+            input: input_items,
+            tools: self.tools.clone(),
+            parallel_tool_calls: false,
+            base_instructions: self.base_instructions.clone(),
+            personality: turn_config.personality,
+            output_schema: None,
+        }
+    }
+
+    /// Inner model→tool iteration loop for a single turn.
+    async fn run_agentic_loop(
+        &mut self,
+        ctx: &mut WorkflowContext<AgentWorkflow>,
+        turn_id: &str,
+        turn_config: &Arc<codex_core::config::Config>,
+        turn_context: &Arc<TurnContext>,
+        overrides: &TurnOverrides,
+    ) -> (bool, Option<codex_core::error::CodexErr>) {
+        let cancellation_token = CancellationToken::new();
+        ctx.state_mut(|s| {
+            s.current_turn_cancellation = Some(cancellation_token.clone());
+            s.interrupt_requested = false;
+        });
+
+        let mut streamer = TemporalModelStreamer::new(
+            ctx.clone(),
+            self.conversation_id.to_string(),
+            self.input.model_provider.clone(),
+            cancellation_token.clone(),
+        );
+
+        let diff_tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let mut iterations = 0u32;
+        let mut turn_aborted = false;
+        let mut turn_error: Option<codex_core::error::CodexErr> = None;
+
+        loop {
+            let interrupted = ctx.state(|s| s.interrupt_requested);
+            if interrupted {
+                tracing::info!("interrupt requested, aborting turn");
+                turn_aborted = true;
+                ctx.state_mut(|s| s.interrupt_requested = false);
+                break;
+            }
+
+            if iterations >= self.max_iterations {
+                tracing::warn!(
+                    "max iterations reached ({}), stopping turn",
+                    self.max_iterations
+                );
+                self.events.emit_event_sync(Event {
+                    id: turn_id.to_string(),
+                    msg: EventMsg::AgentMessage(AgentMessageEvent {
+                        message: format!(
+                            "⚠️ Maximum iterations ({}) reached. \
+                             The model was still processing tool calls. \
+                             You can continue with a follow-up message.",
+                            self.max_iterations
+                        ),
+                        phase: None,
+                        memory_citation: None,
+                    }),
+                });
+                ctx.state_mut(|s| s.bump_version());
+                self.last_agent_message = Some(format!(
+                    "Maximum iterations ({}) reached — \
+                     the model was still processing. \
+                     You can continue with a follow-up message.",
+                    self.max_iterations
+                ));
+                break;
+            }
+
+            // Create handler inside the loop so it picks up the effective
+            // approval policy (which may change mid-turn via signals).
+            let effective_policy = ctx.state(|s| s.effective_approval_policy());
+            let effective_model = overrides
+                .model
+                .as_deref()
+                .unwrap_or(&self.input.model)
+                .to_string();
+            let handler = TemporalToolHandler::new(
+                ctx.clone(),
+                self.events.clone(),
+                turn_id.to_string(),
+                effective_policy,
+                effective_model,
+                self.config.cwd.to_string_lossy().to_string(),
+                Some(self.config_toml.clone()),
+                self.mcp_tool_names.clone(),
+                self.dynamic_tool_names.clone(),
+                self.config.permissions.sandbox_policy.get().clone(),
+            );
+
+            let history = self.sess.history_items().await;
+            let prompt = self.build_prompt(history, turn_config);
+
+            let mut server_model_warning_emitted = false;
+            let result = try_run_sampling_request(
+                Arc::clone(&self.sess),
+                Arc::clone(turn_context),
+                &mut streamer,
+                &handler,
+                None,
+                Arc::clone(&diff_tracker),
+                &mut server_model_warning_emitted,
+                &prompt,
+                cancellation_token.child_token(),
+            )
+            .await;
+
+            iterations += 1;
+            self.total_iterations += 1;
+
+            match result {
+                Ok(outcome) => {
+                    if let Some(msg) = outcome.last_agent_message {
+                        self.last_agent_message = Some(msg);
+                    }
+                    if !outcome.needs_follow_up {
+                        break;
+                    }
+                    tracing::debug!(iteration = iterations, "follow-up needed, continuing loop");
+                }
+                Err(codex_core::error::CodexErr::TurnAborted) => {
+                    tracing::debug!("try_run_sampling_request returned TurnAborted");
+                    turn_aborted = true;
+                    ctx.state_mut(|s| s.interrupt_requested = false);
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "try_run_sampling_request failed");
+                    turn_error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        ctx.state_mut(|s| s.current_turn_cancellation = None);
+        (turn_aborted, turn_error)
+    }
+
+    /// Emit the appropriate turn-end event (TurnAborted, Error, or TurnComplete).
+    fn emit_turn_end_events(
+        &self,
+        ctx: &mut WorkflowContext<AgentWorkflow>,
+        turn_id: &str,
+        aborted: bool,
+        error: Option<&codex_core::error::CodexErr>,
+    ) {
+        if aborted {
+            self.events.emit_event_sync(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some(turn_id.to_string()),
+                    reason: TurnAbortReason::Interrupted,
+                }),
+            });
+            ctx.state_mut(|s| s.bump_version());
+        } else {
+            if let Some(err) = error {
+                let error_event = err.to_error_event(None);
+                self.events.emit_event_sync(Event {
+                    id: turn_id.to_string(),
+                    msg: EventMsg::Error(error_event),
+                });
+                ctx.state_mut(|s| s.bump_version());
+            }
+
+            self.events.emit_event_sync(Event {
+                id: turn_id.to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn_id.to_string(),
+                    last_agent_message: self.last_agent_message.clone(),
+                }),
+            });
+            ctx.state_mut(|s| s.bump_version());
+        }
+    }
 }
 
 /// Re-export the macro-generated `Run` marker type so other modules (e.g.
