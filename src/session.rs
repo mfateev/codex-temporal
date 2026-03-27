@@ -18,6 +18,17 @@
 
 use std::sync::{Arc, Mutex};
 
+/// Extension trait to reduce `.get()` boilerplate.
+trait MutexExt<T> {
+    fn get(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for std::sync::Mutex<T> {
+    fn get(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().expect("lock poisoned")
+    }
+}
+
 use codex_core::error::{CodexErr, Result as CodexResult};
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::protocol::{
@@ -209,7 +220,7 @@ impl TemporalAgentSession {
             .active_agent_workflow_id
             .lock()
             .expect("lock poisoned") = agent_workflow_id;
-        self.event_buffer.lock().expect("lock poisoned").clear();
+        self.event_buffer.get().clear();
         self.start_watching();
     }
 
@@ -220,12 +231,12 @@ impl TemporalAgentSession {
     /// a new watcher.
     pub fn switch_session(&self, new_session_id: String) {
         self.stop_watching();
-        *self.generation.lock().expect("lock poisoned") += 1;
-        *self.session_workflow_id.lock().expect("lock poisoned") = new_session_id.clone();
-        *self.active_agent_workflow_id.lock().expect("lock poisoned") =
+        *self.generation.get() += 1;
+        *self.session_workflow_id.get() = new_session_id.clone();
+        *self.active_agent_workflow_id.get() =
             format!("{new_session_id}/main");
-        self.event_buffer.lock().expect("lock poisoned").clear();
-        *self.started.lock().expect("lock poisoned") = true;
+        self.event_buffer.get().clear();
+        *self.started.get() = true;
         self.start_watching();
     }
 
@@ -237,7 +248,7 @@ impl TemporalAgentSession {
         let buffer = Arc::clone(&self.event_buffer);
         let notify = Arc::clone(&self.event_notify);
         let generation = Arc::clone(&self.generation);
-        let gen_at_start = *generation.lock().expect("lock poisoned");
+        let gen_at_start = *generation.get();
 
         let handle = tokio::spawn(async move {
             let watcher = Watcher::new(client, workflow_id);
@@ -250,12 +261,12 @@ impl TemporalAgentSession {
             drain_watcher_into_buffer(&mut rx, &buffer, &notify, &generation, gen_at_start).await;
         });
 
-        *self.watch_handle.lock().expect("lock poisoned") = Some(handle);
+        *self.watch_handle.get() = Some(handle);
     }
 
     /// Stop the background watcher.
     fn stop_watching(&self) {
-        if let Some(handle) = self.watch_handle.lock().expect("lock poisoned").take() {
+        if let Some(handle) = self.watch_handle.get().take() {
             handle.abort();
         }
     }
@@ -375,19 +386,19 @@ async fn drain_watcher_into_buffer(
 ) {
     let mut stall_notified = false;
     while let Some(result) = rx.recv().await {
-        if *generation.lock().expect("lock poisoned") != gen_at_start {
+        if *generation.get() != gen_at_start {
             return;
         }
         match result {
             WatcherEvent::Events(events, _) => {
                 stall_notified = false;
                 if !events.is_empty() {
-                    buffer.lock().expect("lock poisoned").extend(events);
+                    buffer.get().extend(events);
                     notify.notify_one();
                 }
             }
             WatcherEvent::Completed => {
-                buffer.lock().expect("lock poisoned").push(Event {
+                buffer.get().push(Event {
                     id: String::new(),
                     msg: EventMsg::ShutdownComplete,
                 });
@@ -398,7 +409,7 @@ async fn drain_watcher_into_buffer(
                 tracing::warn!(error = %e, "watcher: connection error, retrying");
                 if !stall_notified {
                     stall_notified = true;
-                    buffer.lock().expect("lock poisoned").push(Event {
+                    buffer.get().push(Event {
                         id: String::new(),
                         msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
                             message: "Connecting to backend...".to_string(),
@@ -440,12 +451,12 @@ impl codex_core::AgentSession for TemporalAgentSession {
         // --- Op::Interrupt: immediate abort back to prompt ---
         if matches!(op, Op::Interrupt) {
             // Cancel any in-flight submit retry loop.
-            if let Some(token) = self.submit_cancel.lock().expect("lock poisoned").take() {
+            if let Some(token) = self.submit_cancel.get().take() {
                 token.cancel();
             }
             // Push synthetic TurnAborted(Interrupted) so the TUI returns to the prompt.
             {
-                let mut buf = self.event_buffer.lock().expect("lock poisoned");
+                let mut buf = self.event_buffer.get();
                 buf.push(Event {
                     id: String::new(),
                     msg: EventMsg::TurnAborted(TurnAbortedEvent {
@@ -481,12 +492,12 @@ impl codex_core::AgentSession for TemporalAgentSession {
             ..
         } = op
         {
-            let started = *self.started.lock().expect("lock poisoned");
+            let started = *self.started.get();
             if !started {
                 let message = extract_message(items);
                 // Retry start_workflow in a background task with cancellation.
                 let cancel = CancellationToken::new();
-                *self.submit_cancel.lock().expect("lock poisoned") = Some(cancel.clone());
+                *self.submit_cancel.get() = Some(cancel.clone());
 
                 let client = self.client.clone();
                 let session_id = self.session_id();
@@ -525,13 +536,13 @@ impl codex_core::AgentSession for TemporalAgentSession {
                     .await
                 {
                     Ok(_) => {
-                        *self.started.lock().expect("lock poisoned") = true;
-                        *self.submit_cancel.lock().expect("lock poisoned") = None;
+                        *self.started.get() = true;
+                        *self.submit_cancel.get() = None;
                         // Inject SessionConfigured before the watcher starts
                         // so it is the first event consumers see.
                         {
                             let evt = self.build_session_configured_event(&input);
-                            self.event_buffer.lock().expect("lock poisoned").push(evt);
+                            self.event_buffer.get().push(evt);
                             self.event_notify.notify_one();
                         }
                         self.start_watching();
@@ -545,7 +556,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         tracing::warn!(error = %first_err, "start_workflow failed, retrying in background");
                         // Push connecting status.
                         {
-                            let mut buf = buffer.lock().expect("lock poisoned");
+                            let mut buf = buffer.get();
                             buf.push(Event {
                                 id: String::new(),
                                 msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
@@ -563,7 +574,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         let notify2 = Arc::clone(&self.event_notify);
                         let session_configured_evt = self.build_session_configured_event(&input);
                         let generation = Arc::clone(&self.generation);
-                        let gen_at_start = *generation.lock().expect("lock poisoned");
+                        let gen_at_start = *generation.get();
                         let active_agent_id = self.active_agent_id();
 
                         tokio::spawn(async move {
@@ -580,7 +591,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                 }
 
                                 // Check generation for staleness.
-                                if *generation.lock().expect("lock poisoned") != gen_at_start {
+                                if *generation.get() != gen_at_start {
                                     return;
                                 }
 
@@ -597,7 +608,7 @@ impl codex_core::AgentSession for TemporalAgentSession {
                                         );
                                         // Inject SessionConfigured before the watcher starts.
                                         {
-                                            buffer2.lock().expect("lock poisoned").push(session_configured_evt);
+                                            buffer2.get().push(session_configured_evt);
                                             notify2.notify_one();
                                         }
                                         // Start a watcher inline since we can't call self.start_watching().
@@ -620,25 +631,25 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         // Return immediately — the retry loop runs in the background.
                         // We need to set `started` to true so subsequent UserTurns
                         // go through signal_agent_op instead of trying to start again.
-                        *self.started.lock().expect("lock poisoned") = true;
+                        *self.started.get() = true;
                         return Ok("started".to_string());
                     }
                 }
             } else {
                 // Already started — retry signal_agent_op for UserTurn.
                 let cancel = CancellationToken::new();
-                *self.submit_cancel.lock().expect("lock poisoned") = Some(cancel.clone());
+                *self.submit_cancel.get() = Some(cancel.clone());
 
                 match self.signal_agent_op(op.clone()).await {
                     Ok(result) => {
-                        *self.submit_cancel.lock().expect("lock poisoned") = None;
+                        *self.submit_cancel.get() = None;
                         return Ok(result);
                     }
                     Err(first_err) => {
                         tracing::warn!(error = %first_err, "signal_agent_op failed for UserTurn, retrying in background");
                         // Push connecting status.
                         {
-                            let mut buf = self.event_buffer.lock().expect("lock poisoned");
+                            let mut buf = self.event_buffer.get();
                             buf.push(Event {
                                 id: String::new(),
                                 msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
@@ -693,15 +704,15 @@ impl codex_core::AgentSession for TemporalAgentSession {
         // Track shutdown locally so next_event() can detect it.
         if matches!(op, Op::Shutdown) {
             // Cancel any in-flight submit retry loop.
-            if let Some(token) = self.submit_cancel.lock().expect("lock poisoned").take() {
+            if let Some(token) = self.submit_cancel.get().take() {
                 token.cancel();
             }
-            *self.shutdown.lock().expect("lock poisoned") = true;
+            *self.shutdown.get() = true;
             // Push ShutdownComplete immediately so the TUI can exit without
             // waiting for a gRPC round-trip that may hang if the backend is
             // unreachable (the "connecting to backend..." scenario).
             {
-                let mut buf = self.event_buffer.lock().expect("lock poisoned");
+                let mut buf = self.event_buffer.get();
                 buf.push(Event {
                     id: String::new(),
                     msg: EventMsg::ShutdownComplete,
@@ -757,14 +768,14 @@ impl codex_core::AgentSession for TemporalAgentSession {
         loop {
             // Check the local buffer first.
             {
-                let mut buf = self.event_buffer.lock().expect("lock poisoned");
+                let mut buf = self.event_buffer.get();
                 if !buf.is_empty() {
                     return Ok(buf.remove(0));
                 }
             }
 
             // If not started, wait a bit (watcher not yet running).
-            let started = *self.started.lock().expect("lock poisoned");
+            let started = *self.started.get();
             if !started {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
