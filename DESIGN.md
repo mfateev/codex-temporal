@@ -108,70 +108,26 @@ No `SessionCore` extraction needed. The following traits/abstractions are alread
 7. **`Session::new_minimal()`** — zero-service constructor for external harnesses
 8. **`Config::for_harness()`** — zero-I/O config constructor
 
-## Codex-Temporal Changes (next steps)
+## Codex-Temporal Implementation
 
 ### Workflow
 
-- Uses `Session::new_minimal()` (already done)
+- Uses `Session::new_minimal()` to hold conversation state
 - Approval decisions via `ExecApprovalRequest` signal + `wait_condition`
 
 ### Activities
 
-- `model_call` — uses codex `ModelClient` / `ModelClientSession` (done)
-- `tool_exec` — add handlers for `apply_patch`, `read_file`, `list_dir`, `grep_files`
-- Each tool handler is straightforward I/O (~10-150 lines each)
+- `model_call` — uses codex `ModelClient` / `ModelClientSession`
+- `dispatch_tool` — builds a `ToolRouter` from `ToolsConfig` and dispatches any tool call through the standard codex routing pipeline (`ToolRouter::dispatch()`), so all built-in tools (shell, apply_patch, read_file, list_dir, grep, etc.) are supported without per-tool handler code
 
-## Worker-Level State for Persistent Processes
+## MCP Server Management
 
-Some codex features require **long-lived processes** that outlive individual activity calls: PTY sessions, JS REPL kernels, MCP server connections. Activities are stateless one-shot functions — they can't hold a subprocess or connection open between invocations.
+MCP server connections are managed by `HarnessMcpManager` (in `mcp.rs`), which holds persistent `RmcpClient` connections to user-configured MCP servers. It supports tool discovery (returning qualified tool names like `mcp__server__tool`) and tool execution within activities. Elicitation requests from MCP servers are captured and surfaced to the workflow for approval.
 
-The solution is **worker-level state**: the worker process owns persistent resources, and activities access them by reference.
+## Future: Worker-Level State for Persistent Processes
 
-```
-┌──────────────────────────────────────────────────────┐
-│ Worker Process (long-lived)                          │
-│                                                      │
-│  WorkerResources (shared across all activities)      │
-│  ├── mcp_connections: HashMap<String, McpConnection> │
-│  ├── pty_sessions: HashMap<String, PtySession>       │
-│  ├── js_repl: Option<JsReplKernel>                   │
-│  └── sandbox_config: SandboxConfig                   │
-│                                                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │ Activity    │  │ Activity    │  │ Activity    │  │
-│  │ tool_exec   │  │ model_call  │  │ tool_exec   │  │
-│  │  accesses   │  │             │  │  accesses   │  │
-│  │  PTY #3     │  │  ModelClient│  │  MCP "git"  │  │
-│  └─────────────┘  └─────────────┘  └─────────────┘  │
-└──────────────────────────────────────────────────────┘
-```
+Some codex features require **long-lived processes** that outlive individual activity calls: PTY sessions, JS REPL kernels. Activities are stateless one-shot functions — they can't hold a subprocess or connection open between invocations.
 
-### How it works
+The planned solution is **worker-level state**: the worker process would own persistent resources (PTY sessions, JS REPL kernels, sandbox config), and activities would access them by reference. This would require sticky task routing — assigning each workflow to a specific worker — which is the natural model for a coding agent since the worker runs on the machine with the code.
 
-1. **Worker startup**: The worker process creates `WorkerResources` — starts MCP servers, initializes sandbox config, prepares PTY/REPL infrastructure.
-
-2. **Activity access**: Activities receive a reference to `WorkerResources` via the activity context. They look up or create persistent resources by key (e.g., workflow ID → PTY session).
-
-3. **Lifecycle**: Resources are tied to the worker process lifetime. When the worker restarts, resources are re-created. The workflow is unaffected — it replays and activities re-establish connections.
-
-### What this enables
-
-| Feature | Worker resource | Activity usage |
-|---|---|---|
-| **MCP tools** | `McpConnection` per server | Activity sends request, gets response |
-| **JS REPL** | `JsReplKernel` per workflow | Activity evaluates code, returns result |
-| **PTY / unified exec** | `PtySession` per terminal | Activity writes command, reads output |
-| **Background terminals** | Multiple `PtySession`s | `/ps` queries workflow state, execution via activities |
-| **Sandbox (bubblewrap)** | `SandboxConfig` | Activity wraps subprocess in bubblewrap |
-| **Network proxy** | `ManagedProxy` | Activity routes requests through proxy |
-
-### Trade-off: Sticky task routing
-
-Worker-level state means a workflow's activities must run on the **same worker** that holds its resources. This requires sticky task routing — assigning each workflow to a specific worker via a workflow-specific task queue or session-based routing.
-
-This breaks the "any worker can handle any task" assumption, but is the correct trade-off for a coding agent:
-- The worker runs on the **machine with the code** (filesystem access required)
-- Coding agents are inherently single-machine (you edit files on one machine)
-- The worker IS the machine — sticky routing is the natural model
-
-For multi-machine deployments, each machine runs its own worker with its own task queue. The TUI connects to the workflow, which routes activities to the right worker.
+This is not yet implemented. Currently, MCP connections are the only persistent resource, managed at the activity level by `HarnessMcpManager`.
