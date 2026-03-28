@@ -68,6 +68,23 @@ async fn wait_for_resolution<T>(
     value
 }
 
+/// Set pending state, emit an event, bump version, then wait for resolution.
+///
+/// Combines the common "set pending → emit → bump → wait → clear" sequence
+/// used by all approval/response flows.
+async fn request_and_wait<T>(
+    ctx: &WorkflowContext<AgentWorkflow>,
+    events: &BufferEventSink,
+    event: Event,
+    set_pending: impl FnOnce(&mut AgentWorkflow),
+    get_resolved: impl Fn(&AgentWorkflow) -> Option<T>,
+    clear: impl FnOnce(&mut AgentWorkflow),
+) -> Option<T> {
+    ctx.state_mut(set_pending);
+    AgentWorkflow::emit_and_bump(ctx, events, event);
+    wait_for_resolution(ctx, get_resolved, clear).await
+}
+
 /// Execute an activity with cancellation support. On cancellation, returns
 /// a denied response. Builds `ActivityOptions` from the given timeout.
 macro_rules! run_with_cancellation {
@@ -234,33 +251,29 @@ impl ToolCallHandler for TemporalToolHandler {
 
                 // Check if the MCP server requested elicitation during this call.
                 if let Some(elicitation) = output.elicitation.take() {
-                    // Set pending state.
-                    ctx.state_mut(|s| {
-                        s.pending_elicitation = Some(PendingElicitation {
-                            server_name: elicitation.server_name.clone(),
-                            request_id: elicitation.request_id.clone(),
-                            response: None,
-                        });
-                    });
-
-                    // Emit ElicitationRequest event.
-                    AgentWorkflow::emit_and_bump(&ctx, &events, Event {
-                        id: turn_id.clone(),
-                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                            turn_id: Some(turn_id.clone()),
-                            server_name: elicitation.server_name,
-                            id: elicitation.request_id,
-                            request: ElicitationRequest::Form {
-                                meta: None,
-                                message: elicitation.message,
-                                requested_schema: serde_json::Value::Object(Default::default()),
-                            },
-                        }),
-                    });
-
-                    // Wait for resolution or interrupt.
-                    if wait_for_resolution(
+                    if request_and_wait(
                         &ctx,
+                        &events,
+                        Event {
+                            id: turn_id.clone(),
+                            msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                                turn_id: Some(turn_id.clone()),
+                                server_name: elicitation.server_name.clone(),
+                                id: elicitation.request_id.clone(),
+                                request: ElicitationRequest::Form {
+                                    meta: None,
+                                    message: elicitation.message,
+                                    requested_schema: serde_json::Value::Object(Default::default()),
+                                },
+                            }),
+                        },
+                        |s| {
+                            s.pending_elicitation = Some(PendingElicitation {
+                                server_name: elicitation.server_name,
+                                request_id: elicitation.request_id,
+                                response: None,
+                            });
+                        },
                         |s| s.pending_elicitation.as_ref().and_then(|p| p.response.as_ref().map(|_| ())),
                         |s| { s.pending_elicitation = None; },
                     ).await.is_none() {
@@ -278,28 +291,25 @@ impl ToolCallHandler for TemporalToolHandler {
                         CodexErr::Fatal(format!("invalid request_user_input args: {e}"))
                     })?;
 
-                // Set pending state.
-                ctx.state_mut(|s| {
-                    s.pending_user_input = Some(PendingUserInput {
-                        call_id: call_id.clone(),
-                        turn_id: turn_id.clone(),
-                        response: None,
-                    });
-                });
-
-                // Emit event to client.
-                AgentWorkflow::emit_and_bump(&ctx, &events, Event {
-                    id: turn_id.clone(),
-                    msg: EventMsg::RequestUserInput(RequestUserInputEvent {
-                        call_id: call_id.clone(),
-                        turn_id,
-                        questions: args.questions,
-                    }),
-                });
-
-                // Wait for response or interrupt.
-                let response = wait_for_resolution(
+                let pending_turn_id = turn_id.clone();
+                let response = request_and_wait(
                     &ctx,
+                    &events,
+                    Event {
+                        id: turn_id.clone(),
+                        msg: EventMsg::RequestUserInput(RequestUserInputEvent {
+                            call_id: call_id.clone(),
+                            turn_id,
+                            questions: args.questions,
+                        }),
+                    },
+                    |s| {
+                        s.pending_user_input = Some(PendingUserInput {
+                            call_id: call_id.clone(),
+                            turn_id: pending_turn_id,
+                            response: None,
+                        });
+                    },
                     |s| s.pending_user_input.as_ref().and_then(|p| p.response.clone()),
                     |s| { s.pending_user_input = None; },
                 ).await;
@@ -325,28 +335,24 @@ impl ToolCallHandler for TemporalToolHandler {
                 let args_value: serde_json::Value =
                     serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null);
 
-                // Set pending state.
-                ctx.state_mut(|s| {
-                    s.pending_dynamic_tool = Some(PendingDynamicTool {
-                        call_id: call_id.clone(),
-                        response: None,
-                    });
-                });
-
-                // Emit DynamicToolCallRequest event.
-                AgentWorkflow::emit_and_bump(&ctx, &events, Event {
-                    id: turn_id.clone(),
-                    msg: EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
-                        call_id: call_id.clone(),
-                        turn_id: turn_id.clone(),
-                        tool: tool_name,
-                        arguments: args_value,
-                    }),
-                });
-
-                // Wait for response or interrupt.
-                let response = wait_for_resolution(
+                let response = request_and_wait(
                     &ctx,
+                    &events,
+                    Event {
+                        id: turn_id.clone(),
+                        msg: EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
+                            call_id: call_id.clone(),
+                            turn_id: turn_id.clone(),
+                            tool: tool_name,
+                            arguments: args_value,
+                        }),
+                    },
+                    |s| {
+                        s.pending_dynamic_tool = Some(PendingDynamicTool {
+                            call_id: call_id.clone(),
+                            response: None,
+                        });
+                    },
                     |s| s.pending_dynamic_tool.as_ref().and_then(|p| p.response.clone()),
                     |s| { s.pending_dynamic_tool = None; },
                 ).await;
@@ -416,29 +422,25 @@ impl ToolCallHandler for TemporalToolHandler {
                         });
                     }
                     PatchDecision::AskUser => {
-                        // Set pending state.
-                        ctx.state_mut(|s| {
-                            s.pending_patch_approval = Some(PendingPatchApproval {
-                                call_id: call_id.clone(),
-                                decision: None,
-                            });
-                        });
-
-                        // Emit ApplyPatchApprovalRequest event.
-                        AgentWorkflow::emit_and_bump(&ctx, &events, Event {
-                            id: turn_id.clone(),
-                            msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
-                                call_id: call_id.clone(),
-                                turn_id: turn_id.clone(),
-                                changes: std::collections::HashMap::new(),
-                                reason: Some(patch_text),
-                                grant_root: None,
-                            }),
-                        });
-
-                        // Wait for decision or interrupt.
-                        let approved = wait_for_resolution(
+                        let approved = request_and_wait(
                             &ctx,
+                            &events,
+                            Event {
+                                id: turn_id.clone(),
+                                msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+                                    call_id: call_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    changes: std::collections::HashMap::new(),
+                                    reason: Some(patch_text),
+                                    grant_root: None,
+                                }),
+                            },
+                            |s| {
+                                s.pending_patch_approval = Some(PendingPatchApproval {
+                                    call_id: call_id.clone(),
+                                    decision: None,
+                                });
+                            },
                             |s| s.pending_patch_approval.as_ref().and_then(|p| p.decision),
                             |s| { s.pending_patch_approval = None; },
                         ).await.unwrap_or(false);
@@ -563,42 +565,38 @@ impl ToolCallHandler for TemporalToolHandler {
             let needs_approval = shell_decision == Decision::Prompt;
 
             if needs_approval {
-                // 1. Set pending approval in workflow state
-                ctx.state_mut(|s| {
-                    s.pending_approval = Some(PendingApproval {
-                        call_id: call_id.clone(),
-                        decision: None,
-                    });
-                });
-
-                // 2. Emit ExecApprovalRequest event
-                let approval_event = Event {
-                    id: turn_id.clone(),
-                    msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
-                        call_id: call_id.clone(),
-                        approval_id: Some(call_id.clone()),
-                        turn_id: turn_id.clone(),
-                        command: command.clone(),
-                        cwd: PathBuf::from("/tmp"),
-                        reason: None,
-                        network_approval_context: None,
-                        proposed_execpolicy_amendment: None,
-                        proposed_network_policy_amendments: None,
-                        additional_permissions: None,
-                        skill_metadata: None,
-                        available_decisions: None,
-                        parsed_cmd: Vec::new(),
-                    }),
-                };
-                AgentWorkflow::emit_and_bump(&ctx, &events, approval_event);
-
-                // 3. Wait for approval decision or interrupt.
+                // Wait for approval decision or interrupt.
                 // On interrupt, returns denied-style response rather than
                 // Err(TurnAborted) to avoid panicking codex-core's in-flight
                 // tool future drain. The workflow loop catches
                 // `interrupt_requested` at the iteration boundary.
-                let approved = wait_for_resolution(
+                let approved = request_and_wait(
                     &ctx,
+                    &events,
+                    Event {
+                        id: turn_id.clone(),
+                        msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                            call_id: call_id.clone(),
+                            approval_id: Some(call_id.clone()),
+                            turn_id: turn_id.clone(),
+                            command: command.clone(),
+                            cwd: PathBuf::from("/tmp"),
+                            reason: None,
+                            network_approval_context: None,
+                            proposed_execpolicy_amendment: None,
+                            proposed_network_policy_amendments: None,
+                            additional_permissions: None,
+                            skill_metadata: None,
+                            available_decisions: None,
+                            parsed_cmd: Vec::new(),
+                        }),
+                    },
+                    |s| {
+                        s.pending_approval = Some(PendingApproval {
+                            call_id: call_id.clone(),
+                            decision: None,
+                        });
+                    },
                     |s| s.pending_approval.as_ref().and_then(|p| p.decision),
                     |s| { s.pending_approval = None; },
                 ).await.unwrap_or(false);
