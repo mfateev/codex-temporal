@@ -374,6 +374,30 @@ impl TemporalAgentSession {
 
 }
 
+/// Retry an async action with exponential backoff, respecting cancellation.
+///
+/// Returns `true` on success, `false` if cancelled.
+async fn retry_with_backoff(
+    cancel: &CancellationToken,
+    mut action: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+) -> bool {
+    let mut delay = std::time::Duration::from_millis(500);
+    let max_delay = std::time::Duration::from_secs(5);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        match action().await {
+            Ok(()) => return true,
+            Err(e) => {
+                tracing::warn!(error = %e, "retry failed");
+                delay = (delay * 2).min(max_delay);
+            }
+        }
+    }
+}
+
 /// Drain watcher events into a shared buffer until the channel closes,
 /// the workflow completes, or the generation counter changes (indicating
 /// the session has been switched).
@@ -584,53 +608,38 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         let active_agent_id = self.active_agent_id();
 
                         tokio::spawn(async move {
-                            let mut delay = std::time::Duration::from_millis(500);
-                            let max_delay = std::time::Duration::from_secs(5);
-
-                            loop {
-                                tokio::select! {
-                                    _ = cancel2.cancelled() => {
-                                        tracing::debug!("submit retry loop cancelled by interrupt");
-                                        return;
-                                    }
-                                    _ = tokio::time::sleep(delay) => {}
-                                }
-
-                                // Check generation for staleness.
-                                if *generation.get() != gen_at_start {
-                                    return;
-                                }
-
-                                let options =
-                                    WorkflowStartOptions::new(TASK_QUEUE, &session_id2).build();
-                                match client2
-                                    .start_workflow(SessionWorkflow::run, input.clone(), options)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        tracing::debug!(
-                                            session_workflow_id = %session_id2,
-                                            "session workflow started (after retry)"
-                                        );
-                                        // Inject SessionConfigured before the watcher starts.
-                                        {
-                                            buffer2.get().push(session_configured_evt);
-                                            notify2.notify_one();
+                            let ok = retry_with_backoff(
+                                &cancel2,
+                                || {
+                                    let stale = *generation.get() != gen_at_start;
+                                    let client = client2.clone();
+                                    let session_id = session_id2.clone();
+                                    let input = input.clone();
+                                    Box::pin(async move {
+                                        if stale {
+                                            return Ok(()); // stale — exit loop
                                         }
-                                        // Start a watcher inline since we can't call self.start_watching().
-                                        let watcher = Watcher::new(client2.clone(), active_agent_id.clone());
-                                        let (wtx, mut wrx) = tokio::sync::mpsc::channel(64);
-                                        tokio::spawn(async move {
-                                            watcher.run_watching(wtx).await;
-                                        });
-                                        drain_watcher_into_buffer(&mut wrx, &buffer2, &notify2, &generation, gen_at_start).await;
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "start_workflow retry failed");
-                                        delay = (delay * 2).min(max_delay);
-                                    }
-                                }
+                                        let options = WorkflowStartOptions::new(TASK_QUEUE, &session_id).build();
+                                        client.start_workflow(SessionWorkflow::run, input, options)
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|e| format!("{e}"))
+                                    })
+                                },
+                            )
+                            .await;
+
+                            if ok && *generation.get() == gen_at_start {
+                                // Inject SessionConfigured before the watcher starts.
+                                buffer2.get().push(session_configured_evt);
+                                notify2.notify_one();
+                                // Start a watcher inline since we can't call self.start_watching().
+                                let watcher = Watcher::new(client2.clone(), active_agent_id.clone());
+                                let (wtx, mut wrx) = tokio::sync::mpsc::channel(64);
+                                tokio::spawn(async move {
+                                    watcher.run_watching(wtx).await;
+                                });
+                                drain_watcher_into_buffer(&mut wrx, &buffer2, &notify2, &generation, gen_at_start).await;
                             }
                         });
 
@@ -670,35 +679,20 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         let agent_id = self.active_agent_id();
                         let op_clone = op.clone();
                         tokio::spawn(async move {
-                            let mut delay = std::time::Duration::from_millis(500);
-                            let max_delay = std::time::Duration::from_secs(5);
-                            loop {
-                                tokio::select! {
-                                    _ = cancel.cancelled() => {
-                                        tracing::debug!("signal retry loop cancelled by interrupt");
-                                        return;
-                                    }
-                                    _ = tokio::time::sleep(delay) => {}
-                                }
-                                let handle = client.get_workflow_handle::<AgentWorkflowRun>(&agent_id);
-                                match handle
-                                    .signal(
-                                        AgentWorkflow::receive_op,
-                                        op_clone.clone(),
-                                        WorkflowSignalOptions::default(),
-                                    )
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        tracing::debug!("signal_agent_op succeeded after retry");
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "signal retry failed");
-                                        delay = (delay * 2).min(max_delay);
-                                    }
-                                }
-                            }
+                            let _ = retry_with_backoff(
+                                &cancel,
+                                || {
+                                    let handle = client.get_workflow_handle::<AgentWorkflowRun>(&agent_id);
+                                    let op = op_clone.clone();
+                                    Box::pin(async move {
+                                        handle
+                                            .signal(AgentWorkflow::receive_op, op, WorkflowSignalOptions::default())
+                                            .await
+                                            .map_err(|e| format!("{e}"))
+                                    })
+                                },
+                            )
+                            .await;
                         });
 
                         return Ok("ok".to_string());
