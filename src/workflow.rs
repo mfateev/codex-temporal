@@ -49,8 +49,8 @@ use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
 use crate::activities::{CodexActivities, activity_opts};
 use crate::types::{
-    AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
-    McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
+    AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, PendingApproval,
+    PendingDynamicTool, PendingElicitation,
     PendingPatchApproval, PendingUserInput, ProjectContextOutput, ResolveModelInfoInput,
     StateUpdateRequest, StateUpdateResponse, TurnOverrides, UserTurnInput, extract_message,
 };
@@ -568,55 +568,25 @@ impl WorkflowRuntime {
                 tracing::debug!("using pre-resolved config/context from parent workflow");
                 (config_output, project_context, mcp_tools)
             } else {
-                let config_activity = ctx.start_activity(
-                    CodexActivities::load_config,
-                    (),
-                    activity_opts(30),
-                );
-                let project_context_activity = ctx.start_activity(
-                    CodexActivities::collect_project_context,
-                    (),
-                    activity_opts(30),
-                );
-
-                let (config_result, project_context_result) =
-                    futures::future::join(config_activity, project_context_activity).await;
-
-                let config_output: ConfigOutput = config_result
-                    .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
-                let project_context: ProjectContextOutput = project_context_result
-                    .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
+                let (config_output, project_context) =
+                    crate::startup::load_config_and_context!(ctx)?;
 
                 // MCP discovery: reuse from CAN state or run activity.
-                let mcp_tools: HashMap<String, serde_json::Value> =
-                    if let Some(ref state) = input.continued_state {
-                        if !state.mcp_tools.is_empty() {
-                            tracing::debug!(
-                                tools = state.mcp_tools.len(),
-                                "reusing MCP tools from continue-as-new state"
-                            );
-                        }
-                        state.mcp_tools.clone()
-                    } else {
-                        let mcp_discover_input = McpDiscoverInput {
-                            config_toml: config_output.config_toml.clone(),
-                            cwd: project_context.cwd.clone(),
-                        };
-                        let mcp_output: McpDiscoverOutput = ctx
-                            .start_activity(
-                                CodexActivities::discover_mcp_tools,
-                                mcp_discover_input,
-                                activity_opts(60),
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                tracing::warn!("MCP discovery failed: {e}");
-                                McpDiscoverOutput {
-                                    tools: HashMap::new(),
-                                }
-                            });
-                        mcp_output.tools
-                    };
+                let mcp_tools = if let Some(ref state) = input.continued_state {
+                    if !state.mcp_tools.is_empty() {
+                        tracing::debug!(
+                            tools = state.mcp_tools.len(),
+                            "reusing MCP tools from continue-as-new state"
+                        );
+                    }
+                    state.mcp_tools.clone()
+                } else {
+                    crate::startup::discover_mcp!(
+                        ctx,
+                        config_output.config_toml,
+                        project_context.cwd
+                    )
+                };
 
                 (config_output, project_context, mcp_tools)
             };

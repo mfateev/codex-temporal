@@ -21,8 +21,8 @@ use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
 use crate::activities::{CodexActivities, activity_opts};
 use crate::config_loader::{config_from_toml, inject_crew_roles_into_toml};
 use crate::types::{
-    AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, ConfigOutput, CrewAgentDef,
-    McpDiscoverInput, McpDiscoverOutput, ProjectContextOutput, ResolveRoleConfigInput,
+    AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, CrewAgentDef,
+    ProjectContextOutput, ResolveRoleConfigInput,
     SessionContinueAsNewState, SessionWorkflowInput, SessionWorkflowOutput, SpawnAgentInput,
 };
 
@@ -171,50 +171,10 @@ impl SessionWorkflow {
                 tracing::info!("restoring config/context from continue-as-new state");
                 (ct, pc, existing.2)
             } else {
-                // Load config and project context via activities (in parallel).
-                let config_activity = ctx.start_activity(
-                    CodexActivities::load_config,
-                    (),
-                    activity_opts(30),
-                );
-                let project_context_activity = ctx.start_activity(
-                    CodexActivities::collect_project_context,
-                    (),
-                    activity_opts(30),
-                );
-
-                let (config_result, project_context_result) =
-                    futures::future::join(config_activity, project_context_activity).await;
-
-                let config_output: ConfigOutput = config_result
-                    .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
-                let project_context: ProjectContextOutput = project_context_result
-                    .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
-
-                // MCP discovery.
-                let mcp_discover_input = McpDiscoverInput {
-                    config_toml: config_output.config_toml.clone(),
-                    cwd: project_context.cwd.clone(),
-                };
-                let mcp_output: McpDiscoverOutput = ctx
-                    .start_activity(
-                        CodexActivities::discover_mcp_tools,
-                        mcp_discover_input,
-                        activity_opts(60),
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("MCP discovery failed: {e}");
-                        McpDiscoverOutput {
-                            tools: HashMap::new(),
-                        }
-                    });
-
-                (
-                    config_output.config_toml,
-                    project_context,
-                    mcp_output.tools,
-                )
+                // Load config, project context, and MCP tools via activities.
+                let (config_output, project_context, mcp_tools) =
+                    crate::startup::load_startup_context!(ctx)?;
+                (config_output.config_toml, project_context, mcp_tools)
             }
         };
 

@@ -15,6 +15,8 @@ pub mod picker;
 pub mod session;
 pub mod session_workflow;
 pub mod sink;
+#[macro_use]
+mod startup;
 pub mod storage;
 pub mod streamer;
 pub mod tools;
