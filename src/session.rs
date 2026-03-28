@@ -172,33 +172,33 @@ impl TemporalAgentSession {
             .clone()
     }
 
-    /// Build a synthetic `SessionConfigured` event from `base_input`.
+    /// Build a `SessionConfiguredEvent` from the given input.
     ///
     /// The Temporal workflow does not emit this event itself; instead the
     /// client-side session injects it into the event buffer so that
     /// consumers (TUI, tests) see the same protocol as codex-core.
-    fn build_session_configured_event(&self, input: &SessionWorkflowInput) -> Event {
+    fn build_session_configured(
+        input: &SessionWorkflowInput,
+        initial_messages: Option<Vec<EventMsg>>,
+    ) -> SessionConfiguredEvent {
         use codex_protocol::ThreadId;
-        Event {
-            id: String::new(),
-            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id: ThreadId::new(),
-                forked_from_id: None,
-                thread_name: None,
-                initial_messages: None,
-                model: input.model.clone(),
-                model_provider_id: "openai".into(),
-                approvals_reviewer: Default::default(),
-                approval_policy: input.approval_policy,
-                sandbox_policy: SandboxPolicy::DangerFullAccess,
-                cwd: std::env::current_dir().unwrap_or_default(),
-                reasoning_effort: input.reasoning_effort,
-                history_log_id: 0,
-                history_entry_count: 0,
-                network_proxy: None,
-                rollout_path: None,
-                service_tier: None,
-            }),
+        SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            initial_messages,
+            model: input.model.clone(),
+            model_provider_id: "openai".into(),
+            approvals_reviewer: Default::default(),
+            approval_policy: input.approval_policy,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            reasoning_effort: input.reasoning_effort,
+            history_log_id: 0,
+            history_entry_count: 0,
+            network_proxy: None,
+            rollout_path: None,
+            service_tier: None,
         }
     }
 
@@ -541,7 +541,10 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         // Inject SessionConfigured before the watcher starts
                         // so it is the first event consumers see.
                         {
-                            let evt = self.build_session_configured_event(&input);
+                            let evt = Event {
+                                id: String::new(),
+                                msg: EventMsg::SessionConfigured(Self::build_session_configured(&input, None)),
+                            };
                             self.event_buffer.get().push(evt);
                             self.event_notify.notify_one();
                         }
@@ -572,7 +575,10 @@ impl codex_core::AgentSession for TemporalAgentSession {
                         let session_id2 = session_id.clone();
                         let buffer2 = Arc::clone(&self.event_buffer);
                         let notify2 = Arc::clone(&self.event_notify);
-                        let session_configured_evt = self.build_session_configured_event(&input);
+                        let session_configured_evt = Event {
+                            id: String::new(),
+                            msg: EventMsg::SessionConfigured(Self::build_session_configured(&input, None)),
+                        };
                         let generation = Arc::clone(&self.generation);
                         let gen_at_start = *generation.get();
                         let active_agent_id = self.active_agent_id();
@@ -829,8 +835,6 @@ impl codex_tui::ExternalAgentBrowser for TemporalAgentSession {
         &self,
         session_id: &str,
     ) -> color_eyre::eyre::Result<codex_tui::ExternalSwitchResult> {
-        use codex_protocol::ThreadId;
-
         self.switch_session(session_id.to_string());
 
         // Fetch existing events from the new session to seed initial_messages.
@@ -841,24 +845,10 @@ impl codex_tui::ExternalAgentBrowser for TemporalAgentSession {
         let filtered = filter_initial_events(events);
 
         Ok(codex_tui::ExternalSwitchResult {
-            session_configured: SessionConfiguredEvent {
-                session_id: ThreadId::new(),
-                forked_from_id: None,
-                thread_name: None,
-                initial_messages: Some(filtered),
-                model: self.base_input.model.clone(),
-                model_provider_id: "openai".into(),
-                approvals_reviewer: Default::default(),
-                approval_policy: self.base_input.approval_policy,
-                sandbox_policy: SandboxPolicy::DangerFullAccess,
-                cwd: std::env::current_dir().unwrap_or_default(),
-                reasoning_effort: self.base_input.reasoning_effort,
-                history_log_id: 0,
-                history_entry_count: 0,
-                network_proxy: None,
-                rollout_path: None,
-                service_tier: None,
-            },
+            session_configured: Self::build_session_configured(
+                &self.base_input,
+                Some(filtered),
+            ),
         })
     }
 
