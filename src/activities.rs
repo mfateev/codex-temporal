@@ -49,6 +49,24 @@ pub(crate) fn activity_opts(timeout_secs: u64) -> ActivityOptions {
     }
 }
 
+/// Apply headless-auth fixups to a model provider.
+///
+/// Activities run without interactive login, so we switch from ChatGPT
+/// OAuth to API-key auth and honour env-var overrides for base URL and
+/// bearer token.
+fn apply_headless_auth_fixup(provider: &mut ModelProviderInfo) {
+    provider.requires_openai_auth = false;
+    if provider.env_key.is_none() {
+        provider.env_key = Some("OPENAI_API_KEY".to_string());
+    }
+    if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
+        provider.base_url = Some(base);
+    }
+    if let Ok(token) = std::env::var("OPENAI_BEARER_TOKEN") {
+        provider.experimental_bearer_token = Some(token);
+    }
+}
+
 /// Resolve the model provider to use for the activity.
 ///
 /// Starts from the built-in OpenAI provider but overrides it to use API-key
@@ -58,22 +76,7 @@ fn resolve_provider() -> ModelProviderInfo {
     let mut provider = built_in_model_providers(None)
         .remove("openai")
         .expect("built-in openai provider must exist");
-
-    // Switch from ChatGPT OAuth to API-key auth.
-    provider.requires_openai_auth = false;
-    provider.env_key = Some("OPENAI_API_KEY".to_string());
-
-    // Honour explicit base-URL override.
-    if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
-        provider.base_url = Some(base);
-    }
-
-    // If a bearer token is supplied directly, prefer it over the env_key
-    // mechanism (useful for programmatic / test scenarios).
-    if let Ok(token) = std::env::var("OPENAI_BEARER_TOKEN") {
-        provider.experimental_bearer_token = Some(token);
-    }
-
+    apply_headless_auth_fixup(&mut provider);
     provider
 }
 
@@ -140,17 +143,7 @@ impl CodexActivities {
         // API-key auth and honour env-var overrides.
         let provider = {
             let mut p = input.provider.clone().unwrap_or_else(|| self.provider.clone());
-            // Ensure API-key auth works (activities have no interactive login).
-            p.requires_openai_auth = false;
-            if p.env_key.is_none() {
-                p.env_key = Some("OPENAI_API_KEY".to_string());
-            }
-            if let Ok(base) = std::env::var("OPENAI_BASE_URL") {
-                p.base_url = Some(base);
-            }
-            if let Ok(token) = std::env::var("OPENAI_BEARER_TOKEN") {
-                p.experimental_bearer_token = Some(token);
-            }
+            apply_headless_auth_fixup(&mut p);
             p
         };
         let conversation_id = ThreadId::from_string(&input.conversation_id)
