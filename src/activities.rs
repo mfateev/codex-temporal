@@ -29,6 +29,8 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio::sync::Mutex;
 
+use temporalio_sdk::ActivityOptions;
+
 use crate::config_loader::config_from_toml;
 use crate::mcp::HarnessMcpManager;
 use crate::sink::BufferEventSink;
@@ -38,6 +40,14 @@ use crate::types::{
     ModelCallInput, ModelCallOutput, ProjectContextOutput, ResolveModelInfoInput,
     ResolveRoleConfigInput, ResolveRoleConfigOutput, ToolExecInput, ToolExecOutput,
 };
+
+/// Build `ActivityOptions` with only a schedule-to-close timeout.
+pub(crate) fn activity_opts(timeout_secs: u64) -> ActivityOptions {
+    ActivityOptions {
+        schedule_to_close_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
+        ..Default::default()
+    }
+}
 
 /// Resolve the model provider to use for the activity.
 ///

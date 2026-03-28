@@ -35,7 +35,7 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_sdk::{
-    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
     WorkflowTermination,
 };
 use tokio::sync::Mutex;
@@ -47,7 +47,7 @@ use crate::sink::{BufferEventSink, DEFAULT_EVENT_BUFFER_CAPACITY};
 use crate::storage::InMemoryStorage;
 use crate::streamer::TemporalModelStreamer;
 use crate::tools::TemporalToolHandler;
-use crate::activities::CodexActivities;
+use crate::activities::{CodexActivities, activity_opts};
 use crate::types::{
     AgentWorkflowInput, AgentWorkflowOutput, ConfigOutput, ContinueAsNewState, McpDiscoverInput,
     McpDiscoverOutput, PendingApproval, PendingDynamicTool, PendingElicitation,
@@ -562,18 +562,12 @@ impl WorkflowRuntime {
                 let config_activity = ctx.start_activity(
                     CodexActivities::load_config,
                     (),
-                    ActivityOptions {
-                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                        ..Default::default()
-                    },
+                    activity_opts(30),
                 );
                 let project_context_activity = ctx.start_activity(
                     CodexActivities::collect_project_context,
                     (),
-                    ActivityOptions {
-                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                        ..Default::default()
-                    },
+                    activity_opts(30),
                 );
 
                 let (config_result, project_context_result) =
@@ -603,12 +597,7 @@ impl WorkflowRuntime {
                             .start_activity(
                                 CodexActivities::discover_mcp_tools,
                                 mcp_discover_input,
-                                ActivityOptions {
-                                    schedule_to_close_timeout: Some(
-                                        std::time::Duration::from_secs(60),
-                                    ),
-                                    ..Default::default()
-                                },
+                                activity_opts(60),
                             )
                             .await
                             .unwrap_or_else(|e| {
@@ -650,10 +639,7 @@ impl WorkflowRuntime {
                     model: input.model.clone(),
                     config_toml: config_output.config_toml.clone(),
                 },
-                ActivityOptions {
-                    schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                    ..Default::default()
-                },
+                activity_opts(30),
             )
             .await
             .unwrap_or_else(|e| {

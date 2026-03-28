@@ -12,13 +12,13 @@ use std::collections::{BTreeMap, HashMap};
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
+    ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
     WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
 use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
 
-use crate::activities::CodexActivities;
+use crate::activities::{CodexActivities, activity_opts};
 use crate::config_loader::{config_from_toml, inject_crew_roles_into_toml};
 use crate::types::{
     AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, ConfigOutput, CrewAgentDef,
@@ -135,18 +135,12 @@ impl SessionWorkflow {
                 let config_activity = ctx.start_activity(
                     CodexActivities::load_config,
                     (),
-                    ActivityOptions {
-                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                        ..Default::default()
-                    },
+                    activity_opts(30),
                 );
                 let project_context_activity = ctx.start_activity(
                     CodexActivities::collect_project_context,
                     (),
-                    ActivityOptions {
-                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                        ..Default::default()
-                    },
+                    activity_opts(30),
                 );
 
                 let (config_result, project_context_result) =
@@ -166,10 +160,7 @@ impl SessionWorkflow {
                     .start_activity(
                         CodexActivities::discover_mcp_tools,
                         mcp_discover_input,
-                        ActivityOptions {
-                            schedule_to_close_timeout: Some(std::time::Duration::from_secs(60)),
-                            ..Default::default()
-                        },
+                        activity_opts(60),
                     )
                     .await
                     .unwrap_or_else(|e| {
@@ -331,12 +322,7 @@ impl SessionWorkflow {
                                 .start_activity(
                                     CodexActivities::resolve_role_config,
                                     resolve_input,
-                                    ActivityOptions {
-                                        schedule_to_close_timeout: Some(
-                                            std::time::Duration::from_secs(30),
-                                        ),
-                                        ..Default::default()
-                                    },
+                                    activity_opts(30),
                                 )
                                 .await
                             {
@@ -387,12 +373,7 @@ impl SessionWorkflow {
                             .start_activity(
                                 CodexActivities::resolve_role_config,
                                 resolve_input,
-                                ActivityOptions {
-                                    schedule_to_close_timeout: Some(
-                                        std::time::Duration::from_secs(30),
-                                    ),
-                                    ..Default::default()
-                                },
+                                activity_opts(30),
                             )
                             .await
                         {
