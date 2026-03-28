@@ -252,25 +252,16 @@ impl SessionWorkflow {
 
         // --- Phase 2: start the main agent ---
         let main_agent_id = format!("{session_id}/main");
-        let main_input = AgentWorkflowInput {
-            user_message: input.user_message.clone(),
-            model: input.model.clone(),
-            instructions: input.instructions.clone(),
-            approval_policy: input.approval_policy,
-            web_search_mode: input.web_search_mode,
-            reasoning_effort: input.reasoning_effort,
-            reasoning_summary: input.reasoning_summary,
-            personality: input.personality,
-            developer_instructions: input.developer_instructions.clone(),
-            model_provider: input.model_provider.clone(),
-            continued_state: None,
-            role: "default".to_string(),
-            config_toml: Some(config_toml.clone()),
-            project_context: Some(project_context.clone()),
-            mcp_tools: mcp_tools.clone(),
-            dynamic_tools: Vec::new(),
-            max_iterations: input.max_iterations,
-        };
+        let main_input = AgentWorkflowInput::from_session(
+            &input,
+            input.user_message.clone(),
+            input.model.clone(),
+            input.instructions.clone(),
+            "default".to_string(),
+            config_toml.clone(),
+            project_context.clone(),
+            mcp_tools.clone(),
+        );
 
         let child = ctx.child_workflow(ChildWorkflowOptions {
             workflow_id: main_agent_id.clone(),
@@ -388,25 +379,16 @@ impl SessionWorkflow {
                         (config_toml.clone(), input.model.clone(), input.instructions.clone())
                     };
 
-                let child_input = AgentWorkflowInput {
-                    user_message: spawn_input.message,
-                    model: resolved_model,
-                    instructions: resolved_instructions,
-                    approval_policy: input.approval_policy,
-                    web_search_mode: input.web_search_mode,
-                    reasoning_effort: input.reasoning_effort,
-                    reasoning_summary: input.reasoning_summary,
-                    personality: input.personality,
-                    developer_instructions: input.developer_instructions.clone(),
-                    model_provider: input.model_provider.clone(),
-                    continued_state: None,
-                    role: agent_role.clone(),
-                    config_toml: Some(resolved_config_toml),
-                    project_context: Some(project_context.clone()),
-                    mcp_tools: mcp_tools.clone(),
-                    dynamic_tools: Vec::new(),
-                    max_iterations: input.max_iterations,
-                };
+                let child_input = AgentWorkflowInput::from_session(
+                    &input,
+                    spawn_input.message,
+                    resolved_model,
+                    resolved_instructions,
+                    agent_role.clone(),
+                    resolved_config_toml,
+                    project_context.clone(),
+                    mcp_tools.clone(),
+                );
 
                 let child = ctx.child_workflow(ChildWorkflowOptions {
                     workflow_id: agent_id.clone(),

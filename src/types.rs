@@ -544,6 +544,42 @@ fn default_role() -> String {
     "default".to_string()
 }
 
+impl AgentWorkflowInput {
+    /// Build an `AgentWorkflowInput` from a parent `SessionWorkflowInput`,
+    /// filling in agent-specific fields from the provided arguments and
+    /// copying shared session-level fields from the template.
+    pub fn from_session(
+        session: &SessionWorkflowInput,
+        user_message: String,
+        model: String,
+        instructions: String,
+        role: String,
+        config_toml: String,
+        project_context: ProjectContextOutput,
+        mcp_tools: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            user_message,
+            model,
+            instructions,
+            approval_policy: session.approval_policy,
+            web_search_mode: session.web_search_mode,
+            reasoning_effort: session.reasoning_effort,
+            reasoning_summary: session.reasoning_summary,
+            personality: session.personality,
+            developer_instructions: session.developer_instructions.clone(),
+            model_provider: session.model_provider.clone(),
+            continued_state: None,
+            role,
+            config_toml: Some(config_toml),
+            project_context: Some(project_context),
+            mcp_tools,
+            dynamic_tools: Vec::new(),
+            max_iterations: session.max_iterations,
+        }
+    }
+}
+
 /// Backward-compatible alias.
 pub type CodexWorkflowInput = AgentWorkflowInput;
 
