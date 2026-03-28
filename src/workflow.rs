@@ -272,6 +272,16 @@ impl AgentWorkflow {
         self.state_version += 1;
     }
 
+    /// Emit an event and bump the state version in one call.
+    pub(crate) fn emit_and_bump(
+        ctx: &WorkflowContext<Self>,
+        events: &BufferEventSink,
+        event: Event,
+    ) {
+        events.emit_event_sync(event);
+        ctx.state_mut(|s| s.bump_version());
+    }
+
     // ----- signals -----
 
     /// Generic signal that dispatches all client operations.
@@ -486,11 +496,10 @@ impl AgentWorkflow {
             return can;
         }
 
-        events.emit_event_sync(Event {
+        AgentWorkflow::emit_and_bump(ctx, &events, Event {
             id: String::new(),
             msg: EventMsg::ShutdownComplete,
         });
-        ctx.state_mut(|s| s.bump_version());
 
         Ok(AgentWorkflowOutput {
             last_agent_message: rt.last_agent_message,
@@ -767,11 +776,10 @@ impl WorkflowRuntime {
         tracing::info!("compact requested — triggering continue-as-new");
         ctx.state_mut(|s| s.compact_requested = false);
 
-        self.events.emit_event_sync(Event {
+        AgentWorkflow::emit_and_bump(ctx, &self.events, Event {
             id: String::new(),
             msg: EventMsg::ContextCompacted(ContextCompactedEvent),
         });
-        ctx.state_mut(|s| s.bump_version());
 
         self.trigger_continue_as_new(ctx)
     }
@@ -810,7 +818,7 @@ impl WorkflowRuntime {
         let turn_id = turn.turn_id.clone();
 
         // Emit TurnStarted.
-        self.events.emit_event_sync(Event {
+        AgentWorkflow::emit_and_bump(ctx, &self.events, Event {
             id: turn_id.clone(),
             msg: EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.clone(),
@@ -818,7 +826,6 @@ impl WorkflowRuntime {
                 collaboration_mode_kind: Default::default(),
             }),
         });
-        ctx.state_mut(|s| s.bump_version());
 
         // Record the user message in session history.
         let user_item = ResponseItem::Message {
@@ -968,7 +975,7 @@ impl WorkflowRuntime {
                     "max iterations reached ({}), stopping turn",
                     self.max_iterations
                 );
-                self.events.emit_event_sync(Event {
+                AgentWorkflow::emit_and_bump(ctx, &self.events, Event {
                     id: turn_id.to_string(),
                     msg: EventMsg::AgentMessage(AgentMessageEvent {
                         message: format!(
@@ -981,7 +988,6 @@ impl WorkflowRuntime {
                         memory_citation: None,
                     }),
                 });
-                ctx.state_mut(|s| s.bump_version());
                 self.last_agent_message = Some(format!(
                     "Maximum iterations ({}) reached — \
                      the model was still processing. \
@@ -1069,32 +1075,29 @@ impl WorkflowRuntime {
         error: Option<&codex_core::error::CodexErr>,
     ) {
         if aborted {
-            self.events.emit_event_sync(Event {
+            AgentWorkflow::emit_and_bump(ctx, &self.events, Event {
                 id: turn_id.to_string(),
                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                     turn_id: Some(turn_id.to_string()),
                     reason: TurnAbortReason::Interrupted,
                 }),
             });
-            ctx.state_mut(|s| s.bump_version());
         } else {
             if let Some(err) = error {
                 let error_event = err.to_error_event(None);
-                self.events.emit_event_sync(Event {
+                AgentWorkflow::emit_and_bump(ctx, &self.events, Event {
                     id: turn_id.to_string(),
                     msg: EventMsg::Error(error_event),
                 });
-                ctx.state_mut(|s| s.bump_version());
             }
 
-            self.events.emit_event_sync(Event {
+            AgentWorkflow::emit_and_bump(ctx, &self.events, Event {
                 id: turn_id.to_string(),
                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                     turn_id: turn_id.to_string(),
                     last_agent_message: self.last_agent_message.clone(),
                 }),
             });
-            ctx.state_mut(|s| s.bump_version());
         }
     }
 }

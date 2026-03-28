@@ -244,7 +244,7 @@ impl ToolCallHandler for TemporalToolHandler {
                     });
 
                     // Emit ElicitationRequest event.
-                    events.emit_event_sync(Event {
+                    AgentWorkflow::emit_and_bump(&ctx, &events, Event {
                         id: turn_id.clone(),
                         msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
                             turn_id: Some(turn_id.clone()),
@@ -257,7 +257,6 @@ impl ToolCallHandler for TemporalToolHandler {
                             },
                         }),
                     });
-                    ctx.state_mut(|s| s.bump_version());
 
                     // Wait for resolution or interrupt.
                     if wait_for_resolution(
@@ -289,7 +288,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 });
 
                 // Emit event to client.
-                events.emit_event_sync(Event {
+                AgentWorkflow::emit_and_bump(&ctx, &events, Event {
                     id: turn_id.clone(),
                     msg: EventMsg::RequestUserInput(RequestUserInputEvent {
                         call_id: call_id.clone(),
@@ -297,7 +296,6 @@ impl ToolCallHandler for TemporalToolHandler {
                         questions: args.questions,
                     }),
                 });
-                ctx.state_mut(|s| s.bump_version());
 
                 // Wait for response or interrupt.
                 let response = wait_for_resolution(
@@ -336,7 +334,7 @@ impl ToolCallHandler for TemporalToolHandler {
                 });
 
                 // Emit DynamicToolCallRequest event.
-                events.emit_event_sync(Event {
+                AgentWorkflow::emit_and_bump(&ctx, &events, Event {
                     id: turn_id.clone(),
                     msg: EventMsg::DynamicToolCallRequest(DynamicToolCallRequest {
                         call_id: call_id.clone(),
@@ -345,7 +343,6 @@ impl ToolCallHandler for TemporalToolHandler {
                         arguments: args_value,
                     }),
                 });
-                ctx.state_mut(|s| s.bump_version());
 
                 // Wait for response or interrupt.
                 let response = wait_for_resolution(
@@ -428,7 +425,7 @@ impl ToolCallHandler for TemporalToolHandler {
                         });
 
                         // Emit ApplyPatchApprovalRequest event.
-                        events.emit_event_sync(Event {
+                        AgentWorkflow::emit_and_bump(&ctx, &events, Event {
                             id: turn_id.clone(),
                             msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
                                 call_id: call_id.clone(),
@@ -438,7 +435,6 @@ impl ToolCallHandler for TemporalToolHandler {
                                 grant_root: None,
                             }),
                         });
-                        ctx.state_mut(|s| s.bump_version());
 
                         // Wait for decision or interrupt.
                         let approved = wait_for_resolution(
@@ -594,8 +590,7 @@ impl ToolCallHandler for TemporalToolHandler {
                         parsed_cmd: Vec::new(),
                     }),
                 };
-                events.emit_event_sync(approval_event);
-                ctx.state_mut(|s| s.bump_version());
+                AgentWorkflow::emit_and_bump(&ctx, &events, approval_event);
 
                 // 3. Wait for approval decision or interrupt.
                 // On interrupt, returns denied-style response rather than
