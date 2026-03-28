@@ -28,6 +28,46 @@ use crate::types::{
 
 const TASK_QUEUE: &str = "codex-temporal";
 
+/// Resolve a role's config via the `resolve_role_config` activity, then merge
+/// optional crew-level overrides for model/instructions.
+///
+/// Returns `(config_toml, model, instructions)` on success.
+async fn resolve_role(
+    ctx: &mut WorkflowContext<SessionWorkflow>,
+    config_toml: &str,
+    cwd: &str,
+    role_name: &str,
+    crew_model: Option<&str>,
+    crew_instructions: Option<&str>,
+    fallback_model: &str,
+    fallback_instructions: &str,
+) -> Result<(String, String, String), String> {
+    let resolve_input = ResolveRoleConfigInput {
+        config_toml: config_toml.to_string(),
+        cwd: cwd.to_string(),
+        role_name: role_name.to_string(),
+    };
+    let resolved = ctx
+        .start_activity(
+            CodexActivities::resolve_role_config,
+            resolve_input,
+            activity_opts(30),
+        )
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let model = crew_model
+        .map(String::from)
+        .or(resolved.model)
+        .unwrap_or_else(|| fallback_model.to_string());
+    let instructions = crew_instructions
+        .map(String::from)
+        .or(resolved.instructions)
+        .unwrap_or_else(|| fallback_instructions.to_string());
+
+    Ok((resolved.config_toml, model, instructions))
+}
+
 /// Default maximum number of concurrent agents per session.
 const DEFAULT_MAX_AGENTS: usize = 8;
 
@@ -310,95 +350,42 @@ impl SessionWorkflow {
                 // Resolve role config: crew-aware resolution.
                 let (resolved_config_toml, resolved_model, resolved_instructions) =
                     if let Some(ref crew_agent) = crew_def {
-                        // Crew agent: check if it references a base role.
                         if let Some(ref base_role) = crew_agent.role {
-                            // Has a base role — resolve it, then override with crew values.
-                            let resolve_input = ResolveRoleConfigInput {
-                                config_toml: config_toml.clone(),
-                                cwd: project_context.cwd.clone(),
-                                role_name: base_role.clone(),
-                            };
-                            match ctx
-                                .start_activity(
-                                    CodexActivities::resolve_role_config,
-                                    resolve_input,
-                                    activity_opts(30),
-                                )
-                                .await
-                            {
-                                Ok(resolved) => {
-                                    // Crew model/instructions override resolved role values.
-                                    let model = crew_agent
-                                        .model
-                                        .clone()
-                                        .or(resolved.model)
-                                        .unwrap_or_else(|| input.model.clone());
-                                    let instructions = crew_agent
-                                        .instructions
-                                        .clone()
-                                        .or(resolved.instructions)
-                                        .unwrap_or_else(|| input.instructions.clone());
-                                    (resolved.config_toml, model, instructions)
-                                }
+                            // Crew agent with base role — resolve then overlay crew values.
+                            match resolve_role(
+                                ctx, &config_toml, &project_context.cwd, base_role,
+                                crew_agent.model.as_deref(),
+                                crew_agent.instructions.as_deref(),
+                                &input.model, &input.instructions,
+                            ).await {
+                                Ok(resolved) => resolved,
                                 Err(e) => {
-                                    tracing::error!(
-                                        role = %agent_role,
-                                        base_role = %base_role,
-                                        error = %e,
-                                        "failed to resolve base role for crew agent, skipping spawn"
-                                    );
+                                    tracing::error!(role = %agent_role, base_role = %base_role, error = %e,
+                                        "failed to resolve base role for crew agent, skipping spawn");
                                     continue;
                                 }
                             }
                         } else {
                             // Pure inline crew agent — no activity call needed.
-                            let model = crew_agent
-                                .model
-                                .clone()
-                                .unwrap_or_else(|| input.model.clone());
-                            let instructions = crew_agent
-                                .instructions
-                                .clone()
-                                .unwrap_or_else(|| input.instructions.clone());
+                            let model = crew_agent.model.clone().unwrap_or_else(|| input.model.clone());
+                            let instructions = crew_agent.instructions.clone().unwrap_or_else(|| input.instructions.clone());
                             (config_toml.clone(), model, instructions)
                         }
                     } else if agent_role != "default" {
                         // Non-crew, non-default role — resolve via activity.
-                        let resolve_input = ResolveRoleConfigInput {
-                            config_toml: config_toml.clone(),
-                            cwd: project_context.cwd.clone(),
-                            role_name: agent_role.clone(),
-                        };
-                        match ctx
-                            .start_activity(
-                                CodexActivities::resolve_role_config,
-                                resolve_input,
-                                activity_opts(30),
-                            )
-                            .await
-                        {
-                            Ok(resolved) => (
-                                resolved.config_toml,
-                                resolved.model.unwrap_or_else(|| input.model.clone()),
-                                resolved
-                                    .instructions
-                                    .unwrap_or_else(|| input.instructions.clone()),
-                            ),
+                        match resolve_role(
+                            ctx, &config_toml, &project_context.cwd, &agent_role,
+                            None, None, &input.model, &input.instructions,
+                        ).await {
+                            Ok(resolved) => resolved,
                             Err(e) => {
-                                tracing::error!(
-                                    role = %agent_role,
-                                    error = %e,
-                                    "failed to resolve role config, skipping spawn"
-                                );
+                                tracing::error!(role = %agent_role, error = %e,
+                                    "failed to resolve role config, skipping spawn");
                                 continue;
                             }
                         }
                     } else {
-                        (
-                            config_toml.clone(),
-                            input.model.clone(),
-                            input.instructions.clone(),
-                        )
+                        (config_toml.clone(), input.model.clone(), input.instructions.clone())
                     };
 
                 let child_input = AgentWorkflowInput {
