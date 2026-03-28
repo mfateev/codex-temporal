@@ -822,7 +822,12 @@ async fn run_tui_reactive(
             let output = String::from_utf8_lossy(&output).to_string();
             // Dump pending output for debugging timeouts.
             if !output.is_empty() {
-                eprintln!("  [reactive] TIMEOUT — pending output ({} bytes):\n---\n{}\n---", output.len(), &output[..output.len().min(2000)]);
+                let truncated = {
+                    let max = output.len().min(2000);
+                    let end = output.floor_char_boundary(max);
+                    &output[..end]
+                };
+                eprintln!("  [reactive] TIMEOUT — pending output ({} bytes):\n---\n{}\n---", output.len(), truncated);
             } else {
                 eprintln!("  [reactive] TIMEOUT — no pending output");
             }
