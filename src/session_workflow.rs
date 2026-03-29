@@ -12,21 +12,61 @@ use std::collections::{BTreeMap, HashMap};
 use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
+    ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext,
     WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution;
 use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
 
-use crate::activities::CodexActivities;
+use crate::activities::{CodexActivities, activity_opts};
 use crate::config_loader::{config_from_toml, inject_crew_roles_into_toml};
 use crate::types::{
-    AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, ConfigOutput, CrewAgentDef,
-    McpDiscoverInput, McpDiscoverOutput, ProjectContextOutput, ResolveRoleConfigInput,
+    AgentLifecycle, AgentRecord, AgentSummary, AgentWorkflowInput, CrewAgentDef,
+    ProjectContextOutput, ResolveRoleConfigInput,
     SessionContinueAsNewState, SessionWorkflowInput, SessionWorkflowOutput, SpawnAgentInput,
 };
 
 const TASK_QUEUE: &str = "codex-temporal";
+
+/// Resolve a role's config via the `resolve_role_config` activity, then merge
+/// optional crew-level overrides for model/instructions.
+///
+/// Returns `(config_toml, model, instructions)` on success.
+async fn resolve_role(
+    ctx: &mut WorkflowContext<SessionWorkflow>,
+    config_toml: &str,
+    cwd: &str,
+    role_name: &str,
+    crew_model: Option<&str>,
+    crew_instructions: Option<&str>,
+    fallback_model: &str,
+    fallback_instructions: &str,
+) -> Result<(String, String, String), String> {
+    let resolve_input = ResolveRoleConfigInput {
+        config_toml: config_toml.to_string(),
+        cwd: cwd.to_string(),
+        role_name: role_name.to_string(),
+    };
+    let resolved = ctx
+        .start_activity(
+            CodexActivities::resolve_role_config,
+            resolve_input,
+            activity_opts(30),
+        )
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    let model = crew_model
+        .map(String::from)
+        .or(resolved.model)
+        .unwrap_or_else(|| fallback_model.to_string());
+    let instructions = crew_instructions
+        .map(String::from)
+        .or(resolved.instructions)
+        .unwrap_or_else(|| fallback_instructions.to_string());
+
+    Ok((resolved.config_toml, model, instructions))
+}
 
 /// Default maximum number of concurrent agents per session.
 const DEFAULT_MAX_AGENTS: usize = 8;
@@ -131,59 +171,10 @@ impl SessionWorkflow {
                 tracing::info!("restoring config/context from continue-as-new state");
                 (ct, pc, existing.2)
             } else {
-                // Load config and project context via activities (in parallel).
-                let config_activity = ctx.start_activity(
-                    CodexActivities::load_config,
-                    (),
-                    ActivityOptions {
-                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                        ..Default::default()
-                    },
-                );
-                let project_context_activity = ctx.start_activity(
-                    CodexActivities::collect_project_context,
-                    (),
-                    ActivityOptions {
-                        schedule_to_close_timeout: Some(std::time::Duration::from_secs(30)),
-                        ..Default::default()
-                    },
-                );
-
-                let (config_result, project_context_result) =
-                    futures::future::join(config_activity, project_context_activity).await;
-
-                let config_output: ConfigOutput = config_result
-                    .map_err(|e| anyhow::anyhow!("load_config failed: {e}"))?;
-                let project_context: ProjectContextOutput = project_context_result
-                    .map_err(|e| anyhow::anyhow!("collect_project_context failed: {e}"))?;
-
-                // MCP discovery.
-                let mcp_discover_input = McpDiscoverInput {
-                    config_toml: config_output.config_toml.clone(),
-                    cwd: project_context.cwd.clone(),
-                };
-                let mcp_output: McpDiscoverOutput = ctx
-                    .start_activity(
-                        CodexActivities::discover_mcp_tools,
-                        mcp_discover_input,
-                        ActivityOptions {
-                            schedule_to_close_timeout: Some(std::time::Duration::from_secs(60)),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("MCP discovery failed: {e}");
-                        McpDiscoverOutput {
-                            tools: HashMap::new(),
-                        }
-                    });
-
-                (
-                    config_output.config_toml,
-                    project_context,
-                    mcp_output.tools,
-                )
+                // Load config, project context, and MCP tools via activities.
+                let (config_output, project_context, mcp_tools) =
+                    crate::startup::load_startup_context!(ctx)?;
+                (config_output.config_toml, project_context, mcp_tools)
             }
         };
 
@@ -221,25 +212,16 @@ impl SessionWorkflow {
 
         // --- Phase 2: start the main agent ---
         let main_agent_id = format!("{session_id}/main");
-        let main_input = AgentWorkflowInput {
-            user_message: input.user_message.clone(),
-            model: input.model.clone(),
-            instructions: input.instructions.clone(),
-            approval_policy: input.approval_policy,
-            web_search_mode: input.web_search_mode,
-            reasoning_effort: input.reasoning_effort,
-            reasoning_summary: input.reasoning_summary,
-            personality: input.personality,
-            developer_instructions: input.developer_instructions.clone(),
-            model_provider: input.model_provider.clone(),
-            continued_state: None,
-            role: "default".to_string(),
-            config_toml: Some(config_toml.clone()),
-            project_context: Some(project_context.clone()),
-            mcp_tools: mcp_tools.clone(),
-            dynamic_tools: Vec::new(),
-            max_iterations: input.max_iterations,
-        };
+        let main_input = AgentWorkflowInput::from_session(
+            &input,
+            input.user_message.clone(),
+            input.model.clone(),
+            input.instructions.clone(),
+            "default".to_string(),
+            config_toml.clone(),
+            project_context.clone(),
+            mcp_tools.clone(),
+        );
 
         let child = ctx.child_workflow(ChildWorkflowOptions {
             workflow_id: main_agent_id.clone(),
@@ -319,126 +301,54 @@ impl SessionWorkflow {
                 // Resolve role config: crew-aware resolution.
                 let (resolved_config_toml, resolved_model, resolved_instructions) =
                     if let Some(ref crew_agent) = crew_def {
-                        // Crew agent: check if it references a base role.
                         if let Some(ref base_role) = crew_agent.role {
-                            // Has a base role — resolve it, then override with crew values.
-                            let resolve_input = ResolveRoleConfigInput {
-                                config_toml: config_toml.clone(),
-                                cwd: project_context.cwd.clone(),
-                                role_name: base_role.clone(),
-                            };
-                            match ctx
-                                .start_activity(
-                                    CodexActivities::resolve_role_config,
-                                    resolve_input,
-                                    ActivityOptions {
-                                        schedule_to_close_timeout: Some(
-                                            std::time::Duration::from_secs(30),
-                                        ),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(resolved) => {
-                                    // Crew model/instructions override resolved role values.
-                                    let model = crew_agent
-                                        .model
-                                        .clone()
-                                        .or(resolved.model)
-                                        .unwrap_or_else(|| input.model.clone());
-                                    let instructions = crew_agent
-                                        .instructions
-                                        .clone()
-                                        .or(resolved.instructions)
-                                        .unwrap_or_else(|| input.instructions.clone());
-                                    (resolved.config_toml, model, instructions)
-                                }
+                            // Crew agent with base role — resolve then overlay crew values.
+                            match resolve_role(
+                                ctx, &config_toml, &project_context.cwd, base_role,
+                                crew_agent.model.as_deref(),
+                                crew_agent.instructions.as_deref(),
+                                &input.model, &input.instructions,
+                            ).await {
+                                Ok(resolved) => resolved,
                                 Err(e) => {
-                                    tracing::error!(
-                                        role = %agent_role,
-                                        base_role = %base_role,
-                                        error = %e,
-                                        "failed to resolve base role for crew agent, skipping spawn"
-                                    );
+                                    tracing::error!(role = %agent_role, base_role = %base_role, error = %e,
+                                        "failed to resolve base role for crew agent, skipping spawn");
                                     continue;
                                 }
                             }
                         } else {
                             // Pure inline crew agent — no activity call needed.
-                            let model = crew_agent
-                                .model
-                                .clone()
-                                .unwrap_or_else(|| input.model.clone());
-                            let instructions = crew_agent
-                                .instructions
-                                .clone()
-                                .unwrap_or_else(|| input.instructions.clone());
+                            let model = crew_agent.model.clone().unwrap_or_else(|| input.model.clone());
+                            let instructions = crew_agent.instructions.clone().unwrap_or_else(|| input.instructions.clone());
                             (config_toml.clone(), model, instructions)
                         }
                     } else if agent_role != "default" {
                         // Non-crew, non-default role — resolve via activity.
-                        let resolve_input = ResolveRoleConfigInput {
-                            config_toml: config_toml.clone(),
-                            cwd: project_context.cwd.clone(),
-                            role_name: agent_role.clone(),
-                        };
-                        match ctx
-                            .start_activity(
-                                CodexActivities::resolve_role_config,
-                                resolve_input,
-                                ActivityOptions {
-                                    schedule_to_close_timeout: Some(
-                                        std::time::Duration::from_secs(30),
-                                    ),
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                        {
-                            Ok(resolved) => (
-                                resolved.config_toml,
-                                resolved.model.unwrap_or_else(|| input.model.clone()),
-                                resolved
-                                    .instructions
-                                    .unwrap_or_else(|| input.instructions.clone()),
-                            ),
+                        match resolve_role(
+                            ctx, &config_toml, &project_context.cwd, &agent_role,
+                            None, None, &input.model, &input.instructions,
+                        ).await {
+                            Ok(resolved) => resolved,
                             Err(e) => {
-                                tracing::error!(
-                                    role = %agent_role,
-                                    error = %e,
-                                    "failed to resolve role config, skipping spawn"
-                                );
+                                tracing::error!(role = %agent_role, error = %e,
+                                    "failed to resolve role config, skipping spawn");
                                 continue;
                             }
                         }
                     } else {
-                        (
-                            config_toml.clone(),
-                            input.model.clone(),
-                            input.instructions.clone(),
-                        )
+                        (config_toml.clone(), input.model.clone(), input.instructions.clone())
                     };
 
-                let child_input = AgentWorkflowInput {
-                    user_message: spawn_input.message,
-                    model: resolved_model,
-                    instructions: resolved_instructions,
-                    approval_policy: input.approval_policy,
-                    web_search_mode: input.web_search_mode,
-                    reasoning_effort: input.reasoning_effort,
-                    reasoning_summary: input.reasoning_summary,
-                    personality: input.personality,
-                    developer_instructions: input.developer_instructions.clone(),
-                    model_provider: input.model_provider.clone(),
-                    continued_state: None,
-                    role: agent_role.clone(),
-                    config_toml: Some(resolved_config_toml),
-                    project_context: Some(project_context.clone()),
-                    mcp_tools: mcp_tools.clone(),
-                    dynamic_tools: Vec::new(),
-                    max_iterations: input.max_iterations,
-                };
+                let child_input = AgentWorkflowInput::from_session(
+                    &input,
+                    spawn_input.message,
+                    resolved_model,
+                    resolved_instructions,
+                    agent_role.clone(),
+                    resolved_config_toml,
+                    project_context.clone(),
+                    mcp_tools.clone(),
+                );
 
                 let child = ctx.child_workflow(ChildWorkflowOptions {
                     workflow_id: agent_id.clone(),

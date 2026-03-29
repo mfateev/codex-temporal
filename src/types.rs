@@ -544,6 +544,42 @@ fn default_role() -> String {
     "default".to_string()
 }
 
+impl AgentWorkflowInput {
+    /// Build an `AgentWorkflowInput` from a parent `SessionWorkflowInput`,
+    /// filling in agent-specific fields from the provided arguments and
+    /// copying shared session-level fields from the template.
+    pub fn from_session(
+        session: &SessionWorkflowInput,
+        user_message: String,
+        model: String,
+        instructions: String,
+        role: String,
+        config_toml: String,
+        project_context: ProjectContextOutput,
+        mcp_tools: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            user_message,
+            model,
+            instructions,
+            approval_policy: session.approval_policy,
+            web_search_mode: session.web_search_mode,
+            reasoning_effort: session.reasoning_effort,
+            reasoning_summary: session.reasoning_summary,
+            personality: session.personality,
+            developer_instructions: session.developer_instructions.clone(),
+            model_provider: session.model_provider.clone(),
+            continued_state: None,
+            role,
+            config_toml: Some(config_toml),
+            project_context: Some(project_context),
+            mcp_tools,
+            dynamic_tools: Vec::new(),
+            max_iterations: session.max_iterations,
+        }
+    }
+}
+
 /// Backward-compatible alias.
 pub type CodexWorkflowInput = AgentWorkflowInput;
 
@@ -768,6 +804,48 @@ pub struct StateUpdateResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Turn overrides
+// ---------------------------------------------------------------------------
+
+/// Per-session overrides set via `Op::OverrideTurnContext` signals.
+///
+/// These five fields always travel together — across continue-as-new
+/// boundaries, signal handlers, and turn configuration merges.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnOverrides {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "approval_policy_override"
+    )]
+    pub approval_policy: Option<AskForApproval>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "model_override"
+    )]
+    pub model: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "effort_override"
+    )]
+    pub effort: Option<Option<ReasoningEffort>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "summary_override"
+    )]
+    pub summary: Option<ReasoningSummary>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "personality_override"
+    )]
+    pub personality: Option<Personality>,
+}
+
+// ---------------------------------------------------------------------------
 // Continue-as-new state
 // ---------------------------------------------------------------------------
 
@@ -788,21 +866,9 @@ pub struct ContinueAsNewState {
     /// Discovered MCP tool schemas (carried across CAN to avoid re-discovery).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_tools: HashMap<String, serde_json::Value>,
-    /// Overridden approval policy (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy_override: Option<AskForApproval>,
-    /// Overridden model slug (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
-    /// Overridden reasoning effort (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort_override: Option<Option<ReasoningEffort>>,
-    /// Overridden reasoning summary (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_override: Option<ReasoningSummary>,
-    /// Overridden personality (from `Op::OverrideTurnContext`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub personality_override: Option<Personality>,
+    /// Persistent turn-context overrides.
+    #[serde(default, flatten)]
+    pub overrides: TurnOverrides,
     /// Monotonic offset of evicted events from the rolling event buffer.
     #[serde(default)]
     pub event_offset: usize,
@@ -815,7 +881,20 @@ pub struct ContinueAsNewState {
 // Temporal Failure formatting
 // ---------------------------------------------------------------------------
 
+use codex_protocol::user_input::UserInput;
 use temporalio_common::protos::temporal::api::failure::v1::Failure;
+
+/// Extract the text message from user input items.
+pub fn extract_message(items: &[UserInput]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Format a Temporal [`Failure`] as a human-readable error string.
 ///

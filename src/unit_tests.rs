@@ -702,11 +702,7 @@ fn continue_as_new_state_roundtrips_through_json() {
             total_tokens: 125,
         }),
         mcp_tools: std::collections::HashMap::new(),
-        approval_policy_override: None,
-        model_override: None,
-        effort_override: None,
-        summary_override: None,
-        personality_override: None,
+        overrides: Default::default(),
         event_offset: 0,
         event_snapshot: vec![],
     };
@@ -744,11 +740,7 @@ fn workflow_input_with_continued_state_roundtrips() {
             cumulative_iterations: 10,
             cumulative_token_usage: None,
             mcp_tools: std::collections::HashMap::new(),
-            approval_policy_override: None,
-            model_override: None,
-            effort_override: None,
-            summary_override: None,
-            personality_override: None,
+            overrides: Default::default(),
             event_offset: 0,
             event_snapshot: vec![],
         }),
@@ -1969,11 +1961,7 @@ fn continue_as_new_state_with_mcp_tools() {
         cumulative_iterations: 2,
         cumulative_token_usage: None,
         mcp_tools: mcp_tools.clone(),
-        approval_policy_override: None,
-        model_override: None,
-        effort_override: None,
-        summary_override: None,
-        personality_override: None,
+        overrides: Default::default(),
         event_offset: 0,
         event_snapshot: vec![],
     };
@@ -2012,18 +2000,17 @@ fn continue_as_new_state_with_approval_policy_roundtrips() {
         cumulative_iterations: 2,
         cumulative_token_usage: None,
         mcp_tools: std::collections::HashMap::new(),
-        approval_policy_override: Some(AskForApproval::Never),
-        model_override: None,
-        effort_override: None,
-        summary_override: None,
-        personality_override: None,
+        overrides: crate::types::TurnOverrides {
+            approval_policy: Some(AskForApproval::Never),
+            ..Default::default()
+        },
         event_offset: 0,
         event_snapshot: vec![],
     };
 
     let json = serde_json::to_string(&state).unwrap();
     let back: ContinueAsNewState = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.approval_policy_override, Some(AskForApproval::Never));
+    assert_eq!(back.overrides.approval_policy, Some(AskForApproval::Never));
 }
 
 #[test]
@@ -2039,7 +2026,7 @@ fn continue_as_new_state_approval_policy_default_when_missing() {
     }"#;
 
     let state: ContinueAsNewState = serde_json::from_str(json).unwrap();
-    assert!(state.approval_policy_override.is_none());
+    assert!(state.overrides.approval_policy.is_none());
 }
 
 #[tokio::test]
