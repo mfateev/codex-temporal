@@ -586,7 +586,6 @@ impl ToolCallHandler for TemporalToolHandler {
                             proposed_execpolicy_amendment: None,
                             proposed_network_policy_amendments: None,
                             additional_permissions: None,
-                            skill_metadata: None,
                             available_decisions: None,
                             parsed_cmd: Vec::new(),
                         }),
