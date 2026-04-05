@@ -284,7 +284,7 @@ async fn run_tui_session(
 
     // --- Build Config ---
     let mut config = Config::for_harness(codex_home.clone())?;
-    config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(cwd)?;
+    config.cwd = cwd;
 
     // --- Create real AuthManager and ModelsManager ---
     let auth_manager = AuthManager::shared(

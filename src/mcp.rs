@@ -160,7 +160,7 @@ impl HarnessMcpManager {
                 RmcpClient::new_stdio_client(
                     OsString::from(command),
                     args.iter().map(OsString::from).collect(),
-                    env.as_ref().map(|m| m.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))).collect()),
+                    env.clone(),
                     env_vars,
                     cwd.clone(),
                 )

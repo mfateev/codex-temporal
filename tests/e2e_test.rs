@@ -97,7 +97,6 @@ fn user_turn_op(text: &str) -> Op {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
-        approvals_reviewer: None,
     }
 }
 
@@ -284,7 +283,6 @@ fn user_turn_op_with_model(text: &str, model: &str) -> Op {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
-        approvals_reviewer: None,
     }
 }
 
@@ -1442,7 +1440,6 @@ async fn command_safety_auto_approves_safe_commands(client: &Client) {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
-        approvals_reviewer: None,
     };
     session.submit(op).await.expect("submit failed");
 
@@ -1638,8 +1635,8 @@ async fn policy_amendment_mid_workflow(client: &Client) {
     session
         .submit(Op::OverrideTurnContext {
             cwd: None,
-            approvals_reviewer: None,
             approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: None,
@@ -1886,8 +1883,8 @@ async fn override_turn_context_flow(client: &Client) {
     session
         .submit(Op::OverrideTurnContext {
             cwd: None,
-            approvals_reviewer: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: None,
@@ -3270,7 +3267,6 @@ async fn patch_auto_approve_full_access(client: &Client) {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
-        approvals_reviewer: None,
     };
     session.submit(op).await.expect("submit failed");
 
@@ -3342,7 +3338,6 @@ async fn multi_tool_emits_exec_events(client: &Client) {
         final_output_json_schema: None,
         collaboration_mode: None,
         personality: None,
-        approvals_reviewer: None,
     };
     session.submit(op).await.expect("submit failed");
 
